@@ -1,0 +1,13 @@
+pyproject.toml
+readme.md
+fsync/__init__.py
+fsync/cli.py
+fsync/fileindex.py
+fsync.egg-info/PKG-INFO
+fsync.egg-info/SOURCES.txt
+fsync.egg-info/dependency_links.txt
+fsync.egg-info/entry_points.txt
+fsync.egg-info/requires.txt
+fsync.egg-info/top_level.txt
+tests/test_cli_and_options.py
+tests/test_fileindex.py

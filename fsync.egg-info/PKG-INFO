@@ -1,0 +1,166 @@
+Metadata-Version: 2.4
+Name: fsync
+Version: 0.1.0
+Summary: Simple file indexing and comparison utilities
+Author-email: dev <dev@example.com>
+Description-Content-Type: text/markdown
+Provides-Extra: progress
+Requires-Dist: tqdm; extra == "progress"
+
+# fsync
+
+
+```
+CREATE TABLE file_metadata (
+    id SERIAL PRIMARY KEY,
+    file_path TEXT NOT NULL,
+    file_name TEXT NOT NULL,
+    file_size BIGINT,
+    creation_time TIMESTAMP,
+    modification_time TIMESTAMP,
+    access_time TIMESTAMP
+);
+```
+
+```
+import os
+import psycopg2
+from datetime import datetime
+
+# Database connection details
+DB_HOST = "localhost"
+DB_NAME = "your_database_name"
+DB_USER = "your_username"
+DB_PASSWORD = "your_password"
+
+# Directory to scan
+SCAN_DIRECTORY = "/path/to/your/directory"
+
+def get_file_metadata(filepath):
+    """Collects essential metadata for a given file."""
+    try:
+        stats = os.stat(filepath)
+        return {
+            "file_path": filepath,
+            "file_name": os.path.basename(filepath),
+            "file_size": stats.st_size,
+            "creation_time": datetime.fromtimestamp(stats.st_ctime),
+            "modification_time": datetime.fromtimestamp(stats.st_mtime),
+            "access_time": datetime.fromtimestamp(stats.st_atime),
+        }
+    except FileNotFoundError:
+        print(f"File not found: {filepath}")
+        return None
+    except Exception as e:
+        print(f"Error collecting metadata for {filepath}: {e}")
+        return None
+
+def insert_metadata_into_db(metadata):
+    """Inserts file metadata into the PostgreSQL database."""
+    conn = None
+    try:
+        conn = psycopg2.connect(host=DB_HOST, database=DB_NAME, user=DB_USER, password=DB_PASSWORD)
+        cur = conn.cursor()
+        
+        insert_query = """
+        INSERT INTO file_metadata (file_path, file_name, file_size, creation_time, modification_time, access_time)
+        VALUES (%s, %s, %s, %s, %s, %s)
+        ON CONFLICT (file_path) DO UPDATE SET
+            file_name = EXCLUDED.file_name,
+            file_size = EXCLUDED.file_size,
+            creation_time = EXCLUDED.creation_time,
+            modification_time = EXCLUDED.modification_time,
+            access_time = EXCLUDED.access_time;
+        """
+        
+        cur.execute(insert_query, (
+            metadata["file_path"],
+            metadata["file_name"],
+            metadata["file_size"],
+            metadata["creation_time"],
+            metadata["modification_time"],
+            metadata["access_time"],
+        ))
+        conn.commit()
+        cur.close()
+    except (Exception, psycopg2.Error) as error:
+        print(f"Error while connecting to PostgreSQL or inserting data: {error}")
+    finally:
+        if conn:
+            conn.close()
+
+def scan_and_store_metadata(directory):
+    """Scans a directory for files, collects metadata, and stores it in the database."""
+    for root, _, files in os.walk(directory):
+        for file in files:
+            filepath = os.path.join(root, file)
+            metadata = get_file_metadata(filepath)
+            if metadata:
+                insert_metadata_into_db(metadata)
+                print(f"Metadata for {file} stored.")
+
+if __name__ == "__main__":
+    scan_and_store_metadata(SCAN_DIRECTORY)
+    print("File scanning and metadata collection complete.")
+```
+
+```
+```
+
+## CLI usage
+
+The package provides a small CLI entrypoint you can run with Python's -m flag.
+
+Examples:
+
+Index a directory and print JSON metadata:
+
+```bash
+python -m fsync.cli index /path/to/dir --recursive --hash sha256
+```
+
+Compare two directories and print a JSON report:
+
+```bash
+python -m fsync.cli compare /path/to/dirA /path/to/dirB --recursive --hash sha256
+```
+
+The output is JSON written to stdout and can be redirected to a file for further processing.
+
+Additional options
+
+- `--workers N`: run N hashing workers (threads) to compute file checksums in parallel.
+- `--format jsonl`: (index) write one JSON object per line for streaming/large outputs.
+- `--format pretty`: (compare) print a concise human summary; pair with `--show N` to show sample entries.
+- `--show N`: show up to N sample matches in pretty compare output.
+- `--progress`: show a progress bar during indexing (requires `tqdm` package).
+- `--verbose`: increase CLI verbosity (repeat for more verbose logging).
+
+Hashing note
+
+ You can pass `--hash b3sum` to use the external `b3sum` utility (Blake3) for faster hashing when available. If `b3sum` is not installed, the CLI will fall back to the default `sha256`.
+
+Benchmark
+
+You can run a simple benchmark which creates files and measures hashing throughput:
+
+```bash
+fsync benchmark /tmp/fsync-bench --count 100 --size 4096 --hash b3sum --workers 4
+```
+
+If your `b3sum` binary is not on PATH, pass its path via `--b3sum-path /path/to/b3sum`.
+
+You can also install the package locally and get a `fsync` console script:
+
+```bash
+pip install -e .
+fsync index /path/to/dir --workers 4 --format jsonl > out.jsonl
+```
+
+
+
+```
+```
+
+```
+```
