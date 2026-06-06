@@ -149,6 +149,8 @@ def list_files_with_metadata(
             size = st.st_size
             mtime = st.st_mtime
             inode = st.st_ino
+            dev = st.st_dev
+            nlink = st.st_nlink
             atime = st.st_atime
             ctime = st.st_ctime
             uid = st.st_uid
@@ -162,6 +164,8 @@ def list_files_with_metadata(
                 "mtime": mtime,
                 "hash": None,
                 "inode": inode,
+                "dev": dev,
+                "nlink": nlink,
                 "atime": atime,
                 "ctime": ctime,
                 "uid": uid,
@@ -177,8 +181,26 @@ def list_files_with_metadata(
             # skip files we can't read
             continue
     # Compute hashes (possibly in parallel) over the collected results.
-    # Collect indices and target paths to hash
-    to_hash = [(i, Path(item["_target_path"])) for i, item in enumerate(results) if item.get("_target_path")]
+    # To avoid re-reading the same physical file many times (e.g. UrBackup-style
+    # hardlink farms), hash only one representative per (st_dev, st_ino) group and
+    # copy the digest to its hardlink siblings afterwards. Only files with more
+    # than one link are grouped, so filesystems that report a constant/zero inode
+    # for distinct files (no real hardlink info) still hash each file individually.
+    to_hash: List[Tuple[int, Path]] = []
+    seen_group: Dict[Tuple[Any, Any], int] = {}
+    for i, item in enumerate(results):
+        if not item.get("_target_path"):
+            continue
+        ino = item.get("inode")
+        nlink = item.get("nlink") or 1
+        group_key = (item.get("dev"), ino) if (nlink > 1 and ino) else None
+        if group_key is not None and group_key in seen_group:
+            # Sibling hardlink: reuse the representative's hash later.
+            item["_hash_from"] = seen_group[group_key]
+            continue
+        if group_key is not None:
+            seen_group[group_key] = i
+        to_hash.append((i, Path(item["_target_path"])))
 
     if to_hash:
         if workers is None or workers <= 1:
@@ -208,6 +230,12 @@ def list_files_with_metadata(
                             results[idx]["hash"] = fut.result()
                         except Exception:
                             results[idx]["hash"] = None
+
+    # Copy each representative's hash onto its hardlink siblings.
+    for item in results:
+        rep = item.pop("_hash_from", None)
+        if rep is not None:
+            item["hash"] = results[rep].get("hash")
 
     # Remove internal _target_path and apply fields filtering
     final: List[Dict[str, Any]] = []

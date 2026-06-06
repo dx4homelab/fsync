@@ -1,30 +1,25 @@
--- initdb script: create a table using JSONB
+-- initdb script: central file catalog keyed by (source, path)
 
 CREATE TABLE IF NOT EXISTS file_index (
   id SERIAL PRIMARY KEY,
-  path TEXT NOT NULL,
-  metadata JSONB NOT NULL,
-  created_at TIMESTAMP WITH TIME ZONE DEFAULT now()
+  source TEXT NOT NULL,                -- which root/host this entry came from
+  path TEXT NOT NULL,                  -- relative path within that source
+  metadata JSONB NOT NULL,             -- size, mtime, hash, inode, nlink, ...
+  created_at TIMESTAMPTZ DEFAULT now(),
+  updated_at TIMESTAMPTZ DEFAULT now(),
+  UNIQUE (source, path)                -- required for the ON CONFLICT upsert
 );
 
--- Example insert
-INSERT INTO file_index (path, metadata) VALUES ('/example.txt', '{"size": 123, "hash": "abc123"}'::jsonb);
-
--- Create a GIN index to accelerate searches/containment queries on JSONB
+-- GIN index to accelerate containment queries on the JSONB metadata
 CREATE INDEX IF NOT EXISTS idx_file_index_metadata_gin ON file_index USING gin (metadata);
 
--- Create an expression index on a commonly queried JSON key (hash) for fast lookup
+-- Expression index on the content hash for fast dedup / lookup across sources
 CREATE INDEX IF NOT EXISTS idx_file_index_metadata_hash ON file_index ((metadata->>'hash'));
 
--- Example queries you can run to search JSON data:
--- 1) Find rows where metadata contains a key/value (containment):
---    SELECT * FROM file_index WHERE metadata @> '{"hash": "abc123"}';
-
--- 2) Find rows where a JSON key exists:
---    SELECT * FROM file_index WHERE metadata ? 'size';
-
--- 3) Extract and compare a JSON scalar value:
---    SELECT * FROM file_index WHERE (metadata->>'size')::int > 100;
-
--- 4) Use the expression index to lookup by hash rapidly:
---    SELECT * FROM file_index WHERE metadata->>'hash' = 'abc123';
+-- Example queries:
+-- 1) Everything from one source:
+--    SELECT path FROM file_index WHERE source = '/mnt/vhd';
+-- 2) Find identical content anywhere (same hash across sources):
+--    SELECT source, path FROM file_index WHERE metadata->>'hash' = '<hex>';
+-- 3) Files larger than 100MB:
+--    SELECT source, path FROM file_index WHERE (metadata->>'size')::bigint > 104857600;

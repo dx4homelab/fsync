@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 from pathlib import Path
 from typing import Any
@@ -53,7 +54,8 @@ def cmd_index(args: argparse.Namespace) -> int:
             return 2
         from .db import store_index
 
-        store_index(db_url, data)
+        source = args.source or str(Path(args.dir).resolve())
+        store_index(db_url, data, source=source)
     return 0
 
 
@@ -106,8 +108,10 @@ def cmd_compare(args: argparse.Namespace) -> int:
             return 2
         from .db import store_index
 
-        store_index(db_url, a)
-        store_index(db_url, b)
+        source_a = args.source_a or str(Path(args.dirA).resolve())
+        source_b = args.source_b or str(Path(args.dirB).resolve())
+        store_index(db_url, a, source=source_a)
+        store_index(db_url, b, source=source_b)
     return 0
 
 
@@ -150,6 +154,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_index.add_argument("--b3sum-path", help="Path to external b3sum binary (optional)")
     p_index.add_argument("--store-db", action="store_true", help="Store index results into a Postgres DB")
     p_index.add_argument("--db-url", help="Postgres connection URL (overrides DB_URL env var)")
+    p_index.add_argument("--source", help="Source label for the central catalog (default: absolute path of dir)")
 
     p_cmp = sub.add_parser("compare", help="Compare two directories and print JSON report")
     p_cmp.add_argument("dirA", help="Left directory")
@@ -168,6 +173,8 @@ def build_parser() -> argparse.ArgumentParser:
     p_cmp.add_argument("--b3sum-path", help="Path to external b3sum binary (optional)")
     p_cmp.add_argument("--store-db", action="store_true", help="Store index results into a Postgres DB")
     p_cmp.add_argument("--db-url", help="Postgres connection URL (overrides DB_URL env var)")
+    p_cmp.add_argument("--source-a", help="Source label for dirA in the central catalog (default: absolute path)")
+    p_cmp.add_argument("--source-b", help="Source label for dirB in the central catalog (default: absolute path)")
 
     p_bench = sub.add_parser("benchmark", help="Run a simple hashing benchmark")
     p_bench.add_argument("dir", help="Directory to create files for benchmark (will write files)")
