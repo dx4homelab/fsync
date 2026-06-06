@@ -18,13 +18,18 @@ import sys
 from pathlib import Path
 from typing import Any
 
-from .fileindex import list_files_with_metadata, compare_file_lists
+from .fileindex import list_files_with_metadata, compare_file_lists, iter_index_records
 
 
 def cmd_index(args: argparse.Namespace) -> int:
     fields = None
     if args.fields:
         fields = [f.strip() for f in args.fields.split(",") if f.strip()]
+
+    # Storing to a DB uses the streaming path so memory stays bounded even for
+    # multi-million-file trees (the in-memory list approach gets OOM-killed).
+    if getattr(args, "store_db", False):
+        return _cmd_index_streaming(args, fields)
 
     data = list_files_with_metadata(
         Path(args.dir),
@@ -46,16 +51,49 @@ def cmd_index(args: argparse.Namespace) -> int:
         Path(args.output).write_text(out)
     else:
         sys.stdout.write(out + "\n")
-    # Optionally store in DB
-    if getattr(args, "store_db", False):
-        db_url = args.db_url or os.environ.get("DB_URL")
-        if not db_url:
-            print("DB URL not provided (use --db-url or set DB_URL)", file=sys.stderr)
-            return 2
-        from .db import store_index
+    return 0
 
-        source = args.source or str(Path(args.dir).resolve())
-        store_index(db_url, data, source=source)
+
+def _cmd_index_streaming(args: argparse.Namespace, fields) -> int:
+    """Index a directory straight into Postgres in bounded-memory batches."""
+    db_url = args.db_url or os.environ.get("DB_URL")
+    if not db_url:
+        print("DB URL not provided (use --db-url or set DB_URL)", file=sys.stderr)
+        return 2
+    from .db import store_index
+
+    source = args.source or str(Path(args.dir).resolve())
+    logger = getattr(args, "logger", None)
+    batch_size = 5000
+    out_f = open(args.output, "w") if args.output else None
+    batch: list[dict] = []
+    total = 0
+    try:
+        for rec in iter_index_records(
+            Path(args.dir),
+            recursive=args.recursive,
+            follow_symlinks=args.follow_symlinks,
+            hash_algo=args.hash,
+            workers=args.workers,
+            b3sum_path=getattr(args, "b3sum_path", None),
+            chunk_size=batch_size,
+            logger=logger,
+        ):
+            if out_f is not None:
+                out_f.write(json.dumps(rec) + "\n")
+            batch.append({k: rec[k] for k in fields if k in rec} if fields else rec)
+            if len(batch) >= batch_size:
+                store_index(db_url, batch, source=source)
+                total += len(batch)
+                batch = []
+                print(f"stored {total} records...", file=sys.stderr)
+        if batch:
+            store_index(db_url, batch, source=source)
+            total += len(batch)
+    finally:
+        if out_f is not None:
+            out_f.close()
+    print(f"done: stored {total} records to source '{source}'", file=sys.stderr)
     return 0
 
 

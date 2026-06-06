@@ -250,6 +250,128 @@ def list_files_with_metadata(
     return final
 
 
+def iter_index_records(
+    root: str | Path,
+    recursive: bool = True,
+    follow_symlinks: bool = False,
+    hash_algo: str = "sha256",
+    workers: int = 1,
+    b3sum_path: str | None = None,
+    chunk_size: int = 5000,
+    logger: Any | None = None,
+):
+    """Yield file metadata records one at a time, hashing in bounded-memory chunks.
+
+    Unlike :func:`list_files_with_metadata` (which materialises the whole tree),
+    this walks lazily and hashes files in chunks of ``chunk_size`` (in parallel
+    within a chunk), yielding finalised records as it goes. Hardlinks are
+    deduplicated globally by ``(st_dev, st_ino)`` through a small persistent
+    cache, so each physical file is read at most once even across chunks.
+
+    Memory stays bounded to roughly one chunk plus the inode cache, which is
+    what lets it index multi-million-file trees (e.g. UrBackup stores) without
+    being OOM-killed.
+    """
+    root_path = Path(root)
+    if not root_path.exists():
+        raise FileNotFoundError(f"Root path not found: {root}")
+    if not root_path.is_dir():
+        raise NotADirectoryError(f"Root path is not a directory: {root}")
+
+    from concurrent.futures import ThreadPoolExecutor
+
+    inode_hash: Dict[Tuple[Any, Any], str] = {}
+
+    def finalize(pending: List[Tuple[Dict[str, Any], Path, Any]]) -> List[Dict[str, Any]]:
+        # Decide which entries actually need hashing: skip ones whose (dev,ino)
+        # is already known (cached from a prior chunk) or shared within this chunk.
+        seen_local: Dict[Tuple[Any, Any], Dict[str, Any]] = {}
+        need: List[Tuple[Dict[str, Any], Path, Any]] = []
+        siblings: List[Tuple[Dict[str, Any], Any]] = []
+        for rec, tgt, gk in pending:
+            if gk is None:
+                need.append((rec, tgt, gk))
+            elif gk in inode_hash:
+                rec["hash"] = inode_hash[gk]
+            elif gk in seen_local:
+                siblings.append((rec, gk))
+            else:
+                seen_local[gk] = rec
+                need.append((rec, tgt, gk))
+
+        def do(item: Tuple[Dict[str, Any], Path, Any]) -> None:
+            rec, tgt, gk = item
+            try:
+                h = _compute_hash(tgt, algo=hash_algo, b3sum_path=b3sum_path)
+            except Exception:
+                h = None
+            rec["hash"] = h
+            if gk is not None and h is not None:
+                inode_hash[gk] = h
+
+        if workers and workers > 1 and len(need) > 1:
+            with ThreadPoolExecutor(max_workers=workers) as exe:
+                list(exe.map(do, need))
+        else:
+            for item in need:
+                do(item)
+
+        # Fill same-chunk hardlink siblings from their now-hashed representative.
+        for rec, gk in siblings:
+            rec["hash"] = inode_hash.get(gk)
+
+        return [rec for (rec, _, _) in pending]
+
+    walker = root_path.rglob("*") if recursive else root_path.iterdir()
+    pending: List[Tuple[Dict[str, Any], Path, Any]] = []
+    for p in walker:
+        try:
+            if p.is_file():
+                is_symlink = False
+                target_for_stat = p
+            elif follow_symlinks and p.is_symlink():
+                try:
+                    resolved = p.resolve(strict=True)
+                except OSError:
+                    continue
+                if not resolved.is_file():
+                    continue
+                is_symlink = True
+                target_for_stat = resolved
+            else:
+                continue
+
+            rel = p.relative_to(root_path).as_posix()
+            st = target_for_stat.stat()
+            rec = {
+                "name": p.name,
+                "path": rel,
+                "size": st.st_size,
+                "mtime": st.st_mtime,
+                "hash": None,
+                "inode": st.st_ino,
+                "dev": st.st_dev,
+                "nlink": st.st_nlink,
+                "atime": st.st_atime,
+                "ctime": st.st_ctime,
+                "uid": st.st_uid,
+                "gid": st.st_gid,
+                "mode": st.st_mode,
+                "is_symlink": is_symlink,
+            }
+            gk = (st.st_dev, st.st_ino) if (st.st_nlink > 1 and st.st_ino) else None
+            pending.append((rec, target_for_stat, gk))
+            if len(pending) >= chunk_size:
+                for r in finalize(pending):
+                    yield r
+                pending = []
+        except PermissionError:
+            continue
+    if pending:
+        for r in finalize(pending):
+            yield r
+
+
 def compare_file_lists(
     list_a: Iterable[Dict[str, Any]],
     list_b: Iterable[Dict[str, Any]],
