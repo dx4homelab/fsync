@@ -1,0 +1,22 @@
+version: '3.8'
+services:
+  db:
+    build: .
+    image: local-postgres-jsonb:latest
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: fsync
+      POSTGRES_PASSWORD: fsyncpass
+      POSTGRES_DB: fsyncdb
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U fsync -d fsyncdb"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  pgdata: {}

@@ -45,6 +45,15 @@ def cmd_index(args: argparse.Namespace) -> int:
         Path(args.output).write_text(out)
     else:
         sys.stdout.write(out + "\n")
+    # Optionally store in DB
+    if getattr(args, "store_db", False):
+        db_url = args.db_url or os.environ.get("DB_URL")
+        if not db_url:
+            print("DB URL not provided (use --db-url or set DB_URL)", file=sys.stderr)
+            return 2
+        from .db import store_index
+
+        store_index(db_url, data)
     return 0
 
 
@@ -89,6 +98,16 @@ def cmd_compare(args: argparse.Namespace) -> int:
         Path(args.output).write_text(out)
     else:
         sys.stdout.write(out + "\n")
+    # Optionally store in DB
+    if getattr(args, "store_db", False):
+        db_url = args.db_url or os.environ.get("DB_URL")
+        if not db_url:
+            print("DB URL not provided (use --db-url or set DB_URL)", file=sys.stderr)
+            return 2
+        from .db import store_index
+
+        store_index(db_url, a)
+        store_index(db_url, b)
     return 0
 
 
@@ -129,6 +148,8 @@ def build_parser() -> argparse.ArgumentParser:
     p_index.add_argument("--progress", action="store_true", help="Show a progress bar (requires tqdm)")
     p_index.add_argument("--verbose", action="count", default=0, help="Increase verbosity (repeat for more)")
     p_index.add_argument("--b3sum-path", help="Path to external b3sum binary (optional)")
+    p_index.add_argument("--store-db", action="store_true", help="Store index results into a Postgres DB")
+    p_index.add_argument("--db-url", help="Postgres connection URL (overrides DB_URL env var)")
 
     p_cmp = sub.add_parser("compare", help="Compare two directories and print JSON report")
     p_cmp.add_argument("dirA", help="Left directory")
@@ -145,6 +166,8 @@ def build_parser() -> argparse.ArgumentParser:
     p_cmp.add_argument("--progress", action="store_true", help="Show a progress bar (requires tqdm)")
     p_cmp.add_argument("--verbose", action="count", default=0, help="Increase verbosity (repeat for more)")
     p_cmp.add_argument("--b3sum-path", help="Path to external b3sum binary (optional)")
+    p_cmp.add_argument("--store-db", action="store_true", help="Store index results into a Postgres DB")
+    p_cmp.add_argument("--db-url", help="Postgres connection URL (overrides DB_URL env var)")
 
     p_bench = sub.add_parser("benchmark", help="Run a simple hashing benchmark")
     p_bench.add_argument("dir", help="Directory to create files for benchmark (will write files)")
