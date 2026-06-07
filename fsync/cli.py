@@ -14,6 +14,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import socket
 import sys
 from pathlib import Path
 from typing import Any
@@ -55,7 +56,12 @@ def cmd_index(args: argparse.Namespace) -> int:
 
 
 def _cmd_index_streaming(args: argparse.Namespace, fields) -> int:
-    """Index a directory straight into Postgres in bounded-memory batches."""
+    """Index a directory straight into Postgres in bounded-memory batches.
+
+    Optionally emits scan.* progress events to a dream4events server when
+    --events-url is given (telemetry never blocks the scan; emit failures are
+    swallowed).
+    """
     db_url = args.db_url or os.environ.get("DB_URL")
     if not db_url:
         print("DB URL not provided (use --db-url or set DB_URL)", file=sys.stderr)
@@ -64,35 +70,56 @@ def _cmd_index_streaming(args: argparse.Namespace, fields) -> int:
 
     source = args.source or str(Path(args.dir).resolve())
     logger = getattr(args, "logger", None)
+
+    # Optional event telemetry.
+    from .eventbus import FsyncEvents
+
+    events_url = getattr(args, "events_url", None) or os.environ.get("FSYNC_EVENTS_URL")
+    scanner_id = getattr(args, "scanner_id", None) or os.environ.get("FSYNC_SCANNER_ID") or socket.gethostname()
+    run_id = getattr(args, "run_id", None)
+    if events_url and not run_id:
+        from dream4devops.events import ulid_new
+
+        run_id = ulid_new()
+
     batch_size = 5000
     out_f = open(args.output, "w") if args.output else None
     batch: list[dict] = []
     total = 0
-    try:
-        for rec in iter_index_records(
-            Path(args.dir),
-            recursive=args.recursive,
-            follow_symlinks=args.follow_symlinks,
-            hash_algo=args.hash,
-            workers=args.workers,
-            b3sum_path=getattr(args, "b3sum_path", None),
-            chunk_size=batch_size,
-            logger=logger,
-        ):
-            if out_f is not None:
-                out_f.write(json.dumps(rec) + "\n")
-            batch.append({k: rec[k] for k in fields if k in rec} if fields else rec)
-            if len(batch) >= batch_size:
+    bytes_done = 0
+    with FsyncEvents(events_url, scanner_id, logger=logger) as events:
+        events.scan_started(run_id, source, dir=str(Path(args.dir)), hash=args.hash)
+        try:
+            for rec in iter_index_records(
+                Path(args.dir),
+                recursive=args.recursive,
+                follow_symlinks=args.follow_symlinks,
+                hash_algo=args.hash,
+                workers=args.workers,
+                b3sum_path=getattr(args, "b3sum_path", None),
+                chunk_size=batch_size,
+                logger=logger,
+            ):
+                if out_f is not None:
+                    out_f.write(json.dumps(rec) + "\n")
+                bytes_done += int(rec.get("size") or 0)
+                batch.append({k: rec[k] for k in fields if k in rec} if fields else rec)
+                if len(batch) >= batch_size:
+                    store_index(db_url, batch, source=source)
+                    total += len(batch)
+                    batch = []
+                    print(f"stored {total} records...", file=sys.stderr)
+                    events.scan_progress(run_id, total, bytes_done=bytes_done)
+            if batch:
                 store_index(db_url, batch, source=source)
                 total += len(batch)
-                batch = []
-                print(f"stored {total} records...", file=sys.stderr)
-        if batch:
-            store_index(db_url, batch, source=source)
-            total += len(batch)
-    finally:
-        if out_f is not None:
-            out_f.close()
+            events.scan_completed(run_id, source=source, files=total, bytes=bytes_done)
+        except Exception as e:
+            events.scan_failed(run_id, e)
+            raise
+        finally:
+            if out_f is not None:
+                out_f.close()
     print(f"done: stored {total} records to source '{source}'", file=sys.stderr)
     return 0
 
@@ -193,6 +220,8 @@ def build_parser() -> argparse.ArgumentParser:
     p_index.add_argument("--store-db", action="store_true", help="Store index results into a Postgres DB")
     p_index.add_argument("--db-url", help="Postgres connection URL (overrides DB_URL env var)")
     p_index.add_argument("--source", help="Source label for the central catalog (default: absolute path of dir)")
+    p_index.add_argument("--events-url", help="dream4events base URL; if set, emit scan.* progress events")
+    p_index.add_argument("--scanner-id", help="Scanner id used as event instance (default: hostname)")
 
     p_cmp = sub.add_parser("compare", help="Compare two directories and print JSON report")
     p_cmp.add_argument("dirA", help="Left directory")
