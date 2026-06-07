@@ -27,4 +27,7 @@ fsync/__pycache__/
 # SSH keys / secrets (do not commit)
 /github
 /github.pub
+
+# Local Claude settings
+.claude/settings.local.json
 scratchpad

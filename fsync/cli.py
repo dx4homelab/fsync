@@ -27,9 +27,10 @@ def cmd_index(args: argparse.Namespace) -> int:
     if args.fields:
         fields = [f.strip() for f in args.fields.split(",") if f.strip()]
 
-    # Storing to a DB uses the streaming path so memory stays bounded even for
-    # multi-million-file trees (the in-memory list approach gets OOM-killed).
-    if getattr(args, "store_db", False):
+    # Storing to a sink (DB or catalog API) uses the streaming path so memory
+    # stays bounded even for multi-million-file trees (the in-memory list
+    # approach gets OOM-killed).
+    if getattr(args, "store_db", False) or getattr(args, "catalog_url", None):
         return _cmd_index_streaming(args, fields)
 
     data = list_files_with_metadata(
@@ -63,13 +64,28 @@ def _cmd_index_streaming(args: argparse.Namespace, fields) -> int:
     swallowed).
     """
     db_url = args.db_url or os.environ.get("DB_URL")
-    if not db_url:
-        print("DB URL not provided (use --db-url or set DB_URL)", file=sys.stderr)
+    catalog_url = getattr(args, "catalog_url", None) or os.environ.get("FSYNC_CATALOG_URL")
+    if not db_url and not catalog_url:
+        print("No catalog sink: provide --catalog-url (preferred) or --db-url / DB_URL", file=sys.stderr)
         return 2
-    from .db import store_index
 
     source = args.source or str(Path(args.dir).resolve())
     logger = getattr(args, "logger", None)
+
+    # Choose the catalog sink: HTTP catalog API (scanner holds no DB creds) or direct DB.
+    catalog_client = None
+    if catalog_url:
+        from .catalog_client import CatalogClient
+
+        catalog_client = CatalogClient(catalog_url, source)
+
+        def store_batch(recs):
+            catalog_client.post_batch(recs)
+    else:
+        from .db import store_index
+
+        def store_batch(recs):
+            store_index(db_url, recs, source=source)
 
     # Optional event telemetry.
     from .eventbus import FsyncEvents
@@ -105,13 +121,13 @@ def _cmd_index_streaming(args: argparse.Namespace, fields) -> int:
                 bytes_done += int(rec.get("size") or 0)
                 batch.append({k: rec[k] for k in fields if k in rec} if fields else rec)
                 if len(batch) >= batch_size:
-                    store_index(db_url, batch, source=source)
+                    store_batch(batch)
                     total += len(batch)
                     batch = []
                     print(f"stored {total} records...", file=sys.stderr)
                     events.scan_progress(run_id, total, bytes_done=bytes_done)
             if batch:
-                store_index(db_url, batch, source=source)
+                store_batch(batch)
                 total += len(batch)
             events.scan_completed(run_id, source=source, files=total, bytes=bytes_done)
         except Exception as e:
@@ -120,6 +136,8 @@ def _cmd_index_streaming(args: argparse.Namespace, fields) -> int:
         finally:
             if out_f is not None:
                 out_f.close()
+            if catalog_client is not None:
+                catalog_client.close()
     print(f"done: stored {total} records to source '{source}'", file=sys.stderr)
     return 0
 
@@ -219,6 +237,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_index.add_argument("--b3sum-path", help="Path to external b3sum binary (optional)")
     p_index.add_argument("--store-db", action="store_true", help="Store index results into a Postgres DB")
     p_index.add_argument("--db-url", help="Postgres connection URL (overrides DB_URL env var)")
+    p_index.add_argument("--catalog-url", help="fsync catalog API base URL; POST batches over HTTP instead of direct DB")
     p_index.add_argument("--source", help="Source label for the central catalog (default: absolute path of dir)")
     p_index.add_argument("--events-url", help="dream4events base URL; if set, emit scan.* progress events")
     p_index.add_argument("--scanner-id", help="Scanner id used as event instance (default: hostname)")
