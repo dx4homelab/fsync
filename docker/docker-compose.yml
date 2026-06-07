@@ -11,7 +11,9 @@ services:
     volumes:
       - pgdata:/var/lib/postgresql/data
     ports:
-      - "5432:5432"
+      # Loopback-only: Postgres is reached via the events/catalog HTTP APIs,
+      # never directly from the LAN. (0.0.0.0 publish would bypass firewalld.)
+      - "127.0.0.1:5432:5432"
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U fsync -d fsyncdb"]
       interval: 5s
