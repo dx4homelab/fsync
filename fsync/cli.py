@@ -218,6 +218,33 @@ def cmd_benchmark(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_ctl(args: argparse.Namespace) -> int:
+    """Emit a command event addressed to a scanner (instance = target id)."""
+    events_url = args.events_url or os.environ.get("FSYNC_EVENTS_URL")
+    if not events_url:
+        print("ctl requires --events-url (or FSYNC_EVENTS_URL)", file=sys.stderr)
+        return 2
+    from .eventbus import FsyncEvents, EV_COMMAND
+    from dream4devops.events import ulid_new
+
+    command_id = ulid_new()
+    body = {"command": args.command, "command_id": command_id}
+    if args.command == "start_scan":
+        if not args.dir:
+            print("start_scan requires --dir", file=sys.stderr)
+            return 2
+        body["args"] = {
+            "dir": args.dir,
+            "source": args.source or args.dir,
+            "workers": args.workers,
+            "hash": args.hash,
+        }
+    with FsyncEvents(events_url, args.scanner_id, source="fsync-ctl") as ev:
+        eid = ev.emit(EV_COMMAND, body, correlation_id=command_id)
+    print(f"sent {args.command} to {args.scanner_id} (command_id={command_id}, event={eid})")
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="fsync")
     sub = p.add_subparsers(dest="cmd")
@@ -241,6 +268,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_index.add_argument("--source", help="Source label for the central catalog (default: absolute path of dir)")
     p_index.add_argument("--events-url", help="dream4events base URL; if set, emit scan.* progress events")
     p_index.add_argument("--scanner-id", help="Scanner id used as event instance (default: hostname)")
+    p_index.add_argument("--run-id", help="Correlation id for this scan's events (default: generated ULID)")
 
     p_cmp = sub.add_parser("compare", help="Compare two directories and print JSON report")
     p_cmp.add_argument("dirA", help="Left directory")
@@ -272,6 +300,29 @@ def build_parser() -> argparse.ArgumentParser:
     p_bench.add_argument("--progress", action="store_true", help="Show a progress bar (requires tqdm)")
     p_bench.add_argument("--verbose", action="count", default=0, help="Increase verbosity (repeat for more)")
 
+    # agent: long-running control-plane endpoint
+    p_agent = sub.add_parser("agent", help="Run the long-running scanner agent (register/heartbeat/poll commands)")
+    p_agent.add_argument("--scanner-id", help="Stable scanner id (default: hostname)")
+    p_agent.add_argument("--events-url", help="dream4events base URL (or FSYNC_EVENTS_URL)")
+    p_agent.add_argument("--catalog-url", help="fsync catalog API base URL (or FSYNC_CATALOG_URL)")
+    p_agent.add_argument("--db-url", help="Direct Postgres DSN fallback if no catalog-url (or DB_URL)")
+    p_agent.add_argument("--sources", help="Comma-separated roots this scanner manages (advertised in registration)")
+    p_agent.add_argument("--cursor", help="Path to persist the command-consumer cursor")
+    p_agent.add_argument("--poll-interval", type=float, default=5.0, help="Seconds between command polls")
+    p_agent.add_argument("--heartbeat-interval", type=float, default=30.0, help="Seconds between heartbeats")
+    p_agent.add_argument("--verbose", action="count", default=0, help="Increase verbosity")
+
+    # ctl: emit a command to a scanner (operator tool)
+    p_ctl = sub.add_parser("ctl", help="Send a command to a scanner via dream4events")
+    p_ctl.add_argument("command", choices=("ping", "start_scan", "stop"), help="Command to send")
+    p_ctl.add_argument("--scanner-id", required=True, help="Target scanner id")
+    p_ctl.add_argument("--events-url", help="dream4events base URL (or FSYNC_EVENTS_URL)")
+    p_ctl.add_argument("--dir", help="(start_scan) directory to index")
+    p_ctl.add_argument("--source", help="(start_scan) source label")
+    p_ctl.add_argument("--workers", type=int, default=4, help="(start_scan) hashing workers")
+    p_ctl.add_argument("--hash", default="sha256", help="(start_scan) hash algorithm")
+    p_ctl.add_argument("--verbose", action="count", default=0, help="Increase verbosity")
+
     return p
 
 
@@ -293,6 +344,12 @@ def main(argv: list[str] | None = None) -> int:
         return cmd_compare(args)
     if args.cmd == "benchmark":
         return cmd_benchmark(args)
+    if args.cmd == "agent":
+        from .agent import run_agent
+
+        return run_agent(args)
+    if args.cmd == "ctl":
+        return cmd_ctl(args)
     parser.print_help()
     return 1
 
