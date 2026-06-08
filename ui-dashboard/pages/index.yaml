@@ -1,0 +1,54 @@
+# fsync control-plane dashboard (dream4ui). Renders live from dream4events.
+title: fsync control plane
+
+data_sources:
+  recent:
+    kind: events_query
+    args: { limit: 60 }
+  heartbeats:
+    kind: events_query
+    args: { type: scanner.heartbeat, limit: 200 }
+  scans_started:
+    kind: events_query
+    args: { type: scan.started, limit: 200 }
+  scans_completed:
+    kind: events_query
+    args: { type: scan.completed, limit: 200 }
+  scans_failed:
+    kind: events_query
+    args: { type: scan.failed, limit: 200 }
+  commands:
+    kind: events_query
+    args: { type: scanner.command, limit: 200 }
+
+components:
+  - kind: nav_menu
+    args:
+      items:
+        - { label: fsync, href: / }
+
+  - kind: heading
+    args: { text: fsync control plane, level: 2 }
+
+  - kind: stats_panel
+    from: heartbeats
+    args: { label: heartbeats (last 200) }
+  - kind: stats_panel
+    from: scans_started
+    args: { label: scans started }
+  - kind: stats_panel
+    from: scans_completed
+    args: { label: scans completed }
+  - kind: stats_panel
+    from: scans_failed
+    args: { label: scans failed }
+  - kind: stats_panel
+    from: commands
+    args: { label: commands issued }
+
+  - kind: heading
+    args: { text: Recent events, level: 3 }
+  - kind: event_table
+    from: recent
+    args:
+      columns: [timestamp, type, source, instance, correlation_id]
