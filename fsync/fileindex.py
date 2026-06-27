@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import hashlib
 import os
+import shlex
 import subprocess
 import shutil
 from pathlib import Path
@@ -479,3 +480,203 @@ def compare_file_lists(
         "only_in_a": only_in_a,
         "only_in_b": only_in_b,
     }
+
+
+# ---------------------------------------------------------------------------
+# Sync planning: turn a compare report into rsync inputs.
+#
+# fsync itself never copies a byte; it computes the diff and projects it onto
+# rsync. The plan is hash-based (from ``compare_file_lists``), so it transfers
+# only genuinely-different files and treats content-identical-but-renamed files
+# as renames rather than re-copies.
+# ---------------------------------------------------------------------------
+
+DEFAULT_RSYNC_FLAGS: Tuple[str, ...] = (
+    "-aHAXS",
+    "--numeric-ids",
+    # The plan is already hash-authoritative (fsync decided these files differ),
+    # so force rsync to transfer exactly the listed files instead of re-deciding
+    # by size+mtime — otherwise a same-size/same-mtime-but-different-content file
+    # would be silently skipped, which is the whole hazard we are guarding against.
+    "--ignore-times",
+    "--info=progress2",
+    "--partial",
+)
+# AES-NI cipher, no double-compression; fast on a Thunderbolt/USB4 link.
+DEFAULT_RSYNC_SSH = "ssh -T -c aes128-gcm@openssh.com -o Compression=no -x"
+
+CONFLICT_POLICIES = ("review", "newer", "a-wins", "b-wins")
+MIRROR_MODES = (None, "a-to-b", "b-to-a")
+
+
+def _pair(entry: Any) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+    """Normalise a paired compare entry to ``(a, b)``.
+
+    Tolerates both the in-memory tuple form returned by
+    :func:`compare_file_lists` and the 2-element list form produced when a
+    report is round-tripped through JSON (``compare --output``).
+    """
+    return entry[0], entry[1]
+
+
+def build_sync_plan(
+    report: Dict[str, Any],
+    conflict: str = "review",
+    mirror: str | None = None,
+) -> Dict[str, Any]:
+    """Project a :func:`compare_file_lists` report onto a directional sync plan.
+
+    ``report`` is the dict returned by :func:`compare_file_lists`, or the same
+    structure loaded back from a ``compare --output`` JSON file (paired buckets
+    may be tuples or 2-element lists).
+
+    Returns a plan dict:
+
+    - ``a_to_b``  – file items to copy from A to B
+    - ``b_to_a``  – file items to copy from B to A
+    - ``a_delete``– items to delete on A (only for ``mirror='b-to-a'``)
+    - ``b_delete``– items to delete on B (only for ``mirror='a-to-b'``)
+    - ``conflicts``– list of ``(a_item, b_item)`` left for a human to decide
+      (only with ``conflict='review'`` or an undecidable ``newer`` tie)
+    - ``renames`` – list of ``(a_item, b_item)`` that are content-identical
+      under a different name (a rename on the receiver, not a copy)
+    - ``noop``    – count of byte-identical files (exact matches)
+
+    ``conflict`` routes same-path/different-content files
+    (``name_matches_diff_hash``): ``review`` (default; leave for a human),
+    ``newer`` (route by mtime), ``a-wins`` or ``b-wins``.
+
+    ``mirror`` makes the plan one-way and is the only mode that proposes
+    deletions: ``a-to-b`` makes B match A (A wins all conflicts, B's extras are
+    queued for deletion); ``b-to-a`` is the reverse. ``conflict`` is ignored
+    when ``mirror`` is set.
+    """
+    if conflict not in CONFLICT_POLICIES:
+        raise ValueError(f"conflict must be one of {CONFLICT_POLICIES}")
+    if mirror not in MIRROR_MODES:
+        raise ValueError(f"mirror must be one of {MIRROR_MODES}")
+
+    only_in_a = list(report.get("only_in_a", []))
+    only_in_b = list(report.get("only_in_b", []))
+    changed = [_pair(e) for e in report.get("name_matches_diff_hash", [])]
+    renames = [_pair(e) for e in report.get("hash_matches_diff_name", [])]
+    noop = len(report.get("exact_matches", []))
+
+    a_to_b: List[Dict[str, Any]] = []
+    b_to_a: List[Dict[str, Any]] = []
+    a_delete: List[Dict[str, Any]] = []
+    b_delete: List[Dict[str, Any]] = []
+    conflicts: List[Tuple[Dict[str, Any], Dict[str, Any]]] = []
+
+    if mirror == "a-to-b":
+        a_to_b.extend(only_in_a)
+        a_to_b.extend(a for a, _ in changed)  # A wins every conflict
+        b_delete.extend(only_in_b)
+    elif mirror == "b-to-a":
+        b_to_a.extend(only_in_b)
+        b_to_a.extend(b for _, b in changed)  # B wins every conflict
+        a_delete.extend(only_in_a)
+    else:
+        # Bidirectional union: each side's unique files flow to the other.
+        a_to_b.extend(only_in_a)
+        b_to_a.extend(only_in_b)
+        for a, b in changed:
+            if conflict == "a-wins":
+                a_to_b.append(a)
+            elif conflict == "b-wins":
+                b_to_a.append(b)
+            elif conflict == "newer":
+                am, bm = a.get("mtime"), b.get("mtime")
+                if am is None or bm is None or am == bm:
+                    conflicts.append((a, b))  # cannot decide -> hand to human
+                elif am > bm:
+                    a_to_b.append(a)
+                else:
+                    b_to_a.append(b)
+            else:  # review
+                conflicts.append((a, b))
+
+    return {
+        "a_to_b": a_to_b,
+        "b_to_a": b_to_a,
+        "a_delete": a_delete,
+        "b_delete": b_delete,
+        "conflicts": conflicts,
+        "renames": renames,
+        "noop": noop,
+    }
+
+
+def _with_slash(p: str) -> str:
+    return p if p.endswith("/") else p + "/"
+
+
+def _is_remote(endpoint: str) -> bool:
+    """True if ``endpoint`` is an rsync remote ``[user@]host:path`` spec.
+
+    A leading ``/``, ``./`` or ``../`` is always local; otherwise a colon that
+    appears before the first slash marks a remote host spec.
+    """
+    if endpoint.startswith(("/", "./", "../")):
+        return False
+    head = endpoint.split("/", 1)[0]
+    return ":" in head
+
+
+def split_remote(endpoint: str) -> Tuple[str | None, str]:
+    """Split an rsync endpoint into ``(host_or_None, path)``.
+
+    ``developer@host:/home/developer`` -> ``("developer@host", "/home/developer")``;
+    a local path returns ``(None, path)``.
+    """
+    if not _is_remote(endpoint):
+        return None, endpoint
+    host, _, path = endpoint.partition(":")
+    return host, path
+
+
+def render_rsync_command(
+    files_from: str,
+    src: str,
+    dest: str,
+    dry_run: bool = True,
+    ssh: str | None = DEFAULT_RSYNC_SSH,
+    flags: Iterable[str] | None = None,
+) -> str:
+    """Render one guarded rsync command line driven by a ``--files-from`` list.
+
+    The listed paths are relative to ``src``'s root; ``-e ssh`` is added only
+    when either endpoint is remote. ``--files-from`` makes rsync transfer only
+    the named files (creating their parent dirs), so no whole-tree ``--delete``
+    walk happens here.
+    """
+    parts: List[str] = ["rsync", *(list(flags) if flags is not None else list(DEFAULT_RSYNC_FLAGS))]
+    if dry_run:
+        parts.append("-n")
+    if ssh and (_is_remote(src) or _is_remote(dest)):
+        parts.append(f"-e {shlex.quote(ssh)}")
+    parts.append(f"--files-from={shlex.quote(files_from)}")
+    parts.append(shlex.quote(_with_slash(src)))
+    parts.append(shlex.quote(_with_slash(dest)))
+    return " ".join(parts)
+
+
+def render_delete_block(list_file: str, target: str) -> str:
+    """Render a guarded shell block that deletes the paths in ``list_file`` on ``target``.
+
+    Works for a local path or a remote ``host:path`` endpoint. The caller is
+    expected to keep this commented out by default — deletions are the
+    destructive part of a mirror.
+    """
+    host, base = split_remote(target)
+    base = base.rstrip("/")
+    lf = shlex.quote(list_file)
+    if host is None:
+        # Bind base to a quoted shell var so a path containing $, backticks,
+        # quotes, etc. cannot be re-interpreted (or break out of) the command.
+        return (
+            f"base={shlex.quote(base)}; "
+            f'while IFS= read -r f; do rm -vf -- "$base/$f"; done < {lf}'
+        )
+    remote = f'cd {shlex.quote(base)} && while IFS= read -r f; do rm -vf -- "$f"; done'
+    return f"ssh {shlex.quote(host)} {shlex.quote(remote)} < {lf}"

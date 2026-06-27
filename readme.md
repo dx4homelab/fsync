@@ -148,6 +148,40 @@ pip install -e .
 fsync index /path/to/dir --workers 4 --format jsonl > out.jsonl
 ```
 
+## Sync planning (`fsync sync-plan`)
+
+`compare` tells you what differs; `sync-plan` projects that hash-based diff onto
+**rsync** inputs. fsync never copies bytes itself — it writes `--files-from`
+lists plus a guarded `run.sh` you review and run.
+
+```bash
+# Bidirectional union (default, dry-run): each side's unique files flow to the
+# other; same-path/different-content files are listed as conflicts, NOT synced.
+fsync sync-plan /home/developer developer@10.55.0.2:/home/developer --out-dir plan
+# (or scan locally and point rsync elsewhere)
+fsync sync-plan /home/developer /mnt/other \
+  --src /home/developer --dest developer@10.55.0.2:/home/developer --out-dir plan
+bash plan/run.sh        # review first; re-run sync-plan with --execute to drop -n
+```
+
+Generated files: `plan.a_to_b.lst`, `plan.b_to_a.lst` (rsync `--files-from`
+lists), `plan.conflicts.txt`, `plan.renames.sh` (content-identical files under a
+different name — a rename, not a re-copy), and `run.sh`.
+
+Key options:
+
+- `--conflict review|newer|a-wins|b-wins` — how to route same-path/different-content files (default `review`: left for a human, never auto-clobbered).
+- `--mirror a-to-b|b-to-a` — one-way mirror (the only mode that proposes deletions; they are written to a list and **commented out** in `run.sh`). Ignores `--conflict`.
+- `--from-report report.json` — consume a saved `compare --output` report (requires `--src`/`--dest`).
+- `--execute` — emit live rsync commands (default is a dry run with `-n`).
+- `--src` / `--dest` — rsync endpoints (default: the resolved scan dirs).
+- `--rsync-flags` — override the defaults (`-aHAXS --numeric-ids --ignore-times --info=progress2 --partial`).
+
+Safety: copies never `--delete`; `--ignore-times` makes rsync transfer exactly
+the hash-chosen files (so a same-size/same-mtime-but-different-content file is
+never silently skipped); deletions only ever appear in mirror mode and are
+emitted commented-out. After running, re-run `fsync compare` to verify.
+
 
 
 ```

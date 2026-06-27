@@ -14,12 +14,22 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import shlex
 import socket
 import sys
 from pathlib import Path
 from typing import Any
 
-from .fileindex import list_files_with_metadata, compare_file_lists, iter_index_records
+from .fileindex import (
+    list_files_with_metadata,
+    compare_file_lists,
+    iter_index_records,
+    build_sync_plan,
+    render_rsync_command,
+    render_delete_block,
+    split_remote,
+    DEFAULT_RSYNC_SSH,
+)
 
 
 def cmd_index(args: argparse.Namespace) -> int:
@@ -245,6 +255,275 @@ def cmd_ctl(args: argparse.Namespace) -> int:
     return 0
 
 
+def _plan_paths(items: list[dict]) -> tuple[list[str], list]:
+    """Extract clean relative paths for an rsync --files-from list.
+
+    Returns ``(usable_paths, skipped_items)``. An entry is skipped when it has no
+    ``path`` or the path contains an embedded newline (which would corrupt the
+    newline-delimited list file). Callers must surface ``skipped`` — this tool
+    must never drop user data silently.
+    """
+    out: list[str] = []
+    skipped: list = []
+    for it in items:
+        p = it.get("path")
+        if not p or "\n" in p or "\r" in p:
+            skipped.append(it)
+            continue
+        out.append(p)
+    return out, skipped
+
+
+def _render_renames_script(pairs: list, target: str, old_idx: int, new_idx: int,
+                           required: bool = False) -> str:
+    """Render a script that renames content-identical files on ``target``.
+
+    Each pair is ``(a_item, b_item)`` whose bytes are identical under a different
+    name. ``old_idx``/``new_idx`` (0=A, 1=B) pick which side's path is the
+    *existing* name on ``target`` and which is the *desired* name — so for
+    ``--mirror a-to-b`` we rename on B (B's name -> A's name) and for
+    ``b-to-a`` we rename on A (A's name -> B's name). Renaming avoids re-copying
+    the bytes. ``required`` only changes the wording (mirror needs it to
+    converge; union treats it as optional reconciliation).
+    """
+    host, base = split_remote(target)
+    base = base.rstrip("/")
+    intro = ("# Rename content-identical files so the two sides' names converge."
+             if required else
+             "# OPTIONAL: rename content-identical files to reconcile differing names.")
+    lines = [
+        "#!/usr/bin/env bash",
+        intro,
+        "# These bytes already exist under a different name; this avoids a re-copy.",
+        "set -euo pipefail",
+        "",
+    ]
+    dropped = 0
+    for pair in pairs:
+        old = pair[old_idx].get("path")
+        new = pair[new_idx].get("path")
+        if not old or not new:
+            dropped += 1  # cannot place this rename -> surface it, never silent
+            continue
+        if old == new:
+            continue  # already correctly named: a genuine no-op, not a loss
+        old_full = f"{base}/{old}"
+        new_full = f"{base}/{new}"
+        new_dir = os.path.dirname(new_full)
+        # mkdir -p so the rename works even when the other side's directory
+        # layout doesn't yet exist on the receiver.
+        op = f"mkdir -p -- {shlex.quote(new_dir)} && mv -vn -- {shlex.quote(old_full)} {shlex.quote(new_full)}"
+        if host is None:
+            lines.append(op)
+        else:
+            lines.append(f"ssh {shlex.quote(host)} {shlex.quote(op)}")
+    return "\n".join(lines) + "\n", dropped
+
+
+def cmd_sync_plan(args: argparse.Namespace) -> int:
+    """Turn a compare report into rsync inputs: --files-from lists + a run.sh.
+
+    Either compares two directories on the fly, or consumes a saved
+    ``compare --output`` report via ``--from-report``. fsync plans and verifies;
+    rsync moves the bytes.
+    """
+    logger = getattr(args, "logger", None)
+
+    # 1. Obtain the compare report.
+    if args.from_report:
+        try:
+            report = json.loads(Path(args.from_report).read_text())
+        except (OSError, ValueError) as e:
+            # OSError: missing / dir / unreadable; ValueError: bad JSON or non-UTF8.
+            print(f"--from-report: cannot read {args.from_report}: {e}", file=sys.stderr)
+            return 2
+        if not args.src or not args.dest:
+            print("--from-report requires --src and --dest (rsync endpoints)", file=sys.stderr)
+            return 2
+        src = args.src
+        dest = args.dest
+    else:
+        if not args.dirA or not args.dirB:
+            print("provide two directories (dirA dirB) or --from-report REPORT", file=sys.stderr)
+            return 2
+        a = list_files_with_metadata(
+            Path(args.dirA), recursive=args.recursive, hash_algo=args.hash,
+            workers=args.workers, show_progress=args.progress,
+            b3sum_path=getattr(args, "b3sum_path", None), logger=logger,
+        )
+        b = list_files_with_metadata(
+            Path(args.dirB), recursive=args.recursive, hash_algo=args.hash,
+            workers=args.workers, show_progress=args.progress,
+            b3sum_path=getattr(args, "b3sum_path", None), logger=logger,
+        )
+        report = compare_file_lists(a, b, match_on=args.match_on)
+        src = args.src or str(Path(args.dirA).resolve())
+        dest = args.dest or str(Path(args.dirB).resolve())
+
+    # A newline in an endpoint would break out of run.sh comment/command lines.
+    for label, ep in (("--src/dirA", src), ("--dest/dirB", dest)):
+        if "\n" in ep or "\r" in ep:
+            print(f"{label} contains a newline; refusing (would corrupt run.sh)", file=sys.stderr)
+            return 2
+
+    # 2. Build the directional plan.
+    plan = build_sync_plan(report, conflict=args.conflict, mirror=args.mirror)
+
+    # 3. Emit the artifacts.
+    out_dir = Path(args.out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    ssh = None if args.no_ssh else (args.ssh or DEFAULT_RSYNC_SSH)
+    dry_run = not args.execute
+    flags = args.rsync_flags.split() if getattr(args, "rsync_flags", None) else None
+    if flags is not None:
+        # The default flags include --ignore-times specifically so rsync transfers
+        # exactly the hash-chosen files. Warn if an override drops that guard.
+        has_force = any(
+            fl in ("--ignore-times", "--checksum", "-c")
+            or (fl.startswith("-") and not fl.startswith("--") and ("I" in fl or "c" in fl))
+            for fl in flags
+        )
+        if not has_force:
+            print("WARNING: --rsync-flags lacks --ignore-times/-I (or --checksum); rsync "
+                  "may skip same-size+mtime files that fsync flagged as different.",
+                  file=sys.stderr)
+    written: list[str] = []
+    skipped_total = 0
+
+    def write(name: str, text: str) -> str:
+        (out_dir / name).write_text(text)
+        written.append(name)
+        return name
+
+    def paths_for(items: list, label: str) -> list[str]:
+        nonlocal skipped_total
+        good, skipped = _plan_paths(items)
+        if skipped:
+            skipped_total += len(skipped)
+            sample = [it.get("path") or it.get("name") or "<no path>" for it in skipped[:3]]
+            print(f"WARNING: {label}: skipped {len(skipped)} entr(y/ies) with missing or "
+                  f"newline-containing path (NOT synced): {sample}", file=sys.stderr)
+        return good
+
+    run_lines = [
+        "#!/usr/bin/env bash",
+        "# Generated by `fsync sync-plan`. REVIEW before running.",
+        f"# mode: {args.mirror or 'bidirectional union'}   conflict: {args.conflict}",
+        f"# SRC (A): {src}",
+        f"# DEST(B): {dest}",
+        "# rsync commands "
+        + ("include -n (DRY RUN); re-run sync-plan with --execute to apply."
+           if dry_run else "are LIVE (no -n). They will modify the destination."),
+        "# Copies never delete; any deletions (mirror) are commented out below.",
+        "set -euo pipefail",
+        'cd "$(dirname "$0")"',
+        "",
+    ]
+
+    a_paths = paths_for(plan["a_to_b"], "A->B")
+    if a_paths:
+        lf = write("plan.a_to_b.lst", "\n".join(a_paths) + "\n")
+        run_lines += [
+            f"# A -> B : {len(a_paths)} file(s) present/newer on A",
+            render_rsync_command(lf, src, dest, dry_run=dry_run, ssh=ssh, flags=flags),
+            "",
+        ]
+
+    b_paths = paths_for(plan["b_to_a"], "B->A")
+    if b_paths:
+        lf = write("plan.b_to_a.lst", "\n".join(b_paths) + "\n")
+        run_lines += [
+            f"# B -> A : {len(b_paths)} file(s) present/newer on B",
+            render_rsync_command(lf, dest, src, dry_run=dry_run, ssh=ssh, flags=flags),
+            "",
+        ]
+
+    del_paths = paths_for(plan["b_delete"], "delete-on-B")
+    if del_paths:
+        lf = write("plan.b_delete.lst", "\n".join(del_paths) + "\n")
+        run_lines += [
+            f"# --- DELETE on B ({len(del_paths)} file(s)) : mirror {args.mirror}. ---",
+            "# DESTRUCTIVE and commented out. Review plan.b_delete.lst, then uncomment:",
+            "# " + render_delete_block(lf, dest),
+            "",
+        ]
+    del_paths_a = paths_for(plan["a_delete"], "delete-on-A")
+    if del_paths_a:
+        lf = write("plan.a_delete.lst", "\n".join(del_paths_a) + "\n")
+        run_lines += [
+            f"# --- DELETE on A ({len(del_paths_a)} file(s)) : mirror {args.mirror}. ---",
+            "# DESTRUCTIVE and commented out. Review plan.a_delete.lst, then uncomment:",
+            "# " + render_delete_block(lf, src),
+            "",
+        ]
+
+    if plan["conflicts"]:
+        clines = [
+            "# Unresolved conflicts: same path, different content on both sides.",
+            "# Decide each, then edit the .lst files or re-run with",
+            "# --conflict newer|a-wins|b-wins (or --mirror to force a direction).",
+            "",
+        ]
+        for a, b in plan["conflicts"]:
+            clines.append(a.get("path", a.get("name", "?")))
+            clines.append(f"    A: mtime={a.get('mtime')}  hash={a.get('hash')}")
+            clines.append(f"    B: mtime={b.get('mtime')}  hash={b.get('hash')}")
+        write("plan.conflicts.txt", "\n".join(clines) + "\n")
+        run_lines += [
+            f"# {len(plan['conflicts'])} unresolved conflict(s) -> see plan.conflicts.txt (NOT synced).",
+            "",
+        ]
+
+    if plan["renames"]:
+        # Rename on the side that must change so its names match the other side.
+        # mirror b-to-a => change A (src), A's name -> B's name; otherwise change
+        # B (dest), B's name -> A's name. In mirror mode the rename is needed for
+        # convergence (renamed files are in neither copy nor delete list).
+        if args.mirror == "b-to-a":
+            rn_target, old_idx, new_idx = src, 0, 1
+        else:
+            rn_target, old_idx, new_idx = dest, 1, 0
+        required = args.mirror is not None
+        rn_text, rn_dropped = _render_renames_script(plan["renames"], rn_target, old_idx, new_idx, required=required)
+        rn = write("plan.renames.sh", rn_text)
+        os.chmod(out_dir / rn, 0o755)
+        if rn_dropped:
+            skipped_total += rn_dropped
+            print(f"WARNING: renames: skipped {rn_dropped} rename(s) with missing path "
+                  f"(NOT reconciled){'; mirror will not fully converge' if required else ''}.",
+                  file=sys.stderr)
+        n = len(plan["renames"]) - rn_dropped
+        if required and not dry_run:
+            run_lines += [f"# {n} content-identical rename(s) (required for mirror convergence):",
+                          f"bash {rn}", ""]
+        elif required:
+            run_lines += [f"# {n} content-identical rename(s) (required for mirror; runs live):",
+                          f"# DRY RUN — review, then with --execute this becomes: bash {rn}", ""]
+        else:
+            run_lines += [f"# {n} content-identical rename(s) -> optional reconciliation: bash {rn}", ""]
+
+    run_name = write("run.sh", "\n".join(run_lines) + "\n")
+    os.chmod(out_dir / run_name, 0o755)
+
+    # 4. Summary.
+    print(
+        "sync-plan ({mode}, conflict={c}): A->B {ab}, B->A {ba}, "
+        "conflicts {cf}, renames {rn}, identical {noop}{dels}{sk}".format(
+            mode=args.mirror or "union",
+            c=args.conflict,
+            ab=len(a_paths), ba=len(b_paths),
+            cf=len(plan["conflicts"]), rn=len(plan["renames"]), noop=plan["noop"],
+            dels=(f", deletes {len(del_paths) + len(del_paths_a)}"
+                  if (del_paths or del_paths_a) else ""),
+            sk=(f", SKIPPED {skipped_total}" if skipped_total else ""),
+        ),
+        file=sys.stderr,
+    )
+    print(f"wrote {len(written)} file(s) to {out_dir} (run: bash {out_dir / 'run.sh'}"
+          + ("; DRY RUN)" if dry_run else "; LIVE)"), file=sys.stderr)
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="fsync")
     sub = p.add_subparsers(dest="cmd")
@@ -323,6 +602,31 @@ def build_parser() -> argparse.ArgumentParser:
     p_ctl.add_argument("--hash", default="sha256", help="(start_scan) hash algorithm")
     p_ctl.add_argument("--verbose", action="count", default=0, help="Increase verbosity")
 
+    # sync-plan: project a compare report onto rsync inputs (--files-from + run.sh)
+    p_plan = sub.add_parser("sync-plan", help="Generate rsync --files-from lists + run.sh from a compare diff")
+    p_plan.add_argument("dirA", nargs="?", help="Left directory (omit if using --from-report)")
+    p_plan.add_argument("dirB", nargs="?", help="Right directory (omit if using --from-report)")
+    p_plan.add_argument("--from-report", help="Consume a saved `compare --output` JSON report instead of scanning")
+    p_plan.add_argument("--out-dir", default="fsync-plan", help="Directory for the generated plan files (default: fsync-plan)")
+    p_plan.add_argument("--conflict", choices=("review", "newer", "a-wins", "b-wins"), default="review",
+                        help="How to route same-path/different-content files (default: review)")
+    p_plan.add_argument("--mirror", choices=("a-to-b", "b-to-a"), default=None,
+                        help="One-way mirror (the only mode that proposes deletions); ignores --conflict")
+    p_plan.add_argument("--src", help="rsync SOURCE endpoint for A (default: resolved dirA); e.g. /home/developer")
+    p_plan.add_argument("--dest", help="rsync DEST endpoint for B (default: resolved dirB); e.g. developer@10.55.0.2:/home/developer")
+    p_plan.add_argument("--ssh", help=f"ssh command for rsync -e on remote endpoints (default: {DEFAULT_RSYNC_SSH!r})")
+    p_plan.add_argument("--rsync-flags", help="Override the default rsync flags ('-aHAXS --numeric-ids --ignore-times --info=progress2 --partial')")
+    p_plan.add_argument("--no-ssh", action="store_true", help="Do not add -e ssh (both endpoints are local)")
+    p_plan.add_argument("--execute", action="store_true", help="Emit live rsync commands (default: dry-run, with -n)")
+    p_plan.add_argument("--recursive", action="store_true", default=True, help="Recurse into subdirectories")
+    p_plan.add_argument("--no-recursive", dest="recursive", action="store_false", help="Do not recurse")
+    p_plan.add_argument("--hash", default="sha256", help="Hash algorithm for the scan (default: sha256)")
+    p_plan.add_argument("--match-on", choices=("path", "name"), default="path", help="Match files on path or name (default: path)")
+    p_plan.add_argument("--workers", type=int, default=1, help="Hashing worker threads (default: 1)")
+    p_plan.add_argument("--b3sum-path", help="Path to external b3sum binary (optional)")
+    p_plan.add_argument("--progress", action="store_true", help="Show a progress bar (requires tqdm)")
+    p_plan.add_argument("--verbose", action="count", default=0, help="Increase verbosity")
+
     return p
 
 
@@ -350,6 +654,8 @@ def main(argv: list[str] | None = None) -> int:
         return run_agent(args)
     if args.cmd == "ctl":
         return cmd_ctl(args)
+    if args.cmd == "sync-plan":
+        return cmd_sync_plan(args)
     parser.print_help()
     return 1
 
