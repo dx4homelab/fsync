@@ -9,6 +9,7 @@
 #   - SSH host keys          (clones present identical keys -> insecure)
 #   - systemd random seed    (shared entropy on first boot)
 #   - cached DHCP leases
+#   - stale browser locks    (Chromium/Chrome SingletonLock after rename)
 #
 # It deliberately does NOT touch filesystem/LVM/btrfs UUIDs — that only
 # matters if both disks are attached to one machine, and changing the root
@@ -107,6 +108,7 @@ About to make this machine unique:
   ssh host keys: regenerate
   random-seed  : remove (regenerated on boot)
   dhcp leases  : clear
+  browser locks: clear stale Singleton* (post-rename; running browsers skipped)
   reboot after : $([[ $DO_REBOOT -eq 1 ]] && echo yes || echo no)
   mode         : $([[ $DRY_RUN -eq 1 ]] && echo DRY-RUN || echo APPLY)
 EOF
@@ -164,6 +166,51 @@ fi
 # ---- 5. cached DHCP leases --------------------------------------------------
 info "Clearing cached DHCP leases"
 run bash -c 'rm -f /var/lib/NetworkManager/*.lease /var/lib/NetworkManager/*-lease* /var/lib/dhclient/*.leases 2>/dev/null || true'
+
+# ---- 6. stale browser profile locks -----------------------------------------
+# Chromium/Chrome keep a per-profile SingletonLock symlink whose target is
+# "<hostname>-<pid>". After a rename the embedded hostname no longer matches, so
+# the browser assumes the profile is open on another computer (its shared-/NFS-
+# profile guard) and refuses to start. Clear locks left by the old hostname or a
+# dead PID; leave alone any profile a browser is genuinely using on this host.
+# These files hold NO user data (no passwords/cookies) — only a runtime lock.
+info "Clearing stale browser profile locks (post-rename)"
+
+LIVE_HOST="$(hostname 2>/dev/null || echo "$NEW_HOSTNAME")"
+# Default user-data dirs of the common Chromium-family browsers.
+BROWSER_DIRS=(google-chrome google-chrome-beta google-chrome-unstable \
+              chromium chromium-browser BraveSoftware/Brave-Browser \
+              microsoft-edge vivaldi opera)
+
+# Return 0 if the profile's SingletonLock is stale/foreign (safe to remove),
+# 1 if a live browser on THIS host still holds it (leave it).
+singleton_is_stale() {
+  local prof="$1" target host pid
+  target="$(readlink "$prof/SingletonLock" 2>/dev/null)" || return 0  # not a symlink -> stale
+  [[ -n "$target" ]] || return 0
+  # Target is "<host>-<pid>"; host may itself contain hyphens, pid is last field.
+  pid="${target##*-}"
+  host="${target%-*}"
+  [[ "$host" == "$LIVE_HOST" ]]   || return 0   # different/old hostname -> stale
+  [[ "$pid" =~ ^[0-9]+$ ]]        || return 0   # unparseable -> stale
+  kill -0 "$pid" 2>/dev/null      && return 1   # PID alive on this host -> in use
+  return 0                                       # dead PID -> stale
+}
+
+while IFS=: read -r _ _ uid _ _ home _; do
+  [[ "$uid" =~ ^[0-9]+$ && "$uid" -ge 1000 && "$uid" -ne 65534 ]] || continue
+  [[ -d "$home" ]] || continue
+  for b in "${BROWSER_DIRS[@]}"; do
+    prof="$home/.config/$b"
+    [[ -L "$prof/SingletonLock" || -e "$prof/SingletonLock" ]] || continue
+    if singleton_is_stale "$prof"; then
+      run rm -f "$prof/SingletonLock" "$prof/SingletonCookie" "$prof/SingletonSocket"
+      ok "cleared stale locks: $prof"
+    else
+      info "in use, left alone: $prof"
+    fi
+  done
+done < /etc/passwd
 
 # ---- done -------------------------------------------------------------------
 if [[ $DRY_RUN -eq 1 ]]; then
