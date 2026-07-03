@@ -25,9 +25,33 @@ from textual.binding import Binding
 from textual.containers import VerticalScroll
 from textual.widgets import Footer, Header, Static
 
-from .homesync import discover_run, state_root
+from .homesync import discover_run, report_totals, state_root
 
 POLL_SECONDS = 0.4
+TIMER_PROBE_TICKS = 35  # systemd probe every ~14s; file reads happen every tick
+
+
+def parse_systemd_show(text: str) -> dict:
+    """Parse `systemctl show` KEY=VALUE output."""
+    out: dict[str, str] = {}
+    for line in text.splitlines():
+        key, _, value = line.partition("=")
+        out[key] = value
+    return out
+
+
+def timer_next_from_json(text: str) -> str | None:
+    """Extract 'HH:MM' of the next elapse from `list-timers --output=json`.
+
+    Works for monotonic timers too (whose NextElapseUSecRealtime is empty in
+    `systemctl show`). Returns None when the timer is absent or unscheduled.
+    """
+    try:
+        entries = json.loads(text)
+        usec = entries[0].get("next")
+        return time.strftime("%H:%M", time.localtime(usec / 1_000_000)) if usec else None
+    except (ValueError, IndexError, KeyError, TypeError):
+        return None
 
 PHASE_LABEL = {
     "indexing": "indexing…",
@@ -49,6 +73,7 @@ def fmt_bytes(n: int | None) -> str:
 class SyncTuiApp(App):
     TITLE = "fsync sync"
     CSS = """
+    #statusbar { padding: 0 2; height: 2; color: $text-muted; border-bottom: hkey $panel; }
     #body { padding: 1 2; }
     """
     BINDINGS = [
@@ -75,17 +100,25 @@ class SyncTuiApp(App):
         self.prev_run_id: str | None = None
         self.spawn_deadline = 0.0
         self.msg = ""
+        # status strip state
+        self.timer_state = "…"
+        self.timer_next: str | None = None
+        self._tick_n = 0
+        self._activity_cache: tuple | None = None  # ((run_id, mtime), summary)
 
     # ------------------------------------------------------------------ setup
 
     def compose(self) -> ComposeResult:
         yield Header(show_clock=True)
+        yield Static(id="statusbar")
         yield VerticalScroll(Static(id="body"))
         yield Footer()
 
     def on_mount(self) -> None:
         self.set_interval(POLL_SECONDS, self.tick)
         found = discover_run()
+        self.update_statusbar(found)
+        self.run_worker(self._timer_probe, thread=True, exclusive=False)
         if found:
             self.prev_run_id = found["pointer"].get("run_id")
             if found["running"]:
@@ -221,6 +254,12 @@ class SyncTuiApp(App):
     # ------------------------------------------------------------------ poll
 
     def tick(self) -> None:
+        self._tick_n += 1
+        found = discover_run()
+        self.update_statusbar(found)
+        if self._tick_n % TIMER_PROBE_TICKS == 0:
+            self.run_worker(self._timer_probe, thread=True, exclusive=False)
+
         if self.mode == "planning":
             try:
                 self.plan_partial = json.loads(self.plan_progress_path.read_text())
@@ -228,7 +267,6 @@ class SyncTuiApp(App):
             except (OSError, ValueError, AttributeError):
                 pass  # snapshot not written yet (engine push / peer probe phase)
         elif self.mode == "spawning":
-            found = discover_run()
             if found and found["pointer"].get("run_id") != self.prev_run_id:
                 self.prev_run_id = found["pointer"].get("run_id")
                 self.attach(found)
@@ -237,12 +275,70 @@ class SyncTuiApp(App):
                 self.msg = f"runner did not start — see {state_root() / 'tui-runner.log'}"
                 self.render_body()
         elif self.mode == "progress":
-            found = discover_run()
             if found:
                 self.progress = found["progress"]
                 if not found["running"]:
                     self.mode = self._final_mode(found["progress"])
                 self.render_body()
+
+    # ------------------------------------------------------------------ status strip
+
+    def _timer_probe(self) -> None:
+        state = subprocess.run(
+            ["systemctl", "--user", "is-active", "fsync-sync.timer"],
+            capture_output=True, text=True,
+        ).stdout.strip()
+        timers = subprocess.run(
+            ["systemctl", "--user", "list-timers", "fsync-sync.timer", "--output=json"],
+            capture_output=True, text=True,
+        ).stdout
+        self.call_from_thread(self._timer_ready, state, timers)
+
+    def _timer_ready(self, state: str, timers_json: str) -> None:
+        self.timer_state = state or "unknown"
+        self.timer_next = timer_next_from_json(timers_json)
+
+    def _last_activity(self) -> str:
+        try:
+            run_id = (state_root() / "runs" / "latest").read_text().strip()
+            rep_path = state_root() / "runs" / run_id / "report.json"
+            key = (run_id, rep_path.stat().st_mtime)
+        except OSError:
+            return "no completed runs yet"
+        if self._activity_cache and self._activity_cache[0] == key:
+            return self._activity_cache[1]
+        try:
+            report = json.loads(rep_path.read_text())
+        except (OSError, ValueError):
+            return "no completed runs yet"
+        moved, conflicts, errors = report_totals(report)
+        when = f"{run_id[9:11]}:{run_id[11:13]}" if len(run_id) >= 13 else run_id
+        summary = (f"last {when} — {moved} moved, {conflicts} held"
+                   + (f", {errors} ERROR" if errors else "")
+                   + (" [dry]" if report.get("dry_run") else ""))
+        self._activity_cache = (key, summary)
+        return summary
+
+    def update_statusbar(self, found: dict | None) -> None:
+        t = Text()
+        if found and found["running"]:
+            prog = found["progress"]
+            elapsed = time.time() - (prog.get("started_ts") or time.time())
+            t.append("● ", style="bold green")
+            t.append(f"run {found['pointer']['run_id']} active "
+                     f"(pid {found['pointer']['pid']}, {elapsed:.0f}s)", style="green")
+        else:
+            t.append("○ no sync running", style="dim")
+        t.append("  ·  ", style="dim")
+        if self.timer_state == "active":
+            t.append(f"timer: next {self.timer_next}" if self.timer_next else "timer: on")
+        elif self.timer_state in ("…", "unknown"):
+            t.append("timer: …", style="dim")
+        else:
+            t.append("timer: off", style="yellow")
+        t.append("  ·  ", style="dim")
+        t.append(self._last_activity())
+        self.query_one("#statusbar", Static).update(t)
 
     # ------------------------------------------------------------------ render
 

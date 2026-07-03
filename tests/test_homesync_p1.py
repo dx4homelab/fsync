@@ -319,7 +319,10 @@ def test_render_timer_units():
     assert "ExecStart=/opt/venv/bin/python -m fsync.cli sync run --all --notify" in service
     assert "Type=oneshot" in service
     assert "DBUS_SESSION_BUS_ADDRESS=unix:path=%t/bus" in service
-    assert "OnUnitActiveSec=30min" in timer
+    # OnUnitInactiveSec, not OnUnitActiveSec: oneshot units may never latch
+    # "active", which silently stops monotonic rescheduling.
+    assert "OnUnitInactiveSec=30min" in timer
+    assert not any(line.startswith("OnUnitActiveSec") for line in timer.splitlines())
     assert "OnBootSec=" in timer and "RandomizedDelaySec=" in timer
     assert "WantedBy=timers.target" in timer
 
@@ -354,3 +357,25 @@ profiles:
 """))
     assert profiles["a"].direction == "both"
     assert profiles["b"].direction == "push"
+
+
+def test_report_totals():
+    from fsync.homesync import report_totals
+    rep = {"profiles": {"p": {"paths": {
+        "x": {"conflicts": 2, "a_to_b": {"files_transferred": 3}, "b_to_a": {"files_transferred": 1}},
+        "y": {"conflicts": 0, "a_to_b": {}, "b_to_a": {"files_transferred": 4}},
+    }}}, "errors": ["boom"]}
+    assert report_totals(rep) == (8, 2, 1)
+    assert report_totals({}) == (0, 0, 0)
+
+
+def test_statusbar_helpers():
+    import time as _time
+    from fsync.tui import parse_systemd_show, timer_next_from_json
+    props = parse_systemd_show("ActiveState=active\nNextElapseUSecRealtime=\n")
+    assert props["ActiveState"] == "active" and props["NextElapseUSecRealtime"] == ""
+    usec = int(_time.mktime((2026, 7, 3, 17, 16, 0, 0, 0, -1))) * 1_000_000
+    assert timer_next_from_json(json.dumps([{"next": usec, "unit": "fsync-sync.timer"}])) == "17:16"
+    assert timer_next_from_json("[]") is None            # timer not installed
+    assert timer_next_from_json(json.dumps([{"next": None}])) is None
+    assert timer_next_from_json("garbage") is None

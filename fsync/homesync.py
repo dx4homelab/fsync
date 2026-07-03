@@ -147,6 +147,17 @@ def discover_run() -> dict[str, Any] | None:
             "running": alive and progress.get("status") == "running"}
 
 
+def report_totals(report: dict) -> tuple[int, int, int]:
+    """(files_moved, conflicts_held, errors) across a run report."""
+    moved = conflicts = 0
+    for prof_r in (report.get("profiles") or {}).values():
+        for pr in (prof_r.get("paths") or {}).values():
+            conflicts += pr.get("conflicts", 0)
+            for leg in (pr.get("a_to_b", {}), pr.get("b_to_a", {})):
+                moved += leg.get("files_transferred", 0)
+    return moved, conflicts, len(report.get("errors") or [])
+
+
 class ProgressWriter:
     """Owns ``<run_dir>/progress.json``: one atomically-replaced snapshot of
     the whole run state, throttled so per-chunk rsync updates stay cheap.
@@ -774,8 +785,11 @@ def _cmd_run(args) -> int:
     try:
         fcntl.flock(lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except OSError:
-        print("another `fsync sync run` is already in progress — aborting", file=sys.stderr)
-        return 2
+        # A normal overlap (timer vs TUI/manual run), not a failure — exit 0
+        # so a timer-triggered service doesn't land in the failed state.
+        print("another `fsync sync run` is already in progress — deferring, nothing done",
+              file=sys.stderr)
+        return 0
 
     # Cross-box guard: if the peer is driving a sync right now, defer cleanly.
     # (Local lock is already held, so the peer's own probe of us backs off.)
@@ -826,21 +840,11 @@ def _cmd_run(args) -> int:
     (st_root / "runs" / "latest").write_text(run_id)
     progress.finish("error" if rc else "done")
 
-    conflicts = sum(
-        pr.get("conflicts", 0)
-        for prof_r in report["profiles"].values()
-        for pr in (prof_r.get("paths") or {}).values()
-    )
+    moved, conflicts, _ = report_totals(report)
     log(f"report: {run_dir / 'report.json'}"
         + (f" — {conflicts} conflict(s) held for review" if conflicts else ""))
 
     if getattr(args, "notify", False) and not args.dry_run:
-        moved = sum(
-            leg.get("files_transferred", 0)
-            for prof_r in report["profiles"].values()
-            for pr in (prof_r.get("paths") or {}).values()
-            for leg in (pr.get("a_to_b", {}), pr.get("b_to_a", {}))
-        )
         # Held conflicts are standing state (the claude profile always has
         # some) — only speak up when files moved or something went wrong.
         if rc != 0:
@@ -877,7 +881,11 @@ Description=Periodic fsync home-sync (peer-away/peer-busy runs are clean no-ops)
 
 [Timer]
 OnBootSec=3min
-OnUnitActiveSec={interval}
+# OnUnitInactiveSec, NOT OnUnitActiveSec: a Type=oneshot service may never
+# latch the "active" state, which leaves OnUnitActiveSec with no reference
+# point and silently stops rescheduling. Inactive-since is always defined:
+# next fire = {interval} after the previous run finished.
+OnUnitInactiveSec={interval}
 RandomizedDelaySec=4min
 
 [Install]
@@ -930,15 +938,8 @@ def _cmd_timer(args) -> int:
             run_id = latest.read_text().strip()
             rep_path = state_root() / "runs" / run_id / "report.json"
             if rep_path.exists():
-                rep = json.loads(rep_path.read_text())
-                moved = sum(
-                    leg.get("files_transferred", 0)
-                    for prof_r in rep.get("profiles", {}).values()
-                    for pr in (prof_r.get("paths") or {}).values()
-                    for leg in (pr.get("a_to_b", {}), pr.get("b_to_a", {}))
-                )
-                print(f"last run {run_id}: {moved} file(s) moved, "
-                      f"{len(rep.get('errors', []))} error(s)")
+                moved, _, errors = report_totals(json.loads(rep_path.read_text()))
+                print(f"last run {run_id}: {moved} file(s) moved, {errors} error(s)")
         return 0
 
     print("usage: fsync sync timer {install|remove|status}", file=sys.stderr)
