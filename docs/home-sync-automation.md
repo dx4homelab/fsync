@@ -140,11 +140,28 @@ Textual app, four screens:
   lives only in the TUI, so the timer path is unaffected.
   **SHIPPED 2026-07-03**:
   - `fsync sync timer install|remove|status` writes/enables systemd user
-    units (`fsync-sync.timer`: OnBootSec=3min, OnUnitActiveSec=1h default via
-    `--interval`, RandomizedDelaySec=4min). Installed on fury4dx; enable on
-    minis4dx with the same command whenever desired. SSH works agentless
-    (key on disk), so the service needs no agent plumbing; notify-send gets
-    the session bus via `DBUS_SESSION_BUS_ADDRESS=unix:path=%t/bus`.
+    units (`fsync-sync.timer`: OnBootSec=3min, OnUnitInactiveSec=1h default
+    via `--interval`, RandomizedDelaySec=4min). SSH works agentless (key on
+    disk), so the service needs no agent plumbing; notify-send gets the
+    session bus via `DBUS_SESSION_BUS_ADDRESS=unix:path=%t/bus`.
+    **Gotcha fixed 2026-07-03:** the first units used OnUnitActiveSec, but a
+    Type=oneshot service may never latch "active" — the monotonic timer then
+    has no reference point and silently stops rescheduling (observed NEXT=-
+    after a firing). OnUnitInactiveSec (next = interval after the previous
+    run finished) is always well-defined. Relatedly, a local-lock overlap
+    exits 0 so a timer firing during a manual/TUI run never lands the
+    service in the failed state.
+  - **Deployed on BOTH boxes** (fury4dx 2026-07-03 afternoon, minis4dx
+    evening with the fixed units). `loginctl enable-linger developer` set on
+    minis4dx so its timer survives logout/reboot-without-login. The
+    randomized delay staggers the two schedules; if they ever coincide, the
+    cross-box lock defers one — either box syncing converges the pair, so
+    dual timers are redundancy, not conflict.
+  - The TUI's always-visible status strip (runner ●/○ + pid/elapsed, next
+    timer firing via `list-timers --output=json` — the `show` NextElapse
+    property is empty for monotonic timers — and last-run moved/held/error
+    stats) is how you see background activity at a glance; `fsync sync
+    timer status` prints the same one-liner headlessly.
   - **Cross-box lock** (both boxes are drivers): before transferring, the
     runner probes the peer's `~/.local/state/fsync/sync.lock` with
     `flock -n` over SSH and defers cleanly (exit 0) if held; flock(1) and
