@@ -305,3 +305,52 @@ def test_discover_run_dead_pid_is_not_running(tmp_path, monkeypatch):
     assert found is not None
     assert found["running"] is False
     assert found["progress"]["status"] == "running"  # stale -> UI shows aborted
+
+
+# --------------------------------------------------------------------------- #
+# P3: timer units                                                             #
+# --------------------------------------------------------------------------- #
+
+from fsync.homesync import render_timer_units
+
+
+def test_render_timer_units():
+    service, timer = render_timer_units("/opt/venv/bin/python", "30min")
+    assert "ExecStart=/opt/venv/bin/python -m fsync.cli sync run --all --notify" in service
+    assert "Type=oneshot" in service
+    assert "DBUS_SESSION_BUS_ADDRESS=unix:path=%t/bus" in service
+    assert "OnUnitActiveSec=30min" in timer
+    assert "OnBootSec=" in timer and "RandomizedDelaySec=" in timer
+    assert "WantedBy=timers.target" in timer
+
+
+def test_tui_run_args_direction_states():
+    from fsync.tui import SyncTuiApp
+    app = SyncTuiApp()
+    app.plan = {"profiles": {"documents": {}, "tools": {}, "claude": {}}}
+    app.state = {"documents": "both", "tools": "push", "claude": "off"}
+    assert app.run_args() == ["--profile", "documents=both", "--profile", "tools=push"]
+    app.config = "/tmp/x.yaml"
+    assert app.run_args()[-2:] == ["--config", "/tmp/x.yaml"]
+    # digit cycle order: both -> push -> pull -> off -> both
+    assert app.CYCLE["both"] == "push"
+    assert app.CYCLE["push"] == "pull"
+    assert app.CYCLE["pull"] == "off"
+    assert app.CYCLE["off"] == "both"
+
+
+def test_profile_direction_config_and_override(tmp_path):
+    with pytest.raises(HomesyncError, match="direction"):
+        load_config(_write_cfg(tmp_path, """
+peer: {host: h}
+profiles:
+  c: {paths: [z], direction: sideways}
+"""))
+    _, profiles, _ = load_config(_write_cfg(tmp_path, """
+peer: {host: h}
+profiles:
+  a: {paths: [x]}
+  b: {paths: [y], direction: push}
+"""))
+    assert profiles["a"].direction == "both"
+    assert profiles["b"].direction == "push"

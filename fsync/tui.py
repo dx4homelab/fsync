@@ -11,6 +11,7 @@ The TUI never holds the sync itself: killing it mid-run loses nothing.
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import sys
 import time
@@ -18,6 +19,7 @@ from pathlib import Path
 
 from rich.table import Table
 from rich.text import Text
+from textual import events
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import VerticalScroll
@@ -62,6 +64,11 @@ class SyncTuiApp(App):
         self.profile_names = profile_names
         self.mode = "loading"          # loading|planning|no_peer|plan|spawning|progress|finished|error
         self.plan: dict | None = None
+        self.plan_partial: dict | None = None  # live per-path planning snapshot
+        self.plan_progress_path: Path | None = None
+        # per-profile run state, cycled by the profile's digit key:
+        # both (⇅) -> push (→) -> pull (←) -> off (·) -> both …
+        self.state: dict[str, str] = {}
         self.dry = False
         self.progress: dict | None = None
         self.run_dir: Path | None = None
@@ -114,11 +121,15 @@ class SyncTuiApp(App):
     def start_plan(self) -> None:
         self.mode = "planning"
         self.msg = ""
+        self.plan_partial = None
+        self.plan_progress_path = state_root() / f"plan-progress-{os.getpid()}.json"
+        self.plan_progress_path.unlink(missing_ok=True)
         self.render_body()
         self.run_worker(self._plan_worker, thread=True, exclusive=True)
 
     def _plan_worker(self) -> None:
-        cmd = [sys.executable, "-m", "fsync.cli", "sync", "run", "--plan-only"] + self.sel_args()
+        cmd = [sys.executable, "-m", "fsync.cli", "sync", "run", "--plan-only",
+               "--plan-progress", str(self.plan_progress_path)] + self.sel_args()
         proc = subprocess.run(cmd, capture_output=True, text=True)
         data = None
         if proc.returncode == 0:
@@ -129,6 +140,8 @@ class SyncTuiApp(App):
         self.call_from_thread(self._plan_ready, data, proc.stderr.strip())
 
     def _plan_ready(self, data: dict | None, stderr: str) -> None:
+        if self.plan_progress_path:
+            self.plan_progress_path.unlink(missing_ok=True)
         if data is None:
             self.mode = "error"
             self.msg = f"plan failed: {stderr.splitlines()[-1] if stderr else 'no output'}"
@@ -137,15 +150,51 @@ class SyncTuiApp(App):
             self.msg = data.get("peer", "peer")
         else:
             self.plan = data
+            # start from each profile's configured direction
+            self.state = {n: p.get("direction", "both")
+                          for n, p in data.get("profiles", {}).items()}
             self.mode = "plan"
         self.render_body()
+
+    def plan_profile_names(self) -> list[str]:
+        return list((self.plan or {}).get("profiles", {}))
+
+    CYCLE = {"both": "push", "push": "pull", "pull": "off", "off": "both"}
+    STATE_MARK = {"both": ("⇅", "green"), "push": ("→", "cyan"),
+                  "pull": ("←", "cyan"), "off": ("·", "dim")}
+
+    def run_args(self) -> list[str]:
+        """Runner selection args: every non-off profile is passed explicitly
+        with its (possibly cycled) direction — the override is idempotent."""
+        args: list[str] = []
+        for n in self.plan_profile_names():
+            st = self.state.get(n, "both")
+            if st != "off":
+                args += ["--profile", f"{n}={st}"]
+        if self.config:
+            args += ["--config", self.config]
+        return args
+
+    def on_key(self, event: events.Key) -> None:
+        if self.mode != "plan" or not event.key.isdigit():
+            return
+        idx = int(event.key) - 1
+        names = self.plan_profile_names()
+        if 0 <= idx < len(names):
+            name = names[idx]
+            self.state[name] = self.CYCLE[self.state.get(name, "both")]
+            self.render_body()
 
     # ------------------------------------------------------------------ run
 
     def action_run_sync(self) -> None:
         if self.mode != "plan":
             return
-        cmd = [sys.executable, "-m", "fsync.cli", "sync", "run"] + self.sel_args()
+        if all(st == "off" for st in self.state.values()):
+            self.msg = "all profiles are off — cycle with 1-9"
+            self.render_body()
+            return
+        cmd = [sys.executable, "-m", "fsync.cli", "sync", "run"] + self.run_args()
         if self.dry:
             cmd.append("--dry-run")
         log_path = state_root() / "tui-runner.log"
@@ -172,7 +221,13 @@ class SyncTuiApp(App):
     # ------------------------------------------------------------------ poll
 
     def tick(self) -> None:
-        if self.mode == "spawning":
+        if self.mode == "planning":
+            try:
+                self.plan_partial = json.loads(self.plan_progress_path.read_text())
+                self.render_body()
+            except (OSError, ValueError, AttributeError):
+                pass  # snapshot not written yet (engine push / peer probe phase)
+        elif self.mode == "spawning":
             found = discover_run()
             if found and found["pointer"].get("run_id") != self.prev_run_id:
                 self.prev_run_id = found["pointer"].get("run_id")
@@ -196,7 +251,10 @@ class SyncTuiApp(App):
         if self.mode == "loading":
             body.update("starting…")
         elif self.mode == "planning":
-            body.update(Text("Planning… indexing both boxes (cached hashing — usually seconds)", style="yellow"))
+            if self.plan_partial:
+                body.update(self._planning_table())
+            else:
+                body.update(Text("Planning… connecting to peer and pushing engine", style="yellow"))
         elif self.mode == "no_peer":
             body.update(Text(f"Peer {self.msg} is not reachable — nothing to sync.\n\n"
                              "p: retry   q: quit", style="red"))
@@ -207,36 +265,94 @@ class SyncTuiApp(App):
         elif self.mode in ("progress", "finished", "error"):
             body.update(self._progress_table())
 
+    def _planning_table(self):
+        """Same shape as the plan preview, filling in as each path is planned."""
+        partial = self.plan_partial or {}
+        done = total = 0
+        table = Table(title="Planning… (both boxes hash locally; cached files are stat-only)",
+                      expand=True)
+        for col in ("profile / path", "state", "→ push", "← pull", "conflicts", "identical"):
+            table.add_column(col, justify="right" if col not in ("profile / path", "state") else "left")
+        for pname, pdata in partial.get("profiles", {}).items():
+            for rel, d in pdata.get("paths", {}).items():
+                total += 1
+                phase = d.get("phase", "queued")
+                if phase == "done":
+                    done += 1
+                    push = f"{d['a_to_b']} ({fmt_bytes(d['bytes_a_to_b'])})" if d.get("a_to_b") else "-"
+                    pull = f"{d['b_to_a']} ({fmt_bytes(d['bytes_b_to_a'])})" if d.get("b_to_a") else "-"
+                    style = "bold" if (d.get("a_to_b") or d.get("b_to_a") or d.get("conflicts")) else ""
+                    table.add_row(f"{pname}/{rel}", Text("✓ planned", style="green"),
+                                  push, pull,
+                                  str(d.get("conflicts") or "-"), str(d.get("identical", "")),
+                                  style=style)
+                elif phase == "indexing":
+                    table.add_row(f"{pname}/{rel}", Text("⣷ indexing…", style="yellow"),
+                                  "", "", "", "")
+                else:
+                    table.add_row(f"{pname}/{rel}", Text("queued", style="dim"),
+                                  "", "", "", "", style="dim")
+        hint = Text(f"\n{done}/{total} paths planned — the preview with toggles appears when all "
+                    "are in.   q: quit", style="dim")
+        from rich.console import Group
+        return Group(table, hint)
+
     def _plan_table(self):
         assert self.plan is not None
         table = Table(title=f"Plan preview -> {self.plan.get('peer', '')}"
                             f"{'   [DRY RUN]' if self.dry else ''}",
                       expand=True)
-        for col in ("profile / path", "→ push", "← pull", "overwrite→backup", "conflicts", "identical"):
-            table.add_column(col, justify="right" if col != "profile / path" else "left")
+        for col in ("on", "profile / path", "→ push", "← pull", "overwrite→backup", "conflicts", "identical"):
+            table.add_column(col, justify="right" if col not in ("on", "profile / path") else "left")
         totals = [0, 0, 0, 0]
         total_bytes = 0
-        for pname, pdata in self.plan.get("profiles", {}).items():
-            for rel, d in pdata.get("paths", {}).items():
-                over = d["overwrites_a_to_b"] + d["overwrites_b_to_a"]
-                push = f"{d['a_to_b']} ({fmt_bytes(d['bytes_a_to_b'])})" if d["a_to_b"] else "-"
-                pull = f"{d['b_to_a']} ({fmt_bytes(d['bytes_b_to_a'])})" if d["b_to_a"] else "-"
-                style = "bold" if (d["a_to_b"] or d["b_to_a"] or d["conflicts"]) else "dim"
-                table.add_row(f"{pname}/{rel}", push, pull,
+        for i, (pname, pdata) in enumerate(self.plan.get("profiles", {}).items(), start=1):
+            st = self.state.get(pname, "both")
+            sym, sym_style = self.STATE_MARK[st]
+            mark = Text(f"{i} ", style="bold cyan") + Text(sym, style=sym_style)
+            take_push = st in ("both", "push")
+            take_pull = st in ("both", "pull")
+            for j, (rel, d) in enumerate(pdata.get("paths", {}).items()):
+                over = (d["overwrites_a_to_b"] if take_push else 0) + \
+                       (d["overwrites_b_to_a"] if take_pull else 0)
+                push = (f"{d['a_to_b']} ({fmt_bytes(d['bytes_a_to_b'])})"
+                        if d["a_to_b"] and take_push else
+                        (Text(f"{d['a_to_b']} skipped", style="dim") if d["a_to_b"] else "-"))
+                pull = (f"{d['b_to_a']} ({fmt_bytes(d['bytes_b_to_a'])})"
+                        if d["b_to_a"] and take_pull else
+                        (Text(f"{d['b_to_a']} skipped", style="dim") if d["b_to_a"] else "-"))
+                if st == "off":
+                    style = "dim strike"
+                elif d["a_to_b"] or d["b_to_a"] or d["conflicts"]:
+                    style = "bold"
+                else:
+                    style = "dim"
+                table.add_row(mark if j == 0 else "", f"{pname}/{rel}", push, pull,
                               str(over) if over else "-",
                               str(d["conflicts"]) if d["conflicts"] else "-",
                               str(d["identical"]), style=style)
-                totals[0] += d["a_to_b"]; totals[1] += d["b_to_a"]
-                totals[2] += over; totals[3] += d["conflicts"]
-                total_bytes += d["bytes_a_to_b"] + d["bytes_b_to_a"]
+                if take_push:
+                    totals[0] += d["a_to_b"]
+                    total_bytes += d["bytes_a_to_b"]
+                if take_pull:
+                    totals[1] += d["b_to_a"]
+                    total_bytes += d["bytes_b_to_a"]
+                if st != "off":
+                    totals[2] += over
+                    totals[3] += d["conflicts"]
+        active = sum(1 for s in self.state.values() if s != "off")
         table.add_section()
-        table.add_row("TOTAL", str(totals[0]), str(totals[1]), str(totals[2]),
+        table.add_row("", f"TOTAL ({active}/{len(self.plan_profile_names())} profiles active)",
+                      str(totals[0]), str(totals[1]), str(totals[2]),
                       str(totals[3]), "", style="bold cyan")
         hint = Text()
         hint.append(f"\n{fmt_bytes(total_bytes)} to move. Overwritten files are backed up on the "
-                    f"receiver under ~/.fsync/backups/<run>/. Conflicts (review profiles) are held.\n\n")
-        hint.append("r: execute", style="bold green")
-        hint.append(f"   d: dry-run [{'ON' if self.dry else 'off'}]   p: re-plan   q: quit")
+                    f"receiver under ~/.fsync/backups/<run>/. Conflicts (review profiles) are held.\n")
+        if self.msg:
+            hint.append(f"{self.msg}\n", style="yellow")
+        hint.append("\nr: execute", style="bold green")
+        hint.append(f"   1-{len(self.plan_profile_names())}: cycle ⇅ both → push ← pull · off"
+                    f"   d: dry-run [{'ON' if self.dry else 'off'}]   p: re-plan   q: quit")
         from rich.console import Group
         return Group(table, hint)
 

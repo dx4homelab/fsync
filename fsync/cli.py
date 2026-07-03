@@ -706,12 +706,23 @@ def build_parser() -> argparse.ArgumentParser:
     p_sync_run.add_argument("--dry-run", action="store_true", help="Plan and report but pass -n to rsync (no transfers, no backups)")
     p_sync_run.add_argument("--plan-only", action="store_true",
                             help="Print a JSON preview of what would transfer (no lock, no rsync) — used by `fsync tui`")
+    p_sync_run.add_argument("--plan-progress", metavar="FILE", default=None,
+                            help="With --plan-only: maintain a live per-path planning snapshot at FILE (for UIs)")
     p_sync_run.add_argument("--workers", type=int, default=None, help="Override hashing workers on both sides")
+    p_sync_run.add_argument("--notify", action="store_true",
+                            help="Desktop notification when files moved or the run failed (used by the timer)")
     p_sync_run.add_argument("--verbose", action="count", default=0, help="Increase verbosity")
     p_sync_init = sync_sub.add_parser("init", help="Write a starter sync-profiles.yaml")
     p_sync_init.add_argument("--config", help="Target path (default: ~/.config/fsync/sync-profiles.yaml)")
     p_sync_init.add_argument("--force", action="store_true", help="Overwrite an existing config")
     p_sync_init.add_argument("--verbose", action="count", default=0, help="Increase verbosity")
+
+    p_sync_timer = sync_sub.add_parser("timer", help="Manage the systemd user timer for hands-off runs")
+    p_sync_timer.add_argument("action", choices=("install", "remove", "status"),
+                              help="install: write+enable units; remove: disable+delete; status: timers + last run")
+    p_sync_timer.add_argument("--interval", default="1h",
+                              help="Run cadence as a systemd time span (default: 1h)")
+    p_sync_timer.add_argument("--verbose", action="count", default=0, help="Increase verbosity")
 
     # tui: plan -> one confirmation -> detached run with live, re-attachable progress
     p_tui = sub.add_parser("tui", help="Terminal UI for sync: preview, confirm once, watch progress (runner survives the UI)")

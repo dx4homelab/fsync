@@ -138,6 +138,25 @@ Textual app, four screens:
   optional `claude -p` triage for the claude profile's residual conflicts.
   Note: headless `fsync sync run` remains promptless — the P2 confirmation
   lives only in the TUI, so the timer path is unaffected.
+  **SHIPPED 2026-07-03**:
+  - `fsync sync timer install|remove|status` writes/enables systemd user
+    units (`fsync-sync.timer`: OnBootSec=3min, OnUnitActiveSec=1h default via
+    `--interval`, RandomizedDelaySec=4min). Installed on fury4dx; enable on
+    minis4dx with the same command whenever desired. SSH works agentless
+    (key on disk), so the service needs no agent plumbing; notify-send gets
+    the session bus via `DBUS_SESSION_BUS_ADDRESS=unix:path=%t/bus`.
+  - **Cross-box lock** (both boxes are drivers): before transferring, the
+    runner probes the peer's `~/.local/state/fsync/sync.lock` with
+    `flock -n` over SSH and defers cleanly (exit 0) if held; flock(1) and
+    Python fcntl share BSD semantics so the probe is exact. Simultaneous
+    starts both back off — safe, next timer retries.
+  - `--notify`: desktop notification only when files moved or the run
+    failed; standing held conflicts alone stay silent (no hourly spam).
+  - Triage helper `scratchpad/triage_claude_conflicts.sh`: pipes the latest
+    run's held-conflict JSONs to `claude -p` for take-a/take-b/merge/
+    leave-per-machine recommendations. Advisory only.
+  - Verified live: timer-triggered service run (6.1s wall, 32M peak, pulled
+    1 file, notification fired); peer-lock defer + resume both proven.
 
 ### P1 field findings (2026-07-03)
 

@@ -52,6 +52,10 @@ DEFAULT_PROFILES_YAML = """\
 #                    <backup_root>/<run-id>/<profile>/ — nothing is destroyed.
 # conflict: review = conflicts are held in the run report, only additive
 #                    copies happen (the .claude pipeline).
+# direction: both|push|pull = per-profile default; push sends local->peer
+#                    only (peer-newer files are SKIPPED, never clobbered),
+#                    pull is the reverse. The TUI digit keys cycle this per
+#                    run: ⇅ both -> → push -> ← pull -> · off.
 peer:
   host: minis4dx.lan   # router DNS name; bare hostname resolution is not reliable here
   user: developer
@@ -72,6 +76,15 @@ profiles:
     paths: ["."]
     recursive: false
     exclude: ["*.tmp", ".bash_history*", "*.log", ".claude.json*"]
+  homelab:
+    # Workspace repos travel as plain files (.git included) — no git remotes
+    # involved. Bidirectional newest-wins is safe while one box at a time is
+    # active in a repo; overwrites are backed up like everything else.
+    paths: [workspaces/homelab]
+    # "mtab": extracted OS rootfs trees symlink etc/mtab -> /proc/mounts,
+    # whose mtime is always "now" — syncing it ping-pongs every run.
+    exclude: [".venv", "venv", "node_modules", "__pycache__", ".pytest_cache",
+              "*.pyc", "backups", "mtab", "fsync/scratchpad/repo-sync/*"]
   claude:
     # Durable artifacts only (memories, agents, skills, plugins). Session
     # ephemera (transcripts, file-history, todos, plans, caches) are managed
@@ -215,6 +228,9 @@ class Peer:
         return f"{self.user}@{self.host}" if self.user else self.host
 
 
+DIRECTIONS = ("both", "push", "pull")  # push = local->peer only, pull = peer->local only
+
+
 @dataclass
 class Profile:
     name: str
@@ -224,6 +240,7 @@ class Profile:
     exclude: list[str] = field(default_factory=list)
     rename_min_size: int = 64
     workers: int = 8
+    direction: str = "both"
 
 
 def load_config(path: str | None) -> tuple[Peer, dict[str, Profile], dict[str, Any]]:
@@ -256,6 +273,9 @@ def load_config(path: str | None) -> tuple[Peer, dict[str, Profile], dict[str, A
         conflict = raw.get("conflict", defaults.get("conflict", "newer"))
         if conflict not in ("newer", "review", "a-wins", "b-wins"):
             raise HomesyncError(f"{cfg_path}: profile '{name}': unknown conflict policy {conflict!r}")
+        direction = raw.get("direction", defaults.get("direction", "both"))
+        if direction not in DIRECTIONS:
+            raise HomesyncError(f"{cfg_path}: profile '{name}': direction must be one of {DIRECTIONS}")
         profiles[name] = Profile(
             name=name,
             paths=[str(p) for p in paths],
@@ -264,6 +284,7 @@ def load_config(path: str | None) -> tuple[Peer, dict[str, Profile], dict[str, A
             exclude=list(defaults.get("exclude", [])) + list(raw.get("exclude", [])),
             rename_min_size=int(raw.get("rename_min_size", defaults.get("rename_min_size", 64))),
             workers=int(raw.get("workers", defaults.get("workers", 8))),
+            direction=direction,
         )
     if not profiles:
         raise HomesyncError(f"{cfg_path}: no profiles defined")
@@ -286,6 +307,34 @@ def peer_reachable(peer: Peer) -> bool:
         return _ssh(peer, "true", timeout=15).returncode == 0
     except subprocess.TimeoutExpired:
         return False
+
+
+def peer_busy(peer: Peer) -> bool:
+    """True when the peer is mid-run (holds its own sync.lock).
+
+    Both boxes are drivers; two concurrent runs would race each other's
+    transfers. flock(1) and Python's fcntl.flock share BSD lock semantics,
+    so probing with a non-blocking flock is exact. An ssh failure counts as
+    busy — deferring is always the safe answer for a scheduled run.
+    """
+    try:
+        probe = _ssh(
+            peer,
+            "mkdir -p ~/.local/state/fsync && flock -n ~/.local/state/fsync/sync.lock true",
+            timeout=20,
+        )
+        return probe.returncode != 0
+    except subprocess.TimeoutExpired:
+        return True
+
+
+def _notify(summary: str, body: str) -> None:
+    """Best-effort desktop notification; failures never affect the run."""
+    try:
+        subprocess.run(["notify-send", "--app-name=fsync", summary, body],
+                       check=False, capture_output=True, timeout=10)
+    except (OSError, subprocess.TimeoutExpired):
+        pass
 
 
 def peer_home(peer: Peer) -> str:
@@ -490,16 +539,36 @@ def build_run_preview(
     selected: list[Profile],
     workers: int | None = None,
     sample_n: int = 8,
+    progress_path: str | Path | None = None,
 ) -> dict[str, Any]:
     """Plan every selected profile without transferring: 'what is coming'.
 
     The executing run re-plans from fresh indexes, so these numbers are a
     preview — live trees can drift between confirm and execute; the run
-    report is authoritative."""
+    report is authoritative.
+
+    With ``progress_path``, an atomically-replaced snapshot of per-path
+    planning state (queued / indexing / done+counts) is maintained so a UI
+    can render the plan filling in while slower paths still hash."""
+    prog: dict[str, Any] | None = None
+
+    def prog_write() -> None:
+        if prog is not None:
+            _atomic_write_json(Path(progress_path), prog)
+
+    if progress_path:
+        prog = {"status": "planning",
+                "profiles": {p.name: {"paths": {rel: {"phase": "queued"} for rel in p.paths}}
+                             for p in selected}}
+        prog_write()
+
     out: dict[str, Any] = {"profiles": {}}
     for prof in selected:
-        pp: dict[str, Any] = {"conflict": prof.conflict, "paths": {}}
+        pp: dict[str, Any] = {"conflict": prof.conflict, "direction": prof.direction, "paths": {}}
         for rel in prof.paths:
+            if prog is not None:
+                prog["profiles"][prof.name]["paths"][rel] = {"phase": "indexing"}
+                prog_write()
             _, _, plan, changed = _plan_path(peer, prof, rel, workers or prof.workers)
             a_items = [it for it in plan["a_to_b"] if it.get("path")]
             b_items = [it for it in plan["b_to_a"] if it.get("path")]
@@ -518,7 +587,13 @@ def build_run_preview(
                     "b_to_a": [it["path"] for it in b_items[:sample_n]],
                 },
             }
+            if prog is not None:
+                prog["profiles"][prof.name]["paths"][rel] = {"phase": "done", **pp["paths"][rel]}
+                prog_write()
         out["profiles"][prof.name] = pp
+    if prog is not None:
+        prog["status"] = "done"
+        prog_write()
     return out
 
 
@@ -552,6 +627,18 @@ def run_profile(
         # produce a backup on the receiver. Additive copies overwrite nothing.
         a_paths = [it["path"] for it in plan["a_to_b"] if it.get("path")]
         b_paths = [it["path"] for it in plan["b_to_a"] if it.get("path")]
+
+        # Direction filters ROUTING, it never overrides newest-wins: in push
+        # mode a file the peer has newer is skipped (reported), not clobbered
+        # with our older copy. One-way here is still additive — no deletes.
+        skipped_by_direction = 0
+        if prof.direction == "push":
+            skipped_by_direction = len(b_paths)
+            b_paths = []
+        elif prof.direction == "pull":
+            skipped_by_direction = len(a_paths)
+            a_paths = []
+
         over_ab = sum(1 for p in a_paths if p in changed_paths)
         over_ba = sum(1 for p in b_paths if p in changed_paths)
 
@@ -586,6 +673,8 @@ def run_profile(
         result["paths"][rel] = {
             "a_to_b": leg_ab,
             "b_to_a": leg_ba,
+            "direction": prof.direction,
+            "skipped_by_direction": skipped_by_direction,
             "conflicts": len(conflicts),
             "renames_pending": len(plan["renames"]),
             "renames_demoted": len(plan["renames_suppressed"]),
@@ -600,6 +689,8 @@ def run_profile(
             + f", B->A {len(b_paths)}"
             + (f" ({over_ba} overwrite->backup)" if over_ba else "")
             + f", conflicts {len(conflicts)}, identical {plan['noop']}"
+            + (f", {prof.direction}-only ({skipped_by_direction} skipped)"
+               if prof.direction != "both" else "")
             + f" [{result['paths'][rel]['seconds']}s]"
         )
     return result
@@ -633,13 +724,24 @@ def _cmd_run(args) -> int:
     if args.all:
         selected = list(profiles.values())
     elif args.profile:
-        missing = [n for n in args.profile if n not in profiles]
-        if missing:
-            print(f"unknown profile(s): {', '.join(missing)} (available: {', '.join(profiles)})", file=sys.stderr)
-            return 2
-        selected = [profiles[n] for n in args.profile]
+        from dataclasses import replace
+
+        selected = []
+        for spec in args.profile:
+            # "name" honors the profile's configured direction;
+            # "name=push|pull|both" overrides it for this run (TUI cycle).
+            name, _, direction = spec.partition("=")
+            if name not in profiles:
+                print(f"unknown profile: {name} (available: {', '.join(profiles)})", file=sys.stderr)
+                return 2
+            if direction and direction not in DIRECTIONS:
+                print(f"{spec}: direction must be one of {DIRECTIONS}", file=sys.stderr)
+                return 2
+            prof = profiles[name]
+            selected.append(replace(prof, direction=direction) if direction else prof)
     else:
-        print(f"pick profiles with --profile NAME (repeatable) or --all; available: {', '.join(profiles)}", file=sys.stderr)
+        print(f"pick profiles with --profile NAME[=push|pull|both] (repeatable) or --all; "
+              f"available: {', '.join(profiles)}", file=sys.stderr)
         return 2
 
     # R6: away-tolerant — a missing peer is a clean no-op, not an error.
@@ -654,7 +756,8 @@ def _cmd_run(args) -> int:
         # Preview for a UI: JSON on stdout, no lock, nothing transferred.
         try:
             ensure_peer_engine(peer)
-            preview = build_run_preview(peer, selected, workers=args.workers)
+            preview = build_run_preview(peer, selected, workers=args.workers,
+                                        progress_path=getattr(args, "plan_progress", None))
         except HomesyncError as e:
             print(f"error: {e}", file=sys.stderr)
             return 1
@@ -673,6 +776,12 @@ def _cmd_run(args) -> int:
     except OSError:
         print("another `fsync sync run` is already in progress — aborting", file=sys.stderr)
         return 2
+
+    # Cross-box guard: if the peer is driving a sync right now, defer cleanly.
+    # (Local lock is already held, so the peer's own probe of us backs off.)
+    if peer_busy(peer):
+        print(f"peer {peer.target} is running a sync — deferring, nothing done", file=sys.stderr)
+        return 0
 
     run_id = time.strftime("%Y%m%d-%H%M%S") + "-" + os.urandom(2).hex()
     run_dir = st_root / "runs" / run_id
@@ -724,7 +833,116 @@ def _cmd_run(args) -> int:
     )
     log(f"report: {run_dir / 'report.json'}"
         + (f" — {conflicts} conflict(s) held for review" if conflicts else ""))
+
+    if getattr(args, "notify", False) and not args.dry_run:
+        moved = sum(
+            leg.get("files_transferred", 0)
+            for prof_r in report["profiles"].values()
+            for pr in (prof_r.get("paths") or {}).values()
+            for leg in (pr.get("a_to_b", {}), pr.get("b_to_a", {}))
+        )
+        # Held conflicts are standing state (the claude profile always has
+        # some) — only speak up when files moved or something went wrong.
+        if rc != 0:
+            _notify("fsync sync FAILED", "; ".join(report["errors"])[:200])
+        elif moved:
+            _notify("fsync sync", f"{moved} file(s) synced with {peer.host}"
+                    + (f", {conflicts} conflict(s) held" if conflicts else ""))
     return rc
+
+
+# --------------------------------------------------------------------------- #
+# systemd user timer (P3: hands-off runs; peer-away and peer-busy are          #
+# already clean no-ops, so the service needs no gating of its own)             #
+# --------------------------------------------------------------------------- #
+
+UNIT_DIR = "~/.config/systemd/user"
+UNIT_NAME = "fsync-sync"
+
+
+def render_timer_units(python: str, interval: str) -> tuple[str, str]:
+    """Render (service, timer) unit texts. Pure — unit-testable."""
+    service = f"""[Unit]
+Description=fsync home-sync run (all profiles)
+
+[Service]
+Type=oneshot
+Nice=10
+# notify-send inside a user service needs the session bus path
+Environment=DBUS_SESSION_BUS_ADDRESS=unix:path=%t/bus
+ExecStart={python} -m fsync.cli sync run --all --notify
+"""
+    timer = f"""[Unit]
+Description=Periodic fsync home-sync (peer-away/peer-busy runs are clean no-ops)
+
+[Timer]
+OnBootSec=3min
+OnUnitActiveSec={interval}
+RandomizedDelaySec=4min
+
+[Install]
+WantedBy=timers.target
+"""
+    return service, timer
+
+
+def _systemctl(*argv: str) -> subprocess.CompletedProcess:
+    return subprocess.run(["systemctl", "--user", *argv], capture_output=True, text=True)
+
+
+def _cmd_timer(args) -> int:
+    unit_dir = Path(UNIT_DIR).expanduser()
+    svc_path = unit_dir / f"{UNIT_NAME}.service"
+    tmr_path = unit_dir / f"{UNIT_NAME}.timer"
+
+    if args.action == "install":
+        unit_dir.mkdir(parents=True, exist_ok=True)
+        service, timer = render_timer_units(sys.executable, args.interval)
+        svc_path.write_text(service)
+        tmr_path.write_text(timer)
+        _systemctl("daemon-reload")
+        en = _systemctl("enable", "--now", f"{UNIT_NAME}.timer")
+        if en.returncode != 0:
+            print(f"enable failed: {en.stderr.strip()}", file=sys.stderr)
+            return 1
+        print(f"installed {tmr_path.name} (every {args.interval}, +boot; "
+              f"randomized ≤4min to avoid colliding with the peer's timer)")
+        out = _systemctl("list-timers", f"{UNIT_NAME}.timer", "--no-pager")
+        print(out.stdout.strip())
+        return 0
+
+    if args.action == "remove":
+        _systemctl("disable", "--now", f"{UNIT_NAME}.timer")
+        removed = []
+        for p in (svc_path, tmr_path):
+            if p.exists():
+                p.unlink()
+                removed.append(p.name)
+        _systemctl("daemon-reload")
+        print(f"removed: {', '.join(removed) or 'nothing installed'}")
+        return 0
+
+    if args.action == "status":
+        out = _systemctl("list-timers", f"{UNIT_NAME}.timer", "--no-pager")
+        print(out.stdout.strip() or "timer not installed")
+        latest = state_root() / "runs" / "latest"
+        if latest.exists():
+            run_id = latest.read_text().strip()
+            rep_path = state_root() / "runs" / run_id / "report.json"
+            if rep_path.exists():
+                rep = json.loads(rep_path.read_text())
+                moved = sum(
+                    leg.get("files_transferred", 0)
+                    for prof_r in rep.get("profiles", {}).values()
+                    for pr in (prof_r.get("paths") or {}).values()
+                    for leg in (pr.get("a_to_b", {}), pr.get("b_to_a", {}))
+                )
+                print(f"last run {run_id}: {moved} file(s) moved, "
+                      f"{len(rep.get('errors', []))} error(s)")
+        return 0
+
+    print("usage: fsync sync timer {install|remove|status}", file=sys.stderr)
+    return 2
 
 
 def cmd_sync(args) -> int:
@@ -732,5 +950,7 @@ def cmd_sync(args) -> int:
         return _cmd_init(args)
     if getattr(args, "sync_cmd", None) == "run":
         return _cmd_run(args)
-    print("usage: fsync sync {run|init} ...", file=sys.stderr)
+    if getattr(args, "sync_cmd", None) == "timer":
+        return _cmd_timer(args)
+    print("usage: fsync sync {run|init|timer} ...", file=sys.stderr)
     return 2
