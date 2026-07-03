@@ -182,6 +182,22 @@ the hash-chosen files (so a same-size/same-mtime-but-different-content file is
 never silently skipped); deletions only ever appear in mirror mode and are
 emitted commented-out. After running, re-run `fsync compare` to verify.
 
+### Fast link: Thunderbolt/USB4 host-to-host
+
+A single TB4/USB4 cable between the two machines gives a ~10–20 Gbit/s
+point-to-point network (kernel `thunderbolt_net`) — much faster than GbE for a
+full `/home` sync. One-time setup on each box:
+
+```bash
+sudo scripts/tb-net.sh 1   # on the scanning machine -> 10.55.0.1/30
+sudo scripts/tb-net.sh 2   # on the peer             -> 10.55.0.2/30
+```
+
+Plug the cable (direct port-to-port is the reliable option; a dock's
+downstream TB port usually works too), wait for `thunderbolt0` to appear,
+then use the `developer@10.55.0.2:...` endpoints exactly as in the examples
+above. The `10.55.0.x` addresses in this doc are that link.
+
 
 
 ```
