@@ -13,10 +13,12 @@ The functions are written to be easy to test and use standard libraries only.
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import shlex
 import subprocess
 import shutil
+from fnmatch import fnmatch
 from pathlib import Path
 from typing import Iterable, List, Dict, Any, Tuple
 
@@ -59,6 +61,67 @@ def _compute_hash(path: Path, algo: str = "sha256", chunk_size: int = 8192, b3su
     return h.hexdigest()
 
 
+def matches_exclude(rel_path: str, patterns: Iterable[str]) -> bool:
+    """True when ``rel_path`` (posix, relative to the indexed root) is excluded.
+
+    Pattern semantics (fnmatch-based, kept deliberately simple):
+    - a pattern containing ``/`` matches against the whole relative path
+      (``backups/*`` excludes everything under ``backups/``);
+    - a pattern without ``/`` matches against any single path component
+      (``*.tmp`` excludes such files anywhere; ``.git`` excludes whole trees).
+    """
+    parts = rel_path.split("/")
+    for pat in patterns:
+        if "/" in pat:
+            if fnmatch(rel_path, pat):
+                return True
+        elif any(fnmatch(part, pat) for part in parts):
+            return True
+    return False
+
+
+def default_cache_path(root: str | Path) -> Path:
+    """Per-root hash-cache location under ``~/.cache/fsync/hashcache/``."""
+    key = hashlib.sha256(str(Path(root).resolve()).encode()).hexdigest()[:24]
+    return Path.home() / ".cache" / "fsync" / "hashcache" / f"{key}.json"
+
+
+def _load_hash_cache(cache_path: str | Path, algo: str) -> Dict[str, list]:
+    """Load ``{rel_path: [size, mtime, hash]}``; empty on miss/corruption/algo change."""
+    try:
+        data = json.loads(Path(cache_path).read_text())
+        if data.get("algo") != algo:
+            return {}
+        files = data.get("files")
+        return files if isinstance(files, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def _save_hash_cache(cache_path: str | Path, algo: str, merged: Dict[str, list]) -> None:
+    """Atomically persist the cache; failures are non-fatal (cache is advisory)."""
+    try:
+        p = Path(cache_path)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        tmp = p.with_suffix(".tmp")
+        tmp.write_text(json.dumps({"algo": algo, "files": merged}))
+        os.replace(tmp, p)
+    except OSError:
+        pass
+
+
+def load_index_file(path: str | Path) -> List[Dict[str, Any]]:
+    """Load a saved ``fsync index`` output (JSON array or JSONL) into records."""
+    text = Path(path).read_text()
+    stripped = text.lstrip()
+    if stripped.startswith("["):
+        data = json.loads(text)
+        if not isinstance(data, list):
+            raise ValueError(f"{path}: expected a JSON array of file records")
+        return data
+    return [json.loads(line) for line in text.splitlines() if line.strip()]
+
+
 def list_files_with_metadata(
     root: str | Path,
     recursive: bool = True,
@@ -69,6 +132,8 @@ def list_files_with_metadata(
     show_progress: bool = False,
     logger: Any | None = None,
     b3sum_path: str | None = None,
+    exclude: Iterable[str] | None = None,
+    cache_path: str | Path | None = None,
 ) -> List[Dict[str, Any]]:
     """List files under `root` and return metadata including checksum.
 
@@ -124,6 +189,8 @@ def list_files_with_metadata(
     if tqdm:
         iterable = tqdm(iterable, desc="scanning files")
 
+    exclude_pats = list(exclude) if exclude else None
+
     for p in iterable:
         try:
             # Only include regular files. If follow_symlinks is True, also include symlinks that
@@ -146,6 +213,8 @@ def list_files_with_metadata(
                 continue
 
             rel = p.relative_to(root_path).as_posix()
+            if exclude_pats and matches_exclude(rel, exclude_pats):
+                continue
             st = target_for_stat.stat()
             size = st.st_size
             mtime = st.st_mtime
@@ -189,6 +258,7 @@ def list_files_with_metadata(
     # for distinct files (no real hardlink info) still hash each file individually.
     to_hash: List[Tuple[int, Path]] = []
     seen_group: Dict[Tuple[Any, Any], int] = {}
+    cache = _load_hash_cache(cache_path, hash_algo) if cache_path else None
     for i, item in enumerate(results):
         if not item.get("_target_path"):
             continue
@@ -201,6 +271,12 @@ def list_files_with_metadata(
             continue
         if group_key is not None:
             seen_group[group_key] = i
+        if cache is not None:
+            hit = cache.get(item["path"])
+            # unchanged (size, mtime) => trust the cached digest, skip the read
+            if hit and hit[0] == item["size"] and hit[1] == item["mtime"] and hit[2]:
+                item["hash"] = hit[2]
+                continue
         to_hash.append((i, Path(item["_target_path"])))
 
     if to_hash:
@@ -238,6 +314,14 @@ def list_files_with_metadata(
         if rep is not None:
             item["hash"] = results[rep].get("hash")
 
+    if cache_path:
+        # Merge (not replace) so records outside this run's exclude set survive.
+        merged = cache if cache is not None else {}
+        for item in results:
+            if item.get("hash"):
+                merged[item["path"]] = [item["size"], item["mtime"], item["hash"]]
+        _save_hash_cache(cache_path, hash_algo, merged)
+
     # Remove internal _target_path and apply fields filtering
     final: List[Dict[str, Any]] = []
     for item in results:
@@ -260,6 +344,7 @@ def iter_index_records(
     b3sum_path: str | None = None,
     chunk_size: int = 5000,
     logger: Any | None = None,
+    exclude: Iterable[str] | None = None,
 ):
     """Yield file metadata records one at a time, hashing in bounded-memory chunks.
 
@@ -324,6 +409,7 @@ def iter_index_records(
         return [rec for (rec, _, _) in pending]
 
     walker = root_path.rglob("*") if recursive else root_path.iterdir()
+    exclude_pats = list(exclude) if exclude else None
     pending: List[Tuple[Dict[str, Any], Path, Any]] = []
     for p in walker:
         try:
@@ -343,6 +429,8 @@ def iter_index_records(
                 continue
 
             rel = p.relative_to(root_path).as_posix()
+            if exclude_pats and matches_exclude(rel, exclude_pats):
+                continue
             st = target_for_stat.stat()
             rec = {
                 "name": p.name,
@@ -523,6 +611,7 @@ def build_sync_plan(
     report: Dict[str, Any],
     conflict: str = "review",
     mirror: str | None = None,
+    rename_min_size: int = 0,
 ) -> Dict[str, Any]:
     """Project a :func:`compare_file_lists` report onto a directional sync plan.
 
@@ -550,6 +639,14 @@ def build_sync_plan(
     deletions: ``a-to-b`` makes B match A (A wins all conflicts, B's extras are
     queued for deletion); ``b-to-a`` is the reverse. ``conflict`` is ignored
     when ``mirror`` is set.
+
+    Rename pairs are only trustworthy when the shared hash is unique to that
+    pair: content that occurs at more than two paths (empty lock files,
+    boilerplate blobs) pairs *unrelated* files, and acting on such a "rename"
+    moves live files around on the receiver. Those pairs — plus, when
+    ``rename_min_size`` > 0, pairs below that size — are demoted to plain
+    copies (or copy+delete under mirror) and reported in
+    ``renames_suppressed``.
     """
     if conflict not in CONFLICT_POLICIES:
         raise ValueError(f"conflict must be one of {CONFLICT_POLICIES}")
@@ -559,8 +656,33 @@ def build_sync_plan(
     only_in_a = list(report.get("only_in_a", []))
     only_in_b = list(report.get("only_in_b", []))
     changed = [_pair(e) for e in report.get("name_matches_diff_hash", [])]
-    renames = [_pair(e) for e in report.get("hash_matches_diff_name", [])]
+    renames_all = [_pair(e) for e in report.get("hash_matches_diff_name", [])]
     noop = len(report.get("exact_matches", []))
+
+    renames: List[Tuple[Dict[str, Any], Dict[str, Any]]] = []
+    suppressed: List[Tuple[Dict[str, Any], Dict[str, Any]]] = []
+    if renames_all:
+        from collections import Counter
+
+        occurrences: Counter = Counter()
+        for e in report.get("exact_matches", []):
+            a, b = _pair(e)
+            occurrences[a.get("hash")] += 2
+        for a, b in changed:
+            occurrences[a.get("hash")] += 1
+            occurrences[b.get("hash")] += 1
+        for it in only_in_a + only_in_b:
+            occurrences[it.get("hash")] += 1
+        for a, b in renames_all:
+            occurrences[a.get("hash")] += 2
+        for a, b in renames_all:
+            h = a.get("hash")
+            size = a.get("size")
+            too_small = size is not None and size < rename_min_size
+            if h is None or occurrences[h] > 2 or too_small:
+                suppressed.append((a, b))
+            else:
+                renames.append((a, b))
 
     a_to_b: List[Dict[str, Any]] = []
     b_to_a: List[Dict[str, Any]] = []
@@ -568,18 +690,27 @@ def build_sync_plan(
     b_delete: List[Dict[str, Any]] = []
     conflicts: List[Tuple[Dict[str, Any], Dict[str, Any]]] = []
 
+    # Demoted rename pairs travel as ordinary content: under mirror the winning
+    # side's path is copied and the loser's old name deleted; under union both
+    # sides simply receive the other's path (content already identical).
     if mirror == "a-to-b":
         a_to_b.extend(only_in_a)
         a_to_b.extend(a for a, _ in changed)  # A wins every conflict
+        a_to_b.extend(a for a, _ in suppressed)
         b_delete.extend(only_in_b)
+        b_delete.extend(b for _, b in suppressed)
     elif mirror == "b-to-a":
         b_to_a.extend(only_in_b)
         b_to_a.extend(b for _, b in changed)  # B wins every conflict
+        b_to_a.extend(b for _, b in suppressed)
         a_delete.extend(only_in_a)
+        a_delete.extend(a for a, _ in suppressed)
     else:
         # Bidirectional union: each side's unique files flow to the other.
         a_to_b.extend(only_in_a)
         b_to_a.extend(only_in_b)
+        a_to_b.extend(a for a, _ in suppressed)
+        b_to_a.extend(b for _, b in suppressed)
         for a, b in changed:
             if conflict == "a-wins":
                 a_to_b.append(a)
@@ -603,6 +734,7 @@ def build_sync_plan(
         "b_delete": b_delete,
         "conflicts": conflicts,
         "renames": renames,
+        "renames_suppressed": suppressed,
         "noop": noop,
     }
 

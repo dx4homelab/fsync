@@ -28,8 +28,49 @@ from .fileindex import (
     render_rsync_command,
     render_delete_block,
     split_remote,
+    load_index_file,
+    matches_exclude,
+    default_cache_path,
     DEFAULT_RSYNC_SSH,
 )
+
+
+def _load_side(
+    spec: str,
+    *,
+    recursive: bool,
+    hash_algo: str,
+    fields=None,
+    workers: int = 1,
+    show_progress: bool = False,
+    exclude=None,
+    b3sum_path=None,
+    logger=None,
+) -> list[dict]:
+    """Resolve one compare/sync-plan side: scan a directory, or load a saved
+    index file (JSON/JSONL) when ``spec`` points at a regular file.
+
+    Index-file input is what lets each box hash locally and exchange only
+    metadata — excludes are re-applied to loaded records so both input kinds
+    honor the same filter.
+    """
+    p = Path(spec)
+    if p.is_file():
+        records = load_index_file(p)
+        if exclude:
+            records = [r for r in records if not matches_exclude(r.get("path", ""), exclude)]
+        return records
+    return list_files_with_metadata(
+        p,
+        recursive=recursive,
+        hash_algo=hash_algo,
+        fields=fields,
+        workers=workers,
+        show_progress=show_progress,
+        exclude=exclude,
+        b3sum_path=b3sum_path,
+        logger=logger,
+    )
 
 
 def cmd_index(args: argparse.Namespace) -> int:
@@ -52,6 +93,8 @@ def cmd_index(args: argparse.Namespace) -> int:
         workers=args.workers,
         show_progress=args.progress,
         logger=getattr(args, "logger", None),
+        exclude=getattr(args, "exclude", None),
+        cache_path=default_cache_path(args.dir) if getattr(args, "cache", False) else None,
     )
     if args.format == "jsonl":
         # stream JSON lines
@@ -125,6 +168,7 @@ def _cmd_index_streaming(args: argparse.Namespace, fields) -> int:
                 b3sum_path=getattr(args, "b3sum_path", None),
                 chunk_size=batch_size,
                 logger=logger,
+                exclude=getattr(args, "exclude", None),
             ):
                 if out_f is not None:
                     out_f.write(json.dumps(rec) + "\n")
@@ -157,11 +201,15 @@ def cmd_compare(args: argparse.Namespace) -> int:
     if args.fields:
         fields = [f.strip() for f in args.fields.split(",") if f.strip()]
 
-    a = list_files_with_metadata(
-        Path(args.dirA), recursive=args.recursive, hash_algo=args.hash, fields=fields, workers=args.workers, show_progress=args.progress, logger=getattr(args, "logger", None)
+    a = _load_side(
+        args.dirA, recursive=args.recursive, hash_algo=args.hash, fields=fields,
+        workers=args.workers, show_progress=args.progress,
+        exclude=getattr(args, "exclude", None), logger=getattr(args, "logger", None),
     )
-    b = list_files_with_metadata(
-        Path(args.dirB), recursive=args.recursive, hash_algo=args.hash, fields=fields, workers=args.workers, show_progress=args.progress, logger=getattr(args, "logger", None)
+    b = _load_side(
+        args.dirB, recursive=args.recursive, hash_algo=args.hash, fields=fields,
+        workers=args.workers, show_progress=args.progress,
+        exclude=getattr(args, "exclude", None), logger=getattr(args, "logger", None),
     )
     report = compare_file_lists(a, b, match_on=args.match_on)
     if args.format == "pretty":
@@ -346,17 +394,24 @@ def cmd_sync_plan(args: argparse.Namespace) -> int:
         if not args.dirA or not args.dirB:
             print("provide two directories (dirA dirB) or --from-report REPORT", file=sys.stderr)
             return 2
-        a = list_files_with_metadata(
-            Path(args.dirA), recursive=args.recursive, hash_algo=args.hash,
+        a = _load_side(
+            args.dirA, recursive=args.recursive, hash_algo=args.hash,
             workers=args.workers, show_progress=args.progress,
+            exclude=getattr(args, "exclude", None),
             b3sum_path=getattr(args, "b3sum_path", None), logger=logger,
         )
-        b = list_files_with_metadata(
-            Path(args.dirB), recursive=args.recursive, hash_algo=args.hash,
+        b = _load_side(
+            args.dirB, recursive=args.recursive, hash_algo=args.hash,
             workers=args.workers, show_progress=args.progress,
+            exclude=getattr(args, "exclude", None),
             b3sum_path=getattr(args, "b3sum_path", None), logger=logger,
         )
         report = compare_file_lists(a, b, match_on=args.match_on)
+        # An index-file side has no directory to resolve into an endpoint.
+        for spec, flag in ((args.dirA, "--src"), (args.dirB, "--dest")):
+            if Path(spec).is_file() and not getattr(args, flag.lstrip("-"), None):
+                print(f"{spec} is an index file; {flag} is required to name its rsync endpoint", file=sys.stderr)
+                return 2
         src = args.src or str(Path(args.dirA).resolve())
         dest = args.dest or str(Path(args.dirB).resolve())
 
@@ -367,7 +422,8 @@ def cmd_sync_plan(args: argparse.Namespace) -> int:
             return 2
 
     # 2. Build the directional plan.
-    plan = build_sync_plan(report, conflict=args.conflict, mirror=args.mirror)
+    plan = build_sync_plan(report, conflict=args.conflict, mirror=args.mirror,
+                           rename_min_size=getattr(args, "rename_min_size", 0))
 
     # 3. Emit the artifacts.
     out_dir = Path(args.out_dir)
@@ -508,13 +564,15 @@ def cmd_sync_plan(args: argparse.Namespace) -> int:
     # 4. Summary.
     print(
         "sync-plan ({mode}, conflict={c}): A->B {ab}, B->A {ba}, "
-        "conflicts {cf}, renames {rn}, identical {noop}{dels}{sk}".format(
+        "conflicts {cf}, renames {rn}, identical {noop}{dels}{sup}{sk}".format(
             mode=args.mirror or "union",
             c=args.conflict,
             ab=len(a_paths), ba=len(b_paths),
             cf=len(plan["conflicts"]), rn=len(plan["renames"]), noop=plan["noop"],
             dels=(f", deletes {len(del_paths) + len(del_paths_a)}"
                   if (del_paths or del_paths_a) else ""),
+            sup=(f", renames demoted to copies {len(plan['renames_suppressed'])}"
+                 if plan.get("renames_suppressed") else ""),
             sk=(f", SKIPPED {skipped_total}" if skipped_total else ""),
         ),
         file=sys.stderr,
@@ -534,6 +592,10 @@ def build_parser() -> argparse.ArgumentParser:
     p_index.add_argument("--no-recursive", dest="recursive", action="store_false", help="Do not recurse")
     p_index.add_argument("--follow-symlinks", action="store_true", help="Follow symlinks to files")
     p_index.add_argument("--hash", default="sha256", help="Hash algorithm (default: sha256)")
+    p_index.add_argument("--exclude", action="append", default=None, metavar="PATTERN",
+                         help="Exclude pattern (repeatable): with '/' matches the relative path, without matches any path component")
+    p_index.add_argument("--cache", action="store_true",
+                         help="Reuse cached hashes for files with unchanged size+mtime (per-root cache under ~/.cache/fsync)")
     p_index.add_argument("--fields", help="Comma-separated list of metadata fields to include (default: all)")
     p_index.add_argument("--output", help="Write output JSON to file")
     p_index.add_argument("--format", choices=("json","jsonl"), default="json", help="Output format for index (json|jsonl)")
@@ -549,9 +611,11 @@ def build_parser() -> argparse.ArgumentParser:
     p_index.add_argument("--scanner-id", help="Scanner id used as event instance (default: hostname)")
     p_index.add_argument("--run-id", help="Correlation id for this scan's events (default: generated ULID)")
 
-    p_cmp = sub.add_parser("compare", help="Compare two directories and print JSON report")
-    p_cmp.add_argument("dirA", help="Left directory")
-    p_cmp.add_argument("dirB", help="Right directory")
+    p_cmp = sub.add_parser("compare", help="Compare two directories (or saved index files) and print JSON report")
+    p_cmp.add_argument("dirA", help="Left directory, or a saved `index --output` JSON/JSONL file")
+    p_cmp.add_argument("dirB", help="Right directory, or a saved `index --output` JSON/JSONL file")
+    p_cmp.add_argument("--exclude", action="append", default=None, metavar="PATTERN",
+                       help="Exclude pattern (repeatable); also filters records loaded from index files")
     p_cmp.add_argument("--recursive", action="store_true", default=True, help="Recurse into subdirectories")
     p_cmp.add_argument("--no-recursive", dest="recursive", action="store_false", help="Do not recurse")
     p_cmp.add_argument("--hash", default="sha256", help="Hash algorithm (default: sha256)")
@@ -604,8 +668,12 @@ def build_parser() -> argparse.ArgumentParser:
 
     # sync-plan: project a compare report onto rsync inputs (--files-from + run.sh)
     p_plan = sub.add_parser("sync-plan", help="Generate rsync --files-from lists + run.sh from a compare diff")
-    p_plan.add_argument("dirA", nargs="?", help="Left directory (omit if using --from-report)")
-    p_plan.add_argument("dirB", nargs="?", help="Right directory (omit if using --from-report)")
+    p_plan.add_argument("dirA", nargs="?", help="Left directory or saved index file (omit if using --from-report)")
+    p_plan.add_argument("dirB", nargs="?", help="Right directory or saved index file (omit if using --from-report)")
+    p_plan.add_argument("--exclude", action="append", default=None, metavar="PATTERN",
+                        help="Exclude pattern (repeatable); applies to scans and loaded index files")
+    p_plan.add_argument("--rename-min-size", type=int, default=0, metavar="BYTES",
+                        help="Demote rename pairs smaller than BYTES to plain copies (duplicate-content pairs are always demoted)")
     p_plan.add_argument("--from-report", help="Consume a saved `compare --output` JSON report instead of scanning")
     p_plan.add_argument("--out-dir", default="fsync-plan", help="Directory for the generated plan files (default: fsync-plan)")
     p_plan.add_argument("--conflict", choices=("review", "newer", "a-wins", "b-wins"), default="review",
@@ -626,6 +694,31 @@ def build_parser() -> argparse.ArgumentParser:
     p_plan.add_argument("--b3sum-path", help="Path to external b3sum binary (optional)")
     p_plan.add_argument("--progress", action="store_true", help="Show a progress bar (requires tqdm)")
     p_plan.add_argument("--verbose", action="count", default=0, help="Increase verbosity")
+
+    # sync: profile-driven home synchronisation (docs/home-sync-automation.md)
+    p_sync = sub.add_parser("sync", help="Profile-driven two-box sync: plan, transfer with backup-dir safety, report")
+    sync_sub = p_sync.add_subparsers(dest="sync_cmd")
+    p_sync_run = sync_sub.add_parser("run", help="Run sync profiles headlessly (safe no-op when the peer is away)")
+    p_sync_run.add_argument("--profile", action="append", default=None,
+                            help="Profile name to run (repeatable); use --all for every profile")
+    p_sync_run.add_argument("--all", action="store_true", help="Run every profile in the config")
+    p_sync_run.add_argument("--config", help="Profiles YAML (default: ~/.config/fsync/sync-profiles.yaml)")
+    p_sync_run.add_argument("--dry-run", action="store_true", help="Plan and report but pass -n to rsync (no transfers, no backups)")
+    p_sync_run.add_argument("--plan-only", action="store_true",
+                            help="Print a JSON preview of what would transfer (no lock, no rsync) — used by `fsync tui`")
+    p_sync_run.add_argument("--workers", type=int, default=None, help="Override hashing workers on both sides")
+    p_sync_run.add_argument("--verbose", action="count", default=0, help="Increase verbosity")
+    p_sync_init = sync_sub.add_parser("init", help="Write a starter sync-profiles.yaml")
+    p_sync_init.add_argument("--config", help="Target path (default: ~/.config/fsync/sync-profiles.yaml)")
+    p_sync_init.add_argument("--force", action="store_true", help="Overwrite an existing config")
+    p_sync_init.add_argument("--verbose", action="count", default=0, help="Increase verbosity")
+
+    # tui: plan -> one confirmation -> detached run with live, re-attachable progress
+    p_tui = sub.add_parser("tui", help="Terminal UI for sync: preview, confirm once, watch progress (runner survives the UI)")
+    p_tui.add_argument("--config", help="Profiles YAML (default: ~/.config/fsync/sync-profiles.yaml)")
+    p_tui.add_argument("--profile", action="append", default=None,
+                       help="Limit to profile NAME (repeatable); default: all profiles")
+    p_tui.add_argument("--verbose", action="count", default=0, help="Increase verbosity")
 
     return p
 
@@ -656,6 +749,17 @@ def main(argv: list[str] | None = None) -> int:
         return cmd_ctl(args)
     if args.cmd == "sync-plan":
         return cmd_sync_plan(args)
+    if args.cmd == "sync":
+        from .homesync import cmd_sync
+
+        return cmd_sync(args)
+    if args.cmd == "tui":
+        try:
+            from .tui import run_tui
+        except ImportError:
+            print("fsync tui requires the 'textual' package: pip install textual", file=sys.stderr)
+            return 2
+        return run_tui(args)
     parser.print_help()
     return 1
 

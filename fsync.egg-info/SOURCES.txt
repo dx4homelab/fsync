@@ -1,8 +1,15 @@
 pyproject.toml
 readme.md
 fsync/__init__.py
+fsync/agent.py
+fsync/catalog_api.py
+fsync/catalog_client.py
 fsync/cli.py
+fsync/db.py
+fsync/eventbus.py
 fsync/fileindex.py
+fsync/homesync.py
+fsync/tui.py
 fsync.egg-info/PKG-INFO
 fsync.egg-info/SOURCES.txt
 fsync.egg-info/dependency_links.txt
@@ -11,3 +18,5 @@ fsync.egg-info/requires.txt
 fsync.egg-info/top_level.txt
 tests/test_cli_and_options.py
 tests/test_fileindex.py
+tests/test_homesync_p1.py
+tests/test_sync_plan.py

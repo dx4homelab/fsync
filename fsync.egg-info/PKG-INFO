@@ -4,6 +4,8 @@ Version: 0.1.0
 Summary: Simple file indexing and comparison utilities
 Author-email: dev <dev@example.com>
 Description-Content-Type: text/markdown
+Requires-Dist: pyyaml
+Requires-Dist: textual
 Provides-Extra: progress
 Requires-Dist: tqdm; extra == "progress"
 
@@ -156,6 +158,56 @@ You can also install the package locally and get a `fsync` console script:
 pip install -e .
 fsync index /path/to/dir --workers 4 --format jsonl > out.jsonl
 ```
+
+## Sync planning (`fsync sync-plan`)
+
+`compare` tells you what differs; `sync-plan` projects that hash-based diff onto
+**rsync** inputs. fsync never copies bytes itself — it writes `--files-from`
+lists plus a guarded `run.sh` you review and run.
+
+```bash
+# Bidirectional union (default, dry-run): each side's unique files flow to the
+# other; same-path/different-content files are listed as conflicts, NOT synced.
+fsync sync-plan /home/developer developer@10.55.0.2:/home/developer --out-dir plan
+# (or scan locally and point rsync elsewhere)
+fsync sync-plan /home/developer /mnt/other \
+  --src /home/developer --dest developer@10.55.0.2:/home/developer --out-dir plan
+bash plan/run.sh        # review first; re-run sync-plan with --execute to drop -n
+```
+
+Generated files: `plan.a_to_b.lst`, `plan.b_to_a.lst` (rsync `--files-from`
+lists), `plan.conflicts.txt`, `plan.renames.sh` (content-identical files under a
+different name — a rename, not a re-copy), and `run.sh`.
+
+Key options:
+
+- `--conflict review|newer|a-wins|b-wins` — how to route same-path/different-content files (default `review`: left for a human, never auto-clobbered).
+- `--mirror a-to-b|b-to-a` — one-way mirror (the only mode that proposes deletions; they are written to a list and **commented out** in `run.sh`). Ignores `--conflict`.
+- `--from-report report.json` — consume a saved `compare --output` report (requires `--src`/`--dest`).
+- `--execute` — emit live rsync commands (default is a dry run with `-n`).
+- `--src` / `--dest` — rsync endpoints (default: the resolved scan dirs).
+- `--rsync-flags` — override the defaults (`-aHAXS --numeric-ids --ignore-times --info=progress2 --partial`).
+
+Safety: copies never `--delete`; `--ignore-times` makes rsync transfer exactly
+the hash-chosen files (so a same-size/same-mtime-but-different-content file is
+never silently skipped); deletions only ever appear in mirror mode and are
+emitted commented-out. After running, re-run `fsync compare` to verify.
+
+### Fast link: Thunderbolt/USB4 host-to-host
+
+A single TB4/USB4 cable between the two machines gives a ~10–20 Gbit/s
+point-to-point network (kernel `thunderbolt_net`) — much faster than GbE for a
+full `/home` sync. One-time setup on each box:
+
+```bash
+sudo scripts/tb-net.sh 1   # on the scanning machine -> 10.55.0.1/30
+sudo scripts/tb-net.sh 2   # on the peer             -> 10.55.0.2/30
+```
+
+Plug the cable (direct port-to-port is the reliable option; a dock's
+downstream TB port usually works too), wait for `thunderbolt0` to appear,
+then use the `developer@10.55.0.2:...` endpoints exactly as in the examples
+above. The `10.55.0.x` addresses in this doc are that link.
 
 
 
