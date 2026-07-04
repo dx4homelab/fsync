@@ -313,6 +313,43 @@ boxes.
 all thin clients of fsyncd rendering one dream4ui-lite spec.** Remaining:
 P4.4 (mTLS hardening / off-LAN).
 
+### P4.4 SHIPPED + DEPLOYED 2026-07-04 (off-LAN; completes P4)
+
+Off-LAN reach for the laptop at the client site, designed generically so the
+tunnel is swappable (Tailscale recommended):
+
+- **Multi-address peer**: `peer.addresses` is an ordered list (LAN name first,
+  tailnet name/IP next). `peer_reachable()` probes each over ssh, pins the
+  first reachable on the Peer; the sync (ssh/rsync) and the API both follow it.
+- **Exact-cert pin, hostname-check off**: the pinned self-signed cert is the
+  identity proof, so TLS hostname matching is dropped — reach the pinned peer
+  by any address (tailnet IP, MagicDNS) with no SAN juggling.
+- **All-interface mTLS** on its own port (`mtls_port`, default `port+2`=7446;
+  loopback token-TLS stays 127.0.0.1:port — 0.0.0.0 would collide). Safe:
+  `CERT_REQUIRED` rejects unpinned callers.
+- **Cross-box mTLS centralized in the daemon**: `/v1/peer` connects to the
+  peer daemon and relays its runner state; UIs just read the local relay (no
+  more per-UI cross-box mTLS or hardcoded `.lan`).
+
+Review (29 agents) → 2 fixed. The load-bearing one: the SYNC path is
+ssh/rsync, which verifies host keys — `StrictHostKeyChecking=yes` refused a
+new off-LAN address, silently no-opping the run (the exact P4.4 case). The
+first "raw IP works" check had only exercised the cert-pinned mTLS API, not
+ssh. Fix: `accept-new` (pin unknown host first connect over the authenticated
+tailnet; still refuse a changed key). Verified properly: a full sync (index +
+rsync legs) runs to minis4dx by a fresh unpinned raw IP. Also: peer status
+now shows ssh-sync health as primary and surfaces API-up/sync-down
+divergence. 81 tests pass; deployed both boxes.
+
+**Off-LAN bring-up (the one manual step)** — both boxes are currently logged
+out of Tailscale: run `tailscale up` on each (per the make-unique plan:
+`--force-reauth` to clear the cloned node identity), then add the peer's
+tailnet name to `peer.addresses`. Everything else is automatic — the first
+off-LAN run pins the tailnet host key and syncs.
+
+**P4 is complete: R9 (UI/engine split), R10 (fsyncd TLS/mTLS, off-LAN), R11
+(TUI + web + GTK), R12 (dream4ui-lite) all shipped and deployed.**
+
 ### Decisions (settled 2026-07-04)
 
 1. Backend lifecycle: **persistent daemon** on each box.
