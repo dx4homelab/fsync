@@ -300,44 +300,43 @@ class SyncTuiApp(App):
     # (the single source of truth shared with `fsync web`) and rendered to Rich
     # here. The TUI owns state + polling + keybindings; it owns no layout.
 
-    def _strip(self):
-        return views.status_strip(self.daemon_status, self.peer_line)
-
     def update_statusbar(self) -> None:
-        self.query_one("#statusbar", Static).update(to_rich(Screen(blocks=[self._strip()])))
+        # the strip lives in its own pinned widget; view builders return
+        # content only, so it is rendered exactly once (not embedded in #body)
+        strip = views.status_strip(self.daemon_status, self.peer_line)
+        self.query_one("#statusbar", Static).update(to_rich(Screen(blocks=[strip])))
 
     def render_body(self) -> None:
         body = self.query_one("#body", Static)
-        strip = self._strip()
         if self.mode == "loading":
-            screen = views.message_screen("", "starting…", Tone.muted, strip)
+            screen = views.message_screen("", "starting…", Tone.muted)
         elif self.mode == "no_daemon":
             screen = views.message_screen(
                 "fsyncd is not running",
                 f"{self.msg}\n\nStart it:  systemctl --user start fsync-daemon\n"
-                "Install:   fsync daemon install", Tone.bad, strip,
+                "Install:   fsync daemon install", Tone.bad,
                 actions=[Action(key="p", label="retry", tone=Tone.accent),
                          Action(key="q", label="quit")])
         elif self.mode == "planning":
-            screen = (views.planning_screen(self.plan_partial, strip) if self.plan_partial
+            screen = (views.planning_screen(self.plan_partial) if self.plan_partial
                       else views.message_screen("", "Planning… backend is indexing both boxes",
-                                                Tone.warn, strip))
+                                                Tone.warn))
         elif self.mode == "no_peer":
             screen = views.message_screen(
-                "", f"Peer {self.msg} is not reachable — nothing to sync.", Tone.bad, strip,
+                "", f"Peer {self.msg} is not reachable — nothing to sync.", Tone.bad,
                 actions=[Action(key="p", label="retry", tone=Tone.accent),
                          Action(key="q", label="quit")])
         elif self.mode == "plan":
-            screen = views.plan_screen(self.plan, self.state, self.dry, strip, self.msg)
+            screen = views.plan_screen(self.plan, self.state, self.dry, self.msg)
         elif self.mode == "spawning":
-            screen = views.message_screen("", "Starting run in the backend…", Tone.warn, strip)
+            screen = views.message_screen("", "Starting run in the backend…", Tone.warn)
         elif self.mode == "error" and not self.progress:
             screen = views.message_screen(
-                "", self.msg or "something went wrong", Tone.bad, strip,
+                "", self.msg or "something went wrong", Tone.bad,
                 actions=[Action(key="p", label="retry", tone=Tone.accent),
                          Action(key="q", label="quit")])
         else:  # progress | finished | error-with-progress
-            screen = views.progress_screen(self.progress or {}, self.mode, strip)
+            screen = views.progress_screen(self.progress or {}, self.mode)
         body.update(to_rich(screen))
 
 

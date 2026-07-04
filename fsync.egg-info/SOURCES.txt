@@ -13,6 +13,8 @@ fsync/eventbus.py
 fsync/fileindex.py
 fsync/homesync.py
 fsync/tui.py
+fsync/views.py
+fsync/web.py
 fsync.egg-info/PKG-INFO
 fsync.egg-info/SOURCES.txt
 fsync.egg-info/dependency_links.txt
@@ -22,4 +24,5 @@ fsync.egg-info/top_level.txt
 tests/test_cli_and_options.py
 tests/test_fileindex.py
 tests/test_homesync_p1.py
+tests/test_p4_2_views_web.py
 tests/test_sync_plan.py

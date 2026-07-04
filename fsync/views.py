@@ -79,15 +79,18 @@ def status_strip(daemon_status: dict | None, peer_line: str | None = None) -> St
     return Strip(segments=segs)
 
 
-def _with_strip(strip: Strip, screen: Screen) -> Screen:
+def with_strip(strip: Strip, screen: Screen) -> Screen:
+    """Prepend the status strip as the first block — for surfaces (web) that
+    render one scrolling column. The TUI keeps the strip in a separate pinned
+    widget and does NOT call this, so the strip is never rendered twice."""
     return Screen(title=screen.title, blocks=[strip, *screen.blocks])
 
 
 # --------------------------------------------------------------------------- #
-# planning (live) and plan preview                                            #
+# planning (live) and plan preview — each returns CONTENT ONLY (no strip)      #
 # --------------------------------------------------------------------------- #
 
-def planning_screen(partial: dict, strip: Strip) -> Screen:
+def planning_screen(partial: dict) -> Screen:
     cols = [Column(label="profile / path"), Column(label="state"),
             Column(label="→ push", align="right"), Column(label="← pull", align="right"),
             Column(label="conflicts", align="right"), Column(label="identical", align="right")]
@@ -113,11 +116,10 @@ def planning_screen(partial: dict, strip: Strip) -> Screen:
                   columns=cols, rows=rows)
     note = Note(text=f"{done}/{total} paths planned — the preview with toggles appears "
                      "when all are in.   q: quit")
-    return _with_strip(strip, Screen(blocks=[table, note]))
+    return Screen(blocks=[table, note])
 
 
-def plan_screen(plan: dict, state: dict, dry: bool, strip: Strip,
-                msg: str = "") -> Screen:
+def plan_screen(plan: dict, state: dict, dry: bool, msg: str = "") -> Screen:
     cols = [Column(label="on"), Column(label="profile / path"),
             Column(label="→ push", align="right"), Column(label="← pull", align="right"),
             Column(label="overwrite→backup", align="right"),
@@ -175,14 +177,14 @@ def plan_screen(plan: dict, state: dict, dry: bool, strip: Strip,
         Action(key="p", label="re-plan"),
         Action(key="q", label="quit"),
     ]))
-    return _with_strip(strip, Screen(blocks=blocks))
+    return Screen(blocks=blocks)
 
 
 # --------------------------------------------------------------------------- #
 # run progress / finished                                                     #
 # --------------------------------------------------------------------------- #
 
-def progress_screen(progress: dict, mode: str, strip: Strip) -> Screen:
+def progress_screen(progress: dict, mode: str) -> Screen:
     status = progress.get("status", "?")
     elapsed = (progress.get("finished_ts") or time.time()) - (progress.get("started_ts") or time.time())
     title = {"progress": f"Sync running (pid {progress.get('pid')}) — {elapsed:.0f}s",
@@ -240,12 +242,12 @@ def progress_screen(progress: dict, mode: str, strip: Strip) -> Screen:
         blocks.append(Note(text=f"report: {progress.get('run_dir', '')}/report.json"))
         blocks.append(Actions(items=[Action(key="p", label="plan a new run", tone=Tone.accent),
                                       Action(key="q", label="quit")]))
-    return _with_strip(strip, Screen(blocks=blocks))
+    return Screen(blocks=blocks)
 
 
-def message_screen(title: str, text: str, tone: Tone, strip: Strip,
+def message_screen(title: str, text: str, tone: Tone,
                    actions: list[Action] | None = None) -> Screen:
     blocks = [Note(text=text, tone=tone)]
     if actions:
         blocks.append(Actions(items=actions))
-    return _with_strip(strip, Screen(title=title, blocks=blocks))
+    return Screen(title=title, blocks=blocks)

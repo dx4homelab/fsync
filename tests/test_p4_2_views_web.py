@@ -31,16 +31,16 @@ def test_status_strip_variants():
 def test_plan_screen_toggle_reflected():
     strip = views.status_strip(DAEMON)
     # both -> full push+pull counted
-    both = views.plan_screen(PLAN, {"documents": "both"}, dry=False, strip=strip)
+    both = views.plan_screen(PLAN, {"documents": "both"}, dry=False)
     html_both = to_html(both)
     assert "3 (1000B)" in html_both  # push count + bytes shown
     # off -> struck, excluded from totals
-    off = views.plan_screen(PLAN, {"documents": "off"}, dry=False, strip=strip)
+    off = views.plan_screen(PLAN, {"documents": "off"}, dry=False)
     html_off = to_html(off)
     assert "strike" in html_off
     assert "0/1 profiles active" in html_off
     # push -> pull column shows 'skipped'
-    push = views.plan_screen(PLAN, {"documents": "push"}, dry=False, strip=strip)
+    push = views.plan_screen(PLAN, {"documents": "push"}, dry=False)
     assert "1 skipped" in to_html(push)
 
 
@@ -51,7 +51,7 @@ def test_progress_screen_done_and_running():
                 "phase": "done", "a_to_b": {"files_transferred": 3, "overwrites_expected": 1},
                 "b_to_a": {"files_transferred": 0}, "conflicts": 2, "seconds": 1.2}}}},
             "errors": []}
-    scr = views.progress_screen(prog, "finished", strip)
+    scr = views.progress_screen(prog, "finished")
     html = to_html(scr)
     assert "✓ done" in html and "2" in html and "held" in html
 
@@ -109,10 +109,26 @@ def test_web_app_serves_shim_and_page():
     from fastapi.testclient import TestClient
     from fsync import web
     app = web.create_web_app(FakeClient(), profile_names=["documents"])
-    c = TestClient(app)
+    c = TestClient(app, base_url="http://127.0.0.1")  # loopback Host passes the guard
     assert "hx-post" in c.get("/htmx.js").text
     assert c.get("/htmx.js").headers["content-type"].startswith("application/javascript")
     page = c.get("/").text
     assert page.startswith("<!doctype html>") and 'id="screen"' in page
-    # no external resources anywhere in the served document
     assert "http://" not in page and "https://" not in page
+
+
+def test_web_guard_blocks_csrf_and_rebinding(monkeypatch):
+    from fastapi.testclient import TestClient
+    from fsync import web, certs
+    monkeypatch.setattr(certs, "trusted_peers", lambda: [])
+    app = web.create_web_app(FakeClient(), profile_names=["documents"])
+    local = TestClient(app, base_url="http://127.0.0.1")
+    # DNS-rebinding: non-local Host is refused even on a POST that would run a sync
+    assert TestClient(app, base_url="http://attacker.com").post("/do/r").status_code == 403
+    assert local.get("/", headers={"host": "evil.example"}).status_code == 403
+    # CSRF: a cross-site browser request (Sec-Fetch-Site) is refused
+    assert local.post("/do/r", headers={"sec-fetch-site": "cross-site"}).status_code == 403
+    # legitimate same-origin request passes
+    assert local.post("/do/d", headers={"sec-fetch-site": "same-origin"}).status_code == 200
+    # direct navigation (Sec-Fetch-Site: none) passes
+    assert local.get("/", headers={"sec-fetch-site": "none"}).status_code == 200
