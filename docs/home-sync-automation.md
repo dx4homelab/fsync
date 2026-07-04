@@ -281,6 +281,38 @@ races (poll() under lock, screen() snapshots + guards plan==None, prev-run
 adoption guard, cached peer client). Tests: 75 fsync + 5 ui_lite pass;
 web/TUI e2e green; `fsync web` verified serving + guards on both boxes.
 
+### P4.3 SHIPPED + DEPLOYED 2026-07-04
+
+**`fsync gtk`** — the native GTK panel, the third UI surface. Renders the SAME
+dream4ui-lite Screens as the TUI and web through a new backend
+(`ui_lite/render_gtk.py`: Screen → GTK3 widgets). Two modes (as the user
+specified):
+
+- `fsync gtk` — normal resizable window, full parity (plan toggles, progress,
+  actions).
+- `fsync gtk --always-on-top` — compact glanceable panel (`views.compact_screen`:
+  status strip + progress bar / idle line + Sync-now / Re-plan / dry-run /
+  open-full), pinned above other windows.
+
+Always-on-top on GNOME/Wayland (where GTK4 has no such API and mutter has no
+layer-shell): a GTK3 window under XWayland sets `_NET_WM_STATE_ABOVE` via
+`set_keep_above()`, which mutter honors for X11 clients. The panel forces
+`GDK_BACKEND=x11` and re-asserts keep-above on map — verified live (xprop
+shows ABOVE). gi is borrowed from system site-packages (same ABI) so it runs
+from the venv without a pip build. The GTK app reuses the reviewed WebSession
+state machine wholesale; only rendering differs.
+
+Adversarial review (25 agents) → 3 confirmed, all fixed: HIGH GTK UI-freeze
+(peer probe moved out of the session lock + act() runs off the GTK main
+thread), MEDIUM dead compact "Sync now" outside plan mode (+ a Re-plan
+action), LOW indeterminate-bar animation (host pulses on a 90ms timer). 77
+fsync + 6 ui_lite tests pass; deployed and GTK-rendering verified on both
+boxes.
+
+**All of R11 is now delivered: TUI, local web, and native GTK (always-on-top),
+all thin clients of fsyncd rendering one dream4ui-lite spec.** Remaining:
+P4.4 (mTLS hardening / off-LAN).
+
 ### Decisions (settled 2026-07-04)
 
 1. Backend lifecycle: **persistent daemon** on each box.
