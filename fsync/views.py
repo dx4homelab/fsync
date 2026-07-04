@@ -248,19 +248,28 @@ def progress_screen(progress: dict, mode: str) -> Screen:
 
 def peer_line(peer_info: dict | None) -> str | None:
     """Format the local daemon's /v1/peer relay into a one-line peer summary
-    (used by all UIs' status strips). The daemon reaches the peer over mTLS
-    and includes its runner state when the API answered (api_ok)."""
+    for the status strips.
+
+    The strip reflects SYNC health, so the ssh reachability (the channel a run
+    actually uses) is the primary signal. The mTLS API can answer over a route
+    where ssh does not (host-key vs cert-pin); that divergence is surfaced
+    ('sync route down') rather than masked with a green line."""
     if not peer_info:
         return None
     host = peer_info.get("peer_host") or peer_info.get("host") or "peer"
-    if peer_info.get("api_ok"):
-        r = peer_info.get("peer_runner")
-        base = f"peer {host}: ● run {r['run_id']}" if r else f"peer {host}: idle"
-        active = peer_info.get("active_host")
-        # note the route when it's the off-LAN fallback (not the first address)
-        return base + (f" (via {active})" if active and active != peer_info.get("host") else "")
-    if peer_info.get("reachable"):
-        return f"peer {host}: " + ("busy" if peer_info.get("busy") else "reachable")
+    active = peer_info.get("active_host")
+    # note the off-LAN route when the reachable address isn't the first (host)
+    via = f" (via {active})" if active and active != peer_info.get("host") else ""
+    if peer_info.get("reachable"):                       # sync (ssh) route up
+        if peer_info.get("busy"):
+            return f"peer {host}: busy{via}"
+        if peer_info.get("api_ok"):
+            r = peer_info.get("peer_runner")
+            base = f"peer {host}: ● run {r['run_id']}" if r else f"peer {host}: idle"
+            return base + via
+        return f"peer {host}: reachable{via}"            # ssh up, daemon/API down
+    if peer_info.get("api_ok"):                          # API up but ssh route dead
+        return f"peer {host}: sync route down (API up)"
     return f"peer {host}: away"
 
 

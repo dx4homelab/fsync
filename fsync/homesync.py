@@ -39,7 +39,15 @@ DEFAULT_CONFIG = "~/.config/fsync/sync-profiles.yaml"
 STATE_ROOT = "~/.local/state/fsync"
 ENGINE_DIR = ".local/lib/fsync-engine"  # relative to the peer's $HOME
 
-SSH_OPTS = ["-o", "BatchMode=yes", "-o", "ConnectTimeout=5", "-o", "StrictHostKeyChecking=yes"]
+# StrictHostKeyChecking=accept-new (not =yes): the SYNC channel is ssh, which
+# verifies host keys against known_hosts. Off-LAN, a new address (the peer's
+# tailnet name/IP) has no pinned key yet, and =yes would refuse it in
+# BatchMode → the run silently no-ops, defeating P4.4. accept-new pins an
+# UNKNOWN host on first connect (safe: the tailnet is WireGuard-authenticated)
+# but still REFUSES a CHANGED key (a real MITM). The cert-pinned mTLS API path
+# is separate and host-key-independent.
+_STRICT = "-o", "StrictHostKeyChecking=accept-new"
+SSH_OPTS = ["-o", "BatchMode=yes", "-o", "ConnectTimeout=5", *_STRICT]
 # rsync exits that mean "the sync itself is fine": 24 = source files vanished
 # mid-transfer (live trees do that), 23 = partial transfer (typically the same
 # vanish reported by the sender, or an unreadable file — logged, never fatal).
@@ -577,7 +585,10 @@ def run_rsync_leg(
         "rsync", "-aHAXS", "--numeric-ids", "--ignore-times", "--partial", "--stats",
         "--info=progress2",
         "--backup", f"--backup-dir={backup_dir}",
-        "-e", DEFAULT_RSYNC_SSH + " -o BatchMode=yes",
+        # match the probe's host-key policy: accept-new so an off-LAN address
+        # (whose key was pinned by the peer_reachable probe moments earlier)
+        # isn't refused mid-transfer; BatchMode so it never prompts.
+        "-e", DEFAULT_RSYNC_SSH + " -o BatchMode=yes -o StrictHostKeyChecking=accept-new",
         f"--files-from={lst_path}",
     ]
     if dry_run:

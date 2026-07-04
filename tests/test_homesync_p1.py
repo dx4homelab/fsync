@@ -669,10 +669,16 @@ def test_peer_line_formats():
     assert views.peer_line(None) is None
     assert views.peer_line({"host": "b", "reachable": False, "api_ok": False}) == "peer b: away"
     assert views.peer_line({"host": "b", "reachable": True, "busy": True, "api_ok": False}) == "peer b: busy"
-    idle = views.peer_line({"host": "b", "peer_host": "boxb", "api_ok": True, "peer_runner": None,
-                            "active_host": "b"})
+    # sync (ssh) reachable + API up + no runner -> idle
+    idle = views.peer_line({"host": "b", "peer_host": "boxb", "reachable": True, "api_ok": True,
+                            "peer_runner": None, "active_host": "b"})
     assert idle == "peer boxb: idle"
-    # off-LAN route annotated when the active address isn't the first (host)
-    viatail = views.peer_line({"host": "b.lan", "peer_host": "boxb", "api_ok": True,
+    # off-LAN route annotated when the reachable address isn't the first (host)
+    viatail = views.peer_line({"host": "b.lan", "peer_host": "boxb", "reachable": True, "api_ok": True,
                                "peer_runner": None, "active_host": "b.tail.ts.net"})
     assert "via b.tail.ts.net" in viatail
+    # DIVERGENCE surfaced: API up over mTLS but the ssh sync route is dead
+    div = views.peer_line({"host": "b", "peer_host": "boxb", "reachable": False, "api_ok": True})
+    assert div == "peer boxb: sync route down (API up)"
+    # ssh up but daemon/API down
+    assert views.peer_line({"host": "b", "reachable": True, "api_ok": False}) == "peer b: reachable"

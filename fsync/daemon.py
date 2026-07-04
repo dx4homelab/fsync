@@ -582,9 +582,12 @@ def create_app(config: str | None = None, *, require_token: bool = False,
             from .client import DaemonUnavailable, FsyncClient
 
             name = trusted[0]
-            addrs = peer.all_addresses()
+            # ssh probe (above) set peer._active to the reachable address; try
+            # it first so a dead LAN name isn't retried (timeout burned) here.
+            ordered = ([peer.active_host] +
+                       [a for a in peer.all_addresses() if a != peer.active_host])
             try:
-                pc = FsyncClient.connect_peer(name, addrs, port=daemon_cfg["mtls_port"])
+                pc = FsyncClient.connect_peer(name, ordered, port=daemon_cfg["mtls_port"])
                 try:
                     st = pc.status()
                     out.update(api_ok=True, peer_runner=st.get("runner"),

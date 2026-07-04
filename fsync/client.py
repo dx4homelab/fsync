@@ -90,16 +90,22 @@ class FsyncClient:
                    identity=(str(certs.cert_path()), str(certs.key_path())),
                    send_token=False)  # authenticated by client cert, not token
 
+    # a peer PROBE must fail fast — the default 60s read timeout would let one
+    # unreachable address tie up a request handler for a minute.
+    PROBE_TIMEOUT = httpx.Timeout(4.0, read=8.0)
+
     @classmethod
     def connect_peer(cls, name: str, addresses: list[str],
                      port: int = DEFAULT_PORT) -> "FsyncClient":
         """Return an mTLS client bound to the first address whose /v1/status
-        answers — LAN name first, off-LAN (tailnet) fallback next. Because the
-        peer cert is pinned exactly and hostname checking is off, any reachable
-        address that presents that cert is accepted."""
+        answers. Because the peer cert is pinned exactly and hostname checking
+        is off, any reachable address presenting that cert is accepted. The
+        caller should put the known-reachable address first so a dead LAN name
+        isn't retried (and its timeout burned) on every poll."""
         last: Exception | None = None
         for addr in addresses or [name]:
             c = cls.for_peer(name, host=addr, port=port)
+            c._http.timeout = cls.PROBE_TIMEOUT
             try:
                 c.status()
                 return c
