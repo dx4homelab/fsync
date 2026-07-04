@@ -224,6 +224,35 @@ Textual app, four screens:
   renderers (Textual / web / GTK). Explicitly **not required to be
   compatible** with the rest of dream4ui.
 
+### P4.1 SHIPPED + DEPLOYED 2026-07-04
+
+Branch `p4.1-fsyncd`. Engine/UI split delivered and running on both boxes:
+
+- **`fsync/certs.py`** — per-box self-signed EC P-256 keypair (openssl), dual
+  serverAuth/clientAuth EKU, `CA:FALSE` (exact-cert pin, not a CA anchor).
+  Peers pin each other's cert; a `0600` `api-token` gates loopback callers.
+- **`fsync/daemon.py` (fsyncd)** — FastAPI over the engine's on-disk state;
+  runs stay detached subprocesses. Two app instances share one PlanJobs/
+  Scheduler/run-lock: loopback (127.0.0.1, TLS + token) and LAN (mTLS,
+  `CERT_REQUIRED` against pinned peers). Internal scheduler replaced the P3
+  timer. `fsync daemon run|install|remove|status|trust|cert`.
+- **`fsync/client.py`** — the only module UIs touch; httpx over an explicit
+  pinned `SSLContext` (presents the client cert for mTLS — httpx 0.28's
+  tuple `cert=` does not). Sends the local token; peers use their cert.
+- **`fsync/tui.py`** — pure API client (import-boundary enforced by test);
+  async tick runs all HTTP off the event loop; status strip reads the daemon
+  and shows the peer's runner over mTLS.
+
+Deployed: fsyncd active on fury4dx + minis4dx, mutual cert trust pinned
+(fingerprints cross-verified), both LAN mTLS listeners open, both P3 timers
+retired. Verified: local token gate (401 without), exact-cert pin (wrong
+cert rejected), cross-box mTLS both directions (200), certless client
+rejected, TUI kill/re-attach, clean SIGTERM. An adversarial review (39
+agents) found 18 issues; the confirmed set (exact-pin, loopback auth, run
+TOCTOU, fast deferrals, scheduler re-anchor, interval floor, 422 bodies,
+plan cap, run-dir GC, async TUI, DNS-failure mTLS) was fixed with regression
+tests. 69 tests pass.
+
 ### Decisions (settled 2026-07-04)
 
 1. Backend lifecycle: **persistent daemon** on each box.
