@@ -75,11 +75,21 @@ def load_daemon_cfg(config_path: str | None) -> dict[str, Any]:
         raw = (yaml.safe_load(cfg_path.read_text()) or {}).get("daemon") or {}
     except OSError:
         pass
+    port = int(raw.get("port", DEFAULT_PORT))
     return {
-        "port": int(raw.get("port", DEFAULT_PORT)),
+        "port": port,
+        # mTLS gets its OWN port: the loopback token-TLS listener binds
+        # 127.0.0.1:port, and 0.0.0.0 (bind=all) would collide with it on the
+        # same port (0.0.0.0 includes loopback). Peers connect to mtls_port.
+        "mtls_port": int(raw.get("mtls_port", port + 2)),
         "interval_s": parse_span(raw.get("interval", "1h")),
         "jitter_s": parse_span(raw.get("jitter", "240s"), 240),
-        "lan_host": raw.get("lan_host", "auto"),
+        # bind: 'all' (0.0.0.0 — the default; mTLS is safe to expose since a
+        # pinned client cert is required, which is what makes off-LAN work),
+        # 'auto' (detected LAN address only), or an explicit address. A legacy
+        # lan_host key still maps to that address for back-compat.
+        "bind": raw.get("bind") or (raw["lan_host"] if raw.get("lan_host") not in (None, "auto")
+                                    else "auto" if "lan_host" in raw else "all"),
     }
 
 
@@ -558,9 +568,32 @@ def create_app(config: str | None = None, *, require_token: bool = False,
             peer, _, _ = load_config(config)
         except HomesyncError as e:
             raise HTTPException(status_code=500, detail=str(e))
+        # ssh reachability (the sync channel), which also resolves the active
+        # address across LAN → tailnet.
         reachable = peer_reachable(peer)
-        return {"host": peer.host, "target": peer.target, "reachable": reachable,
-                "busy": peer_busy(peer) if reachable else None}
+        out: dict[str, Any] = {"host": peer.host, "active_host": peer.active_host,
+                               "reachable": reachable,
+                               "busy": peer_busy(peer) if reachable else None,
+                               "peer_runner": None, "peer_last": None, "api_ok": False}
+        # Relay the peer daemon's own status over mTLS (the daemon holds the
+        # certs + address list, so UIs never do cross-box mTLS themselves).
+        trusted = certs.trusted_peers()
+        if trusted:
+            from .client import DaemonUnavailable, FsyncClient
+
+            name = trusted[0]
+            addrs = peer.all_addresses()
+            try:
+                pc = FsyncClient.connect_peer(name, addrs, port=daemon_cfg["mtls_port"])
+                try:
+                    st = pc.status()
+                    out.update(api_ok=True, peer_runner=st.get("runner"),
+                               peer_last=st.get("last"), peer_host=st.get("host"))
+                finally:
+                    pc.close()
+            except DaemonUnavailable:
+                pass
+        return out
 
     @app.get("/v1/schedule", dependencies=protected)
     def schedule_get() -> dict:
@@ -647,30 +680,37 @@ async def _serve(daemon_cfg: dict, config: str | None) -> None:
     servers.append(QuietServer(local))
 
     bundle = certs.rebuild_bundle()
-    lan_host = daemon_cfg["lan_host"]
-    if lan_host == "auto":
+    bind = daemon_cfg["bind"]
+    if bind == "all":
+        mtls_host = "0.0.0.0"
+    elif bind == "auto":
         peer_host = None
         try:
             peer, _, _ = load_config(config)
             peer_host = peer.host
         except HomesyncError:
             pass
-        lan_host = detect_lan_host(peer_host)
-    if bundle and lan_host:
+        mtls_host = detect_lan_host(peer_host)
+    else:
+        mtls_host = bind  # explicit address
+    if bundle and mtls_host:
         # peers authenticate by their pinned client cert (CERT_REQUIRED), so
-        # this app does NOT require the local token
+        # this app does NOT require the local token, and binding all interfaces
+        # is safe: an unpinned caller cannot complete the handshake. On its own
+        # port so 0.0.0.0 doesn't collide with the loopback listener.
         lan_app = create_app(config, require_token=False, shared=shared)
-        lan = uvicorn.Config(lan_app, host=lan_host, port=daemon_cfg["port"],
+        lan = uvicorn.Config(lan_app, host=mtls_host, port=daemon_cfg["mtls_port"],
                              ssl_certfile=str(cert), ssl_keyfile=str(key),
                              ssl_ca_certs=str(bundle),
                              ssl_cert_reqs=ssl.CERT_REQUIRED,
                              timeout_graceful_shutdown=5,
                              log_level="warning")
         servers.append(QuietServer(lan))
-        print(f"fsyncd: mTLS listener on {lan_host}:{daemon_cfg['port']} "
+        scope = "all interfaces" if mtls_host == "0.0.0.0" else mtls_host
+        print(f"fsyncd: mTLS listener on {scope}:{daemon_cfg['mtls_port']} "
               f"(trusted peers: {', '.join(certs.trusted_peers())})", flush=True)
     else:
-        why = "no trusted peers" if not bundle else "no LAN address detected"
+        why = "no trusted peers" if not bundle else "no bind address"
         print(f"fsyncd: mTLS listener disabled ({why})", flush=True)
     print(f"fsyncd: TLS listener on 127.0.0.1:{daemon_cfg['port']} (token-gated)", flush=True)
 

@@ -62,7 +62,6 @@ class SyncTuiApp(App):
         self._tick_n = 0
         self._polling = False           # re-entrancy guard for the async tick
         self._prev_run_id: str | None = None  # last pointer we saw before spawning
-        self._peer_client: FsyncClient | None = None
 
     @property
     def client(self) -> FsyncClient:
@@ -203,8 +202,6 @@ class SyncTuiApp(App):
     def on_unmount(self) -> None:
         if self._client is not None:
             self._client.close()
-        if self._peer_client is not None:
-            self._peer_client.close()
 
     # ------------------------------------------------------------------ poll
 
@@ -272,26 +269,12 @@ class SyncTuiApp(App):
             self._polling = False
 
     def _peer_probe(self) -> None:
-        from . import certs  # trust-store lookup only — not engine code
-
-        line = None
+        # cross-box mTLS is done by the LOCAL daemon (it holds the certs +
+        # address list); the UI just reads its /v1/peer relay.
         try:
-            peers = certs.trusted_peers()
-            if peers:
-                if self._peer_client is None:
-                    self._peer_client = FsyncClient.for_peer(peers[0], host=f"{peers[0]}.lan")
-                st = self._peer_client.status()
-                runner = st.get("runner")
-                line = (f"peer {st.get('host')}: ● run {runner['run_id']}"
-                        if runner else f"peer {st.get('host')}: idle")
-            else:
-                info = self.client.peer()
-                line = (f"peer {info['host']}: "
-                        + ("busy" if info.get("busy")
-                           else "reachable" if info.get("reachable") else "away"))
+            line = views.peer_line(self.client.peer())
         except Exception:
-            # a transient peer/probe failure must not clear a good last line
-            line = self.peer_line
+            line = self.peer_line  # keep the last good line on a transient blip
         self.call_from_thread(setattr, self, "peer_line", line)
 
     # ------------------------------------------------------------------ status strip + render

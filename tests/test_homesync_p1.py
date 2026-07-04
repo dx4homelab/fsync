@@ -611,3 +611,68 @@ def test_compare_scales_linearly():
     assert len(rep["exact_matches"]) == n - 500
     assert len(rep["only_in_a"]) == 500 and len(rep["only_in_b"]) == 500
     assert took < 5, f"compare took {took:.1f}s — quadratic regression?"
+
+
+# --------------------------------------------------------------------------- #
+# P4.4: off-LAN — multi-address peer, hostname-off pin, bind/mtls_port         #
+# --------------------------------------------------------------------------- #
+
+def test_peer_addresses_and_active_host(tmp_path):
+    _, _, _ = load_config(_write_cfg(tmp_path,
+        "peer: {host: p.lan}\nprofiles: {x: {paths: [a]}}"))  # default addresses
+    peer, _, _ = load_config(_write_cfg(tmp_path, """
+peer: {host: p.lan, user: dev, addresses: [p.lan, p.tail.ts.net]}
+profiles: {x: {paths: [a]}}
+"""))
+    assert peer.all_addresses() == ["p.lan", "p.tail.ts.net"]
+    assert peer.target == "dev@p.lan"       # active_host falls back to host
+    peer._active = "p.tail.ts.net"          # a probe found the off-LAN route
+    assert peer.target == "dev@p.tail.ts.net"
+    # a peer with no addresses list defaults to [host]
+    p2, _, _ = load_config(_write_cfg(tmp_path, "peer: {host: only.lan}\nprofiles: {x: {paths: [a]}}"))
+    assert p2.all_addresses() == ["only.lan"]
+    with pytest.raises(HomesyncError, match="addresses"):
+        load_config(_write_cfg(tmp_path,
+            "peer: {host: p, addresses: [1, 2]}\nprofiles: {x: {paths: [a]}}"))
+
+
+def test_client_pin_disables_hostname_check(tmp_path, monkeypatch):
+    # off-LAN by raw IP requires the exact-cert pin WITHOUT hostname matching
+    from fsync import certs
+    from fsync.client import _ssl_context
+    monkeypatch.setattr(certs, "TLS_DIR", str(tmp_path / "tls"))
+    cert, key = certs.ensure_cert()
+    ctx = _ssl_context(str(cert), (str(cert), str(key)))
+    assert ctx.check_hostname is False
+    import ssl as _ssl
+    assert ctx.verify_mode == _ssl.CERT_REQUIRED  # still verifies the pinned cert
+
+
+def test_daemon_mtls_port_and_bind():
+    from fsync.daemon import load_daemon_cfg
+    import tempfile, os
+    d = tempfile.mkdtemp()
+    p = os.path.join(d, "c.yaml")
+    open(p, "w").write("peer: {host: h}\ndaemon: {port: 7444, bind: all}\nprofiles: {x: {paths: [a]}}")
+    cfg = load_daemon_cfg(p)
+    assert cfg["port"] == 7444 and cfg["mtls_port"] == 7446 and cfg["bind"] == "all"
+    open(p, "w").write("peer: {host: h}\ndaemon: {port: 8000, mtls_port: 8080, bind: 10.1.2.3}\nprofiles: {x: {paths: [a]}}")
+    cfg2 = load_daemon_cfg(p)
+    assert cfg2["mtls_port"] == 8080 and cfg2["bind"] == "10.1.2.3"
+    # absent bind defaults to all (off-LAN ready)
+    open(p, "w").write("peer: {host: h}\nprofiles: {x: {paths: [a]}}")
+    assert load_daemon_cfg(p)["bind"] == "all"
+
+
+def test_peer_line_formats():
+    from fsync import views
+    assert views.peer_line(None) is None
+    assert views.peer_line({"host": "b", "reachable": False, "api_ok": False}) == "peer b: away"
+    assert views.peer_line({"host": "b", "reachable": True, "busy": True, "api_ok": False}) == "peer b: busy"
+    idle = views.peer_line({"host": "b", "peer_host": "boxb", "api_ok": True, "peer_runner": None,
+                            "active_host": "b"})
+    assert idle == "peer boxb: idle"
+    # off-LAN route annotated when the active address isn't the first (host)
+    viatail = views.peer_line({"host": "b.lan", "peer_host": "boxb", "api_ok": True,
+                               "peer_runner": None, "active_host": "b.tail.ts.net"})
+    assert "via b.tail.ts.net" in viatail

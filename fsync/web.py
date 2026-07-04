@@ -89,7 +89,6 @@ class WebSession:
         self.daemon_status: dict | None = None
         self.peer_line: str | None = None
         self._peer_next = 0.0
-        self._peer_client: FsyncClient | None = None
 
     def run_specs(self) -> list[str]:
         return [f"{n}={st}" for n in list((self.plan or {}).get("profiles", {}))
@@ -173,22 +172,12 @@ class WebSession:
                              else ("error" if cur["progress"].get("status") == "running" else "finished"))
 
     def _refresh_peer(self) -> None:
+        # the LOCAL daemon does cross-box mTLS and relays it via /v1/peer;
+        # this process just reads that relay (no direct peer connection).
         try:
-            from . import certs
+            from . import views
 
-            peers = certs.trusted_peers()
-            if peers:
-                if self._peer_client is None:  # cache: don't leak a client every 20s
-                    self._peer_client = FsyncClient.for_peer(peers[0], host=f"{peers[0]}.lan")
-                st = self._peer_client.status()
-                r = st.get("runner")
-                self.peer_line = (f"peer {st['host']}: ● run {r['run_id']}" if r
-                                  else f"peer {st['host']}: idle")
-            else:
-                info = self.client.peer()
-                self.peer_line = (f"peer {info['host']}: "
-                                  + ("busy" if info.get("busy") else "reachable"
-                                     if info.get("reachable") else "away"))
+            self.peer_line = views.peer_line(self.client.peer())
         except Exception:
             pass
 

@@ -61,11 +61,21 @@ peer:
   host: minis4dx.lan   # router DNS name; bare hostname resolution is not reliable here
   user: developer
   home: /var/home/developer
+  # addresses: ordered ways to reach the peer, first ssh-reachable wins. LAN
+  # first, then an off-LAN route (Tailscale) for when the laptop is away. Add
+  # the peer's tailnet name after `tailscale up` on both boxes. Defaults to
+  # [host] when omitted. Peer identity is the pinned cert (P4.1), so the API
+  # can be reached by ANY of these addresses without SAN juggling.
+  addresses: [minis4dx.lan]   # e.g. [minis4dx.lan, minis4dx.tailXXXX.ts.net]
 daemon:
-  # fsyncd (P4): REST over TLS on 127.0.0.1:<port>, mTLS on the LAN address
-  # once a peer cert is pinned (fsync daemon trust). The daemon schedules
-  # runs itself — interval + up-to-jitter delay after each run finishes.
+  # fsyncd (P4): loopback token-TLS on 127.0.0.1:<port>, plus mTLS for peers
+  # on <bind>:<mtls_port> (mtls_port defaults to port+2). bind=all (0.0.0.0)
+  # is the default and is safe — mTLS requires a pinned client cert, so an
+  # unpinned caller can't connect; that is what makes off-LAN (Tailscale/any
+  # route) work. The daemon schedules runs itself.
   port: 7444
+  mtls_port: 7446
+  bind: all
   interval: 1h
   jitter: 240s
 defaults:
@@ -283,10 +293,21 @@ class Peer:
     host: str
     user: str | None = None
     home: str | None = None
+    addresses: list[str] = field(default_factory=list)  # ordered; first = host
+    _active: str | None = None   # the address a recent probe found reachable
+
+    def all_addresses(self) -> list[str]:
+        return self.addresses or [self.host]
+
+    @property
+    def active_host(self) -> str:
+        """The address to actually use — the last one a probe reached, else host."""
+        return self._active or self.host
 
     @property
     def target(self) -> str:
-        return f"{self.user}@{self.host}" if self.user else self.host
+        h = self.active_host
+        return f"{self.user}@{h}" if self.user else h
 
 
 DIRECTIONS = ("both", "push", "pull")  # push = local->peer only, pull = peer->local only
@@ -320,7 +341,11 @@ def load_config(path: str | None) -> tuple[Peer, dict[str, Profile], dict[str, A
     peer_raw = data.get("peer") or {}
     if not peer_raw.get("host"):
         raise HomesyncError(f"{cfg_path}: peer.host is required")
-    peer = Peer(host=peer_raw["host"], user=peer_raw.get("user"), home=peer_raw.get("home"))
+    addrs = peer_raw.get("addresses") or [peer_raw["host"]]
+    if not isinstance(addrs, list) or not all(isinstance(a, str) and a for a in addrs):
+        raise HomesyncError(f"{cfg_path}: peer.addresses must be a list of non-empty strings")
+    peer = Peer(host=peer_raw["host"], user=peer_raw.get("user"), home=peer_raw.get("home"),
+                addresses=[str(a) for a in addrs])
 
     defaults = data.get("defaults") or {}
     profiles: dict[str, Profile] = {}
@@ -358,18 +383,32 @@ def load_config(path: str | None) -> tuple[Peer, dict[str, Profile], dict[str, A
 # peer plumbing                                                               #
 # --------------------------------------------------------------------------- #
 
-def _ssh(peer: Peer, command: str, *, timeout: int = 900) -> subprocess.CompletedProcess:
+def _ssh_to(target: str, command: str, *, timeout: int = 900) -> subprocess.CompletedProcess:
     return subprocess.run(
-        ["ssh", *SSH_OPTS, peer.target, command],
+        ["ssh", *SSH_OPTS, target, command],
         capture_output=True, text=True, timeout=timeout,
     )
 
 
+def _ssh(peer: Peer, command: str, *, timeout: int = 900) -> subprocess.CompletedProcess:
+    # peer.target follows peer._active, set by the most recent peer_reachable()
+    return _ssh_to(peer.target, command, timeout=timeout)
+
+
 def peer_reachable(peer: Peer) -> bool:
-    try:
-        return _ssh(peer, "true", timeout=15).returncode == 0
-    except subprocess.TimeoutExpired:
-        return False
+    """Probe the peer's addresses in order; remember the first ssh-reachable one
+    on the Peer (so the sync + API then use it). LAN name first, off-LAN
+    (Tailscale) fallback next — so a run just works whether home or away."""
+    user = peer.user
+    for addr in peer.all_addresses():
+        target = f"{user}@{addr}" if user else addr
+        try:
+            if _ssh_to(target, "true", timeout=10).returncode == 0:
+                peer._active = addr
+                return True
+        except subprocess.TimeoutExpired:
+            continue
+    return False
 
 
 def peer_busy(peer: Peer) -> bool:

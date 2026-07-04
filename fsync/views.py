@@ -246,6 +246,24 @@ def progress_screen(progress: dict, mode: str) -> Screen:
     return Screen(blocks=blocks)
 
 
+def peer_line(peer_info: dict | None) -> str | None:
+    """Format the local daemon's /v1/peer relay into a one-line peer summary
+    (used by all UIs' status strips). The daemon reaches the peer over mTLS
+    and includes its runner state when the API answered (api_ok)."""
+    if not peer_info:
+        return None
+    host = peer_info.get("peer_host") or peer_info.get("host") or "peer"
+    if peer_info.get("api_ok"):
+        r = peer_info.get("peer_runner")
+        base = f"peer {host}: ● run {r['run_id']}" if r else f"peer {host}: idle"
+        active = peer_info.get("active_host")
+        # note the route when it's the off-LAN fallback (not the first address)
+        return base + (f" (via {active})" if active and active != peer_info.get("host") else "")
+    if peer_info.get("reachable"):
+        return f"peer {host}: " + ("busy" if peer_info.get("busy") else "reachable")
+    return f"peer {host}: away"
+
+
 def _run_aggregate(progress: dict) -> tuple[int, int, str]:
     """(done_paths, total_paths, current-activity string) across a run."""
     done = total = 0

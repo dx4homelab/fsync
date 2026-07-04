@@ -28,8 +28,12 @@ def _ssl_context(pinned_cert: str, identity: tuple[str, str] | None) -> ssl.SSLC
     when combined with a custom verify target, so the cert must be loaded
     into an explicit context instead."""
     ctx = ssl.create_default_context(cafile=pinned_cert)
-    # SANs cover host/.lan/.local/localhost/127.0.0.1, so hostname checking
-    # stays on — the pin already constrains us to the one exact cert.
+    # Exact-cert pinning IS the identity proof: only the holder of this exact
+    # self-signed cert's private key can complete the handshake, so TLS
+    # hostname matching is redundant. Turning it off lets us reach the pinned
+    # peer by ANY address (LAN name, tailnet IP, MagicDNS) without baking every
+    # address into the cert SANs — which is what makes off-LAN (P4.4) work.
+    ctx.check_hostname = False
     if identity:
         ctx.load_cert_chain(certfile=identity[0], keyfile=identity[1])
     return ctx
@@ -85,6 +89,25 @@ class FsyncClient:
                    verify=str(pinned),
                    identity=(str(certs.cert_path()), str(certs.key_path())),
                    send_token=False)  # authenticated by client cert, not token
+
+    @classmethod
+    def connect_peer(cls, name: str, addresses: list[str],
+                     port: int = DEFAULT_PORT) -> "FsyncClient":
+        """Return an mTLS client bound to the first address whose /v1/status
+        answers — LAN name first, off-LAN (tailnet) fallback next. Because the
+        peer cert is pinned exactly and hostname checking is off, any reachable
+        address that presents that cert is accepted."""
+        last: Exception | None = None
+        for addr in addresses or [name]:
+            c = cls.for_peer(name, host=addr, port=port)
+            try:
+                c.status()
+                return c
+            except (DaemonUnavailable, ApiError) as e:
+                last = e
+                c.close()
+        raise DaemonUnavailable(
+            f"peer '{name}' not reachable at any of {addresses}: {last}")
 
     # ------------------------------------------------------------------ core
 
