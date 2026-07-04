@@ -14,6 +14,7 @@ import time
 from dream4devops.ui_lite import (
     Action,
     Actions,
+    Bar,
     Column,
     Note,
     Screen,
@@ -242,6 +243,53 @@ def progress_screen(progress: dict, mode: str) -> Screen:
         blocks.append(Note(text=f"report: {progress.get('run_dir', '')}/report.json"))
         blocks.append(Actions(items=[Action(key="p", label="plan a new run", tone=Tone.accent),
                                       Action(key="q", label="quit")]))
+    return Screen(blocks=blocks)
+
+
+def _run_aggregate(progress: dict) -> tuple[int, int, str]:
+    """(done_paths, total_paths, current-activity string) across a run."""
+    done = total = 0
+    current = ""
+    for pname, pdata in progress.get("profiles", {}).items():
+        for rel, ps in pdata.get("paths", {}).items():
+            total += 1
+            phase = ps.get("phase", "queued")
+            if phase == "done":
+                done += 1
+            elif phase not in ("queued",):
+                leg = ps.get("leg") or {}
+                pct = f" {leg['pct']}%" if leg.get("pct") is not None else ""
+                current = f"{pname}/{rel} {PHASE_LABEL.get(phase, phase)}{pct}"
+    return done, total, current
+
+
+def compact_screen(daemon_status: dict | None, progress: dict | None,
+                   mode: str, dry: bool, peer_line: str | None = None) -> Screen:
+    """Small glanceable panel: status strip + a progress bar when a run is in
+    flight (else an idle line), plus quick actions. Shared by the always-on-top
+    GTK panel; kept separate from the full screens so the footprint stays tiny."""
+    strip = status_strip(daemon_status, peer_line)
+    blocks: list = [strip]
+    running = bool((daemon_status or {}).get("runner")) or mode in ("progress", "spawning")
+    if running and progress:
+        done, total, current = _run_aggregate(progress)
+        pct = round(100 * done / total) if total else None
+        blocks.append(Bar(label="sync", pct=pct,
+                          detail=current or f"{done}/{total} paths", tone=Tone.accent))
+    elif mode == "planning":
+        blocks.append(Bar(label="planning", pct=None, detail="indexing…", tone=Tone.warn))
+    else:
+        last = (daemon_status or {}).get("last")
+        idle = "idle — nothing running"
+        if last and last.get("errors"):
+            idle = f"last run had {last['errors']} error(s)"
+        blocks.append(Note(text=idle, tone=Tone.muted))
+    # quick actions (compact): run, dry-run toggle, open the full window
+    acts = [Action(key="r", label="Sync now", tone=Tone.good,
+                   enabled=not running and mode not in ("planning", "no_daemon")),
+            Action(key="d", label=f"dry-run: {'on' if dry else 'off'}"),
+            Action(key="full", label="Open full window", tone=Tone.accent)]
+    blocks.append(Actions(items=acts))
     return Screen(blocks=blocks)
 
 

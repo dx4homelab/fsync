@@ -132,3 +132,58 @@ def test_web_guard_blocks_csrf_and_rebinding(monkeypatch):
     assert local.post("/do/d", headers={"sec-fetch-site": "same-origin"}).status_code == 200
     # direct navigation (Sec-Fetch-Site: none) passes
     assert local.get("/", headers={"sec-fetch-site": "none"}).status_code == 200
+
+
+# --------------------------------------------------------------------------- #
+# P4.3: compact screen (GTK-free structure) + GTK renderer (display-gated)     #
+# --------------------------------------------------------------------------- #
+
+def test_compact_screen_structure():
+    from dream4devops.ui_lite import Bar, Actions, Note
+    # running -> a progress bar at done/total
+    ds_run = {**DAEMON, "runner": {"run_id": "r", "pid": 9, "elapsed": 5}}
+    prog = {"status": "progress", "profiles": {"p": {"paths": {
+        "a": {"phase": "done"}, "b": {"phase": "a_to_b", "leg": {"name": "a_to_b", "pct": 40}}}}}}
+    scr = views.compact_screen(ds_run, prog, "progress", dry=True)
+    bars = [b for b in scr.blocks if isinstance(b, Bar)]
+    assert bars and bars[0].pct == 50  # 1 of 2 paths done
+    acts = [b for b in scr.blocks if isinstance(b, Actions)][0]
+    keys = [a.key for a in acts.items]
+    assert keys == ["r", "d", "full"]
+    # 'Sync now' disabled while a run is active
+    assert next(a for a in acts.items if a.key == "r").enabled is False
+    # idle -> Sync now enabled, a Note instead of a Bar
+    idle = views.compact_screen(DAEMON, None, "plan", dry=False)
+    assert next(a for a in [x for x in idle.blocks if isinstance(x, Actions)][0].items
+                if a.key == "r").enabled is True
+
+
+def test_gtk_renderer_if_available():
+    import pytest
+    from fsync.gtk_app import _ensure_gi
+    if not _ensure_gi():
+        pytest.skip("PyGObject/gi not available")
+    import gi
+    gi.require_version("Gtk", "3.0")
+    from gi.repository import Gtk
+    if not Gtk.init_check()[0]:
+        pytest.skip("no display for GTK")
+    from dream4devops.ui_lite.render_gtk import to_gtk
+
+    clicked = []
+    scr = views.compact_screen(DAEMON, None, "plan", dry=False)
+    w = to_gtk(scr, on_action=lambda k: clicked.append(k))
+
+    def find(widget, kind, acc):
+        if isinstance(widget, kind):
+            acc.append(widget)
+        if isinstance(widget, Gtk.Container):
+            for c in widget.get_children():
+                find(c, kind, acc)
+        return acc
+
+    btns = find(w, Gtk.Button, [])
+    assert any("Sync now" in b.get_label() for b in btns)
+    # clicking a button routes to on_action with its key
+    next(b for b in btns if "Sync now" in b.get_label()).emit("clicked")
+    assert clicked == ["r"]

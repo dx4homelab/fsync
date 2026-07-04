@@ -731,6 +731,15 @@ def build_parser() -> argparse.ArgumentParser:
     p_tui.add_argument("--port", type=int, default=None, help="fsyncd port (default: 7444)")
     p_tui.add_argument("--verbose", action="count", default=0, help="Increase verbosity")
 
+    # gtk: native Linux panel (renders the same lite Screens; always-on-top option)
+    p_gtk = sub.add_parser("gtk", help="Native GTK panel for sync (normal window, or --always-on-top compact panel)")
+    p_gtk.add_argument("--always-on-top", action="store_true",
+                       help="Compact glanceable panel pinned above other windows")
+    p_gtk.add_argument("--profile", action="append", default=None,
+                       help="Limit to profile NAME (repeatable); default: all profiles")
+    p_gtk.add_argument("--port", type=int, default=None, help="fsyncd port (default: 7444)")
+    p_gtk.add_argument("--verbose", action="count", default=0, help="Increase verbosity")
+
     # web: local browser UI (renders the same lite Screens as the TUI)
     p_web = sub.add_parser("web", help="Local browser UI for sync (renderer process; talks to fsyncd)")
     p_web.add_argument("--profile", action="append", default=None,
@@ -791,6 +800,10 @@ def main(argv: list[str] | None = None) -> int:
             print("fsync tui requires the 'textual' package: pip install textual", file=sys.stderr)
             return 2
         return run_tui(args)
+    if args.cmd == "gtk":
+        from .gtk_app import run_gtk
+
+        return run_gtk(args)
     if args.cmd == "web":
         try:
             from .web import run_web
