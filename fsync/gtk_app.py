@@ -123,6 +123,10 @@ def run_gtk(args) -> int:
         # ---------------------------------------------------------- polling
         def start(self) -> None:
             threading.Thread(target=self._poll_loop, daemon=True).start()
+            # animate indeterminate bars between the ~0.5s rebuilds
+            from dream4devops.ui_lite.render_gtk import pulse_indeterminate
+            GLib.timeout_add(90, lambda: (pulse_indeterminate(self.holder), True)[1]
+                             if not self._stop.is_set() else False)
 
         def _poll_loop(self) -> None:
             while not self._stop.is_set():
@@ -135,24 +139,25 @@ def run_gtk(args) -> int:
 
         # ---------------------------------------------------------- actions
         def on_action(self, key: str) -> None:
-            if key == "full":
-                self.compact = False
-                self._apply_mode()
-                self.rebuild()
-                return
-            if key == "compact":
-                self.compact = True
+            # window-mode toggles and quit are pure UI ops — main thread is fine
+            if key in ("full", "compact"):
+                self.compact = key == "compact"
                 self._apply_mode()
                 self.rebuild()
                 return
             if key == "q":
                 self.close()
                 return
-            try:
-                session.act(key)
-            except Exception:
-                pass
-            self.rebuild()
+            # session.act() may block on the session lock while the poll thread
+            # holds it during network I/O; run it OFF the main thread so a click
+            # never freezes the UI, then rebuild on the main thread.
+            def worker() -> None:
+                try:
+                    session.act(key)
+                except Exception:
+                    pass
+                GLib.idle_add(self.rebuild)
+            threading.Thread(target=worker, daemon=True).start()
 
         # ---------------------------------------------------------- render
         def _screen(self):

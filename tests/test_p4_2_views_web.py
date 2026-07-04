@@ -149,8 +149,8 @@ def test_compact_screen_structure():
     assert bars and bars[0].pct == 50  # 1 of 2 paths done
     acts = [b for b in scr.blocks if isinstance(b, Actions)][0]
     keys = [a.key for a in acts.items]
-    assert keys == ["r", "d", "full"]
-    # 'Sync now' disabled while a run is active
+    assert keys == ["r", "p", "d", "full"]
+    # 'Sync now' disabled outside plan mode (progress here)
     assert next(a for a in acts.items if a.key == "r").enabled is False
     # idle -> Sync now enabled, a Note instead of a Bar
     idle = views.compact_screen(DAEMON, None, "plan", dry=False)

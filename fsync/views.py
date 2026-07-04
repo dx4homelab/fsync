@@ -284,11 +284,15 @@ def compact_screen(daemon_status: dict | None, progress: dict | None,
         if last and last.get("errors"):
             idle = f"last run had {last['errors']} error(s)"
         blocks.append(Note(text=idle, tone=Tone.muted))
-    # quick actions (compact): run, dry-run toggle, open the full window
-    acts = [Action(key="r", label="Sync now", tone=Tone.good,
-                   enabled=not running and mode not in ("planning", "no_daemon")),
+    # quick actions (compact). 'Sync now' is only actionable in plan mode
+    # (that is the only mode the session's act() runs a run from), so it is
+    # enabled exactly there; 're-plan' gets the panel back to a runnable plan
+    # after a run finishes, so a second sync is always one → two clicks away.
+    acts = [Action(key="r", label="Sync now", tone=Tone.good, enabled=mode == "plan"),
+            Action(key="p", label="Re-plan", tone=Tone.accent,
+                   enabled=mode in ("plan", "no_peer", "finished", "error", "no_daemon")),
             Action(key="d", label=f"dry-run: {'on' if dry else 'off'}"),
-            Action(key="full", label="Open full window", tone=Tone.accent)]
+            Action(key="full", label="Open full window")]
     blocks.append(Actions(items=acts))
     return Screen(blocks=blocks)
 

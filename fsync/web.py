@@ -107,8 +107,17 @@ class WebSession:
 
     def poll(self) -> None:
         """Advance the state machine one step; called per fragment request.
-        Holds the lock so concurrent tabs (/frag polls, /do actions) never
-        interleave reads and writes of the shared session."""
+
+        The peer probe (a blocking ssh/mTLS call that can take tens of seconds
+        when box B is asleep) runs BEFORE taking the lock — it only sets
+        peer_line, an atomic attribute write — so a slow peer never holds the
+        lock. That matters for the GTK panel, where a button's act() waits on
+        this same lock on the UI thread; holding it across network I/O froze
+        the window."""
+        now = time.time()
+        if now >= self._peer_next:
+            self._peer_next = now + 20
+            self._refresh_peer()
         with self.lock:
             try:
                 self.daemon_status = self.client.status()
@@ -119,10 +128,6 @@ class WebSession:
                 self.mode = "no_daemon"
                 self.msg = "fsyncd is not reachable"
                 return
-            now = time.time()
-            if now >= self._peer_next:
-                self._peer_next = now + 20
-                self._refresh_peer()
 
             if self.mode == "planning":
                 if not self.plan_job:
