@@ -731,6 +731,15 @@ def build_parser() -> argparse.ArgumentParser:
     p_tui.add_argument("--port", type=int, default=None, help="fsyncd port (default: 7444)")
     p_tui.add_argument("--verbose", action="count", default=0, help="Increase verbosity")
 
+    # web: local browser UI (renders the same lite Screens as the TUI)
+    p_web = sub.add_parser("web", help="Local browser UI for sync (renderer process; talks to fsyncd)")
+    p_web.add_argument("--profile", action="append", default=None,
+                       help="Limit to profile NAME (repeatable); default: all profiles")
+    p_web.add_argument("--port", type=int, default=None, help="fsyncd port (default: 7444)")
+    p_web.add_argument("--web-port", type=int, default=None, help="local web UI port (default: 7445)")
+    p_web.add_argument("--no-browser", action="store_true", help="Do not open a browser")
+    p_web.add_argument("--verbose", action="count", default=0, help="Increase verbosity")
+
     # daemon: the operational backend (REST over TLS/mTLS + scheduler)
     p_dmn = sub.add_parser("daemon", help="fsyncd backend: REST API over TLS/mTLS, absorbs run scheduling")
     p_dmn.add_argument("action", choices=("run", "install", "remove", "status", "trust", "cert"),
@@ -782,6 +791,13 @@ def main(argv: list[str] | None = None) -> int:
             print("fsync tui requires the 'textual' package: pip install textual", file=sys.stderr)
             return 2
         return run_tui(args)
+    if args.cmd == "web":
+        try:
+            from .web import run_web
+        except ImportError as e:
+            print(f"fsync web requires fastapi + uvicorn: {e}", file=sys.stderr)
+            return 2
+        return run_web(args)
     if args.cmd == "daemon":
         from .daemon import cmd_daemon
 

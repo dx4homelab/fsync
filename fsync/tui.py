@@ -11,41 +11,21 @@ last-run stats — and, when a peer daemon is trusted, the peer's runner too.
 from __future__ import annotations
 
 import asyncio
-import time
 
-from rich.table import Table
-from rich.text import Text
 from textual import events
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import VerticalScroll
 from textual.widgets import Footer, Header, Static
 
+from dream4devops.ui_lite import Action, Screen, Tone
+from dream4devops.ui_lite.render_textual import to_rich
+
+from . import views
 from .client import ApiError, DaemonUnavailable, FsyncClient
 
 POLL_SECONDS = 0.4
 PEER_PROBE_TICKS = 75  # ssh + remote-API probes every ~30s
-
-PHASE_LABEL = {
-    "indexing": "indexing…",
-    "merging": "⇄ merging",
-    "a_to_b": "→ pushing",
-    "b_to_a": "← pulling",
-    "done": "done",
-}
-
-
-def fmt_bytes(n: int | None) -> str:
-    n = n or 0
-    for unit in ("B", "KB", "MB", "GB", "TB"):
-        if n < 1024 or unit == "TB":
-            return f"{n:.0f}{unit}" if unit == "B" else f"{n:.1f}{unit}"
-        n /= 1024
-    return "?"
-
-
-def fmt_clock(ts: float | None) -> str:
-    return time.strftime("%H:%M", time.localtime(ts)) if ts else "?"
 
 
 class SyncTuiApp(App):
@@ -164,8 +144,6 @@ class SyncTuiApp(App):
         return list((self.plan or {}).get("profiles", {}))
 
     CYCLE = {"both": "push", "push": "pull", "pull": "off", "off": "both"}
-    STATE_MARK = {"both": ("⇅", "green"), "push": ("→", "cyan"),
-                  "pull": ("←", "cyan"), "off": ("·", "dim")}
 
     def run_specs(self) -> list[str]:
         return [f"{n}={st}" for n in self.plan_profile_names()
@@ -316,222 +294,51 @@ class SyncTuiApp(App):
             line = self.peer_line
         self.call_from_thread(setattr, self, "peer_line", line)
 
-    # ------------------------------------------------------------------ status strip
+    # ------------------------------------------------------------------ status strip + render
+    #
+    # All screen content is built as dream4ui-lite Screen specs by fsync.views
+    # (the single source of truth shared with `fsync web`) and rendered to Rich
+    # here. The TUI owns state + polling + keybindings; it owns no layout.
+
+    def _strip(self):
+        return views.status_strip(self.daemon_status, self.peer_line)
 
     def update_statusbar(self) -> None:
-        t = Text()
-        st = self.daemon_status
-        if st is None:
-            t.append("✗ fsyncd unreachable", style="bold red")
-        else:
-            runner = st.get("runner")
-            if runner:
-                t.append("● ", style="bold green")
-                t.append(f"run {runner['run_id']} active "
-                         f"(pid {runner['pid']}, {runner['elapsed']:.0f}s)", style="green")
-            else:
-                t.append("○ no sync running", style="dim")
-            sched = st.get("schedule") or {}
-            t.append("  ·  ", style="dim")
-            if not sched.get("enabled"):
-                t.append("schedule: off", style="yellow")
-            else:
-                t.append(f"next {fmt_clock(sched.get('next_ts'))}")
-            last = st.get("last")
-            t.append("  ·  ", style="dim")
-            if last:
-                t.append(f"last {last['run_id'][9:11]}:{last['run_id'][11:13]} — "
-                         f"{last['moved']} moved, {last['conflicts']} held"
-                         + (f", {last['errors']} ERROR" if last["errors"] else "")
-                         + (" [dry]" if last.get("dry_run") else ""))
-            else:
-                t.append("no completed runs yet")
-        if self.peer_line:
-            t.append("  ·  ", style="dim")
-            t.append(self.peer_line, style="cyan")
-        self.query_one("#statusbar", Static).update(t)
-
-    # ------------------------------------------------------------------ render
+        self.query_one("#statusbar", Static).update(to_rich(Screen(blocks=[self._strip()])))
 
     def render_body(self) -> None:
         body = self.query_one("#body", Static)
+        strip = self._strip()
         if self.mode == "loading":
-            body.update("starting…")
+            screen = views.message_screen("", "starting…", Tone.muted, strip)
         elif self.mode == "no_daemon":
-            body.update(Text(f"fsyncd is not running.\n\n{self.msg}\n\n"
-                             "Start it:  systemctl --user start fsync-daemon\n"
-                             "Install:   fsync daemon install\n\n"
-                             "p: retry   q: quit", style="red"))
+            screen = views.message_screen(
+                "fsyncd is not running",
+                f"{self.msg}\n\nStart it:  systemctl --user start fsync-daemon\n"
+                "Install:   fsync daemon install", Tone.bad, strip,
+                actions=[Action(key="p", label="retry", tone=Tone.accent),
+                         Action(key="q", label="quit")])
         elif self.mode == "planning":
-            if self.plan_partial:
-                body.update(self._planning_table())
-            else:
-                body.update(Text("Planning… backend is indexing both boxes", style="yellow"))
+            screen = (views.planning_screen(self.plan_partial, strip) if self.plan_partial
+                      else views.message_screen("", "Planning… backend is indexing both boxes",
+                                                Tone.warn, strip))
         elif self.mode == "no_peer":
-            body.update(Text(f"Peer {self.msg} is not reachable — nothing to sync.\n\n"
-                             "p: retry   q: quit", style="red"))
+            screen = views.message_screen(
+                "", f"Peer {self.msg} is not reachable — nothing to sync.", Tone.bad, strip,
+                actions=[Action(key="p", label="retry", tone=Tone.accent),
+                         Action(key="q", label="quit")])
         elif self.mode == "plan":
-            body.update(self._plan_table())
+            screen = views.plan_screen(self.plan, self.state, self.dry, strip, self.msg)
         elif self.mode == "spawning":
-            body.update(Text("Starting run in the backend…", style="yellow"))
+            screen = views.message_screen("", "Starting run in the backend…", Tone.warn, strip)
         elif self.mode == "error" and not self.progress:
-            # a plan/run start failure has a message but no progress table
-            body.update(Text(f"{self.msg or 'something went wrong'}\n\n"
-                             "p: retry   q: quit", style="red"))
-        elif self.mode in ("progress", "finished", "error"):
-            body.update(self._progress_table())
-
-    def _planning_table(self):
-        partial = self.plan_partial or {}
-        done = total = 0
-        table = Table(title="Planning… (both boxes hash locally; cached files are stat-only)",
-                      expand=True)
-        for col in ("profile / path", "state", "→ push", "← pull", "conflicts", "identical"):
-            table.add_column(col, justify="right" if col not in ("profile / path", "state") else "left")
-        for pname, pdata in partial.get("profiles", {}).items():
-            for rel, d in pdata.get("paths", {}).items():
-                total += 1
-                phase = d.get("phase", "queued")
-                if phase == "done":
-                    done += 1
-                    push = f"{d['a_to_b']} ({fmt_bytes(d['bytes_a_to_b'])})" if d.get("a_to_b") else "-"
-                    pull = f"{d['b_to_a']} ({fmt_bytes(d['bytes_b_to_a'])})" if d.get("b_to_a") else "-"
-                    style = "bold" if (d.get("a_to_b") or d.get("b_to_a") or d.get("conflicts")) else ""
-                    table.add_row(f"{pname}/{rel}", Text("✓ planned", style="green"),
-                                  push, pull,
-                                  str(d.get("conflicts") or "-"), str(d.get("identical", "")),
-                                  style=style)
-                elif phase == "indexing":
-                    table.add_row(f"{pname}/{rel}", Text("⣷ indexing…", style="yellow"),
-                                  "", "", "", "")
-                else:
-                    table.add_row(f"{pname}/{rel}", Text("queued", style="dim"),
-                                  "", "", "", "", style="dim")
-        hint = Text(f"\n{done}/{total} paths planned — the preview with toggles appears when all "
-                    "are in.   q: quit", style="dim")
-        from rich.console import Group
-        return Group(table, hint)
-
-    def _plan_table(self):
-        assert self.plan is not None
-        table = Table(title=f"Plan preview -> {self.plan.get('peer', '')}"
-                            f"{'   [DRY RUN]' if self.dry else ''}",
-                      expand=True)
-        for col in ("on", "profile / path", "→ push", "← pull", "overwrite→backup", "conflicts", "identical"):
-            table.add_column(col, justify="right" if col not in ("on", "profile / path") else "left")
-        totals = [0, 0, 0, 0]
-        total_bytes = 0
-        for i, (pname, pdata) in enumerate(self.plan.get("profiles", {}).items(), start=1):
-            st = self.state.get(pname, "both")
-            sym, sym_style = self.STATE_MARK[st]
-            mark = Text(f"{i} ", style="bold cyan") + Text(sym, style=sym_style)
-            take_push = st in ("both", "push")
-            take_pull = st in ("both", "pull")
-            for j, (rel, d) in enumerate(pdata.get("paths", {}).items()):
-                over = (d["overwrites_a_to_b"] if take_push else 0) + \
-                       (d["overwrites_b_to_a"] if take_pull else 0)
-                push = (f"{d['a_to_b']} ({fmt_bytes(d['bytes_a_to_b'])})"
-                        if d["a_to_b"] and take_push else
-                        (Text(f"{d['a_to_b']} skipped", style="dim") if d["a_to_b"] else "-"))
-                pull = (f"{d['b_to_a']} ({fmt_bytes(d['bytes_b_to_a'])})"
-                        if d["b_to_a"] and take_pull else
-                        (Text(f"{d['b_to_a']} skipped", style="dim") if d["b_to_a"] else "-"))
-                if st == "off":
-                    style = "dim strike"
-                elif d["a_to_b"] or d["b_to_a"] or d["conflicts"]:
-                    style = "bold"
-                else:
-                    style = "dim"
-                table.add_row(mark if j == 0 else "", f"{pname}/{rel}", push, pull,
-                              str(over) if over else "-",
-                              str(d["conflicts"]) if d["conflicts"] else "-",
-                              str(d["identical"]), style=style)
-                if take_push:
-                    totals[0] += d["a_to_b"]
-                    total_bytes += d["bytes_a_to_b"]
-                if take_pull:
-                    totals[1] += d["b_to_a"]
-                    total_bytes += d["bytes_b_to_a"]
-                if st != "off":
-                    totals[2] += over
-                    totals[3] += d["conflicts"]
-        active = len(self.run_specs())
-        table.add_section()
-        table.add_row("", f"TOTAL ({active}/{len(self.plan_profile_names())} profiles active)",
-                      str(totals[0]), str(totals[1]), str(totals[2]),
-                      str(totals[3]), "", style="bold cyan")
-        hint = Text()
-        hint.append(f"\n{fmt_bytes(total_bytes)} to move. Overwritten files are backed up on the "
-                    f"receiver under ~/.fsync/backups/<run>/. Conflicts (review profiles) are held.\n")
-        if self.msg:
-            hint.append(f"{self.msg}\n", style="yellow")
-        hint.append("\nr: execute", style="bold green")
-        hint.append(f"   1-{len(self.plan_profile_names())}: cycle ⇅ both → push ← pull · off"
-                    f"   d: dry-run [{'ON' if self.dry else 'off'}]   p: re-plan   q: quit")
-        from rich.console import Group
-        return Group(table, hint)
-
-    def _progress_table(self):
-        prog = self.progress or {}
-        status = prog.get("status", "?")
-        elapsed = (prog.get("finished_ts") or time.time()) - (prog.get("started_ts") or time.time())
-        title = {
-            "progress": f"Sync running (pid {prog.get('pid')}) — {elapsed:.0f}s",
-            "finished": f"Sync {status.upper()} in {elapsed:.0f}s",
-            "error": f"Sync ERROR after {elapsed:.0f}s",
-        }[self.mode if self.mode in ("progress", "finished", "error") else "progress"]
-        if prog.get("dry_run"):
-            title += "   [DRY RUN]"
-        table = Table(title=title, expand=True)
-        for col in ("profile / path", "state", "→ push", "← pull", "conflicts", "time"):
-            table.add_column(col, justify="right" if col not in ("profile / path", "state") else "left")
-
-        conflicts_total = 0
-        for pname, pdata in prog.get("profiles", {}).items():
-            paths = pdata.get("paths", {})
-            if not paths and pdata.get("status") == "pending":
-                table.add_row(pname, Text("pending", style="dim"), "", "", "", "", style="dim")
-                continue
-            for rel, ps in paths.items():
-                phase = ps.get("phase", "?")
-                if phase == "done":
-                    ab, ba = ps.get("a_to_b", {}), ps.get("b_to_a", {})
-                    push = str(ab.get("files_transferred", 0)) + (
-                        f" ({ab.get('overwrites_expected', 0)}⤺)" if ab.get("overwrites_expected") else "")
-                    pull = str(ba.get("files_transferred", 0)) + (
-                        f" ({ba.get('overwrites_expected', 0)}⤺)" if ba.get("overwrites_expected") else "")
-                    cf = ps.get("conflicts", 0)
-                    conflicts_total += cf
-                    table.add_row(f"{pname}/{rel}", Text("✓ done", style="green"),
-                                  push, pull, str(cf) if cf else "-",
-                                  f"{ps.get('seconds', 0)}s")
-                else:
-                    label = PHASE_LABEL.get(phase, phase)
-                    leg = ps.get("leg")
-                    detail = ""
-                    if leg:
-                        detail = f"{fmt_bytes(leg.get('bytes'))}"
-                        if leg.get("pct") is not None:
-                            detail += f" {leg['pct']}%"
-                        if leg.get("files_done") is not None and leg.get("files_total"):
-                            detail += f" ({leg['files_done']}/{leg['files_total']} files)"
-                    row_push = detail if (leg and leg.get("name") == "a_to_b") else ""
-                    row_pull = detail if (leg and leg.get("name") == "b_to_a") else ""
-                    table.add_row(f"{pname}/{rel}", Text(label, style="yellow"),
-                                  row_push, row_pull, "", "")
-
-        lines = Text()
-        for err in prog.get("errors", []):
-            lines.append(f"\nERROR: {err}", style="red")
-        if self.mode == "progress":
-            lines.append("\nRun continues even if you quit — `fsync tui` re-attaches.  q: quit", style="dim")
-        else:
-            if conflicts_total:
-                lines.append(f"\n{conflicts_total} conflict(s) held for review", style="yellow")
-            lines.append(f"\nreport: {prog.get('run_dir', '')}/report.json", style="dim")
-            lines.append("\np: plan a new run   q: quit", style="dim")
-        from rich.console import Group
-        return Group(table, lines)
+            screen = views.message_screen(
+                "", self.msg or "something went wrong", Tone.bad, strip,
+                actions=[Action(key="p", label="retry", tone=Tone.accent),
+                         Action(key="q", label="quit")])
+        else:  # progress | finished | error-with-progress
+            screen = views.progress_screen(self.progress or {}, self.mode, strip)
+        body.update(to_rich(screen))
 
 
 def run_tui(args) -> int:
