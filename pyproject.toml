@@ -4,7 +4,7 @@ version = "0.1.0"
 description = "Simple file indexing and comparison utilities"
 authors = [ { name = "dev", email = "dev@example.com" } ]
 readme = "readme.md"
-dependencies = ["pyyaml", "textual"]
+dependencies = ["pyyaml", "textual", "fastapi", "uvicorn", "httpx", "pydantic"]
 
 [project.scripts]
 fsync = "fsync.cli:main"

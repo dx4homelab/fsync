@@ -6,6 +6,10 @@ Author-email: dev <dev@example.com>
 Description-Content-Type: text/markdown
 Requires-Dist: pyyaml
 Requires-Dist: textual
+Requires-Dist: fastapi
+Requires-Dist: uvicorn
+Requires-Dist: httpx
+Requires-Dist: pydantic
 Provides-Extra: progress
 Requires-Dist: tqdm; extra == "progress"
 

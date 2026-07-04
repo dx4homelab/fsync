@@ -11,7 +11,7 @@ pinned peer cert, presenting this box's cert as client identity.
 from __future__ import annotations
 
 import json
-from typing import Any
+import ssl
 
 import httpx
 
@@ -19,6 +19,20 @@ from . import certs
 
 DEFAULT_PORT = 7444
 USER_TIMEOUT = httpx.Timeout(10.0, read=60.0)
+
+
+def _ssl_context(pinned_cert: str, identity: tuple[str, str] | None) -> ssl.SSLContext:
+    """TLS context pinned to exactly ``pinned_cert`` (the peer/server's
+    self-signed cert), optionally presenting ``identity`` as a client cert
+    for mTLS. httpx 0.28's tuple ``cert=`` no longer presents a client cert
+    when combined with a custom verify target, so the cert must be loaded
+    into an explicit context instead."""
+    ctx = ssl.create_default_context(cafile=pinned_cert)
+    # SANs cover host/.lan/.local/localhost/127.0.0.1, so hostname checking
+    # stays on — the pin already constrains us to the one exact cert.
+    if identity:
+        ctx.load_cert_chain(certfile=identity[0], keyfile=identity[1])
+    return ctx
 
 
 class DaemonUnavailable(RuntimeError):
@@ -43,6 +57,10 @@ class FsyncClient:
                 raise DaemonUnavailable(
                     "no TLS material at ~/.config/fsync/tls — run `fsync daemon install`")
             verify = str(cert)
+        # A path string means "pin this cert"; build an explicit SSLContext so
+        # the client cert (mTLS) is actually presented. A caller may also pass
+        # a ready SSLContext/bool for tests.
+        ssl_target = _ssl_context(verify, identity) if isinstance(verify, str) else verify
         self.base_url = base_url or f"https://127.0.0.1:{port}"
         # loopback endpoints are token-gated; a local caller can read the 0600
         # token file (same user). Peer/mTLS clients pass send_token=False —
@@ -52,8 +70,8 @@ class FsyncClient:
             tok = token or certs.read_token()
             if tok:
                 headers["Authorization"] = f"Bearer {tok}"
-        self._http = httpx.Client(base_url=self.base_url, verify=verify,
-                                  cert=identity, timeout=timeout, headers=headers)
+        self._http = httpx.Client(base_url=self.base_url, verify=ssl_target,
+                                  timeout=timeout, headers=headers)
 
     @classmethod
     def for_peer(cls, name: str, host: str | None = None,
