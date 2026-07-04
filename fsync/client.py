@@ -35,7 +35,8 @@ class ApiError(RuntimeError):
 class FsyncClient:
     def __init__(self, base_url: str | None = None, port: int = DEFAULT_PORT,
                  verify: Any = None, identity: tuple[str, str] | None = None,
-                 timeout: httpx.Timeout = USER_TIMEOUT):
+                 timeout: httpx.Timeout = USER_TIMEOUT, token: str | None = None,
+                 send_token: bool = True):
         if verify is None:
             cert = certs.cert_path()
             if not cert.exists():
@@ -43,8 +44,16 @@ class FsyncClient:
                     "no TLS material at ~/.config/fsync/tls — run `fsync daemon install`")
             verify = str(cert)
         self.base_url = base_url or f"https://127.0.0.1:{port}"
+        # loopback endpoints are token-gated; a local caller can read the 0600
+        # token file (same user). Peer/mTLS clients pass send_token=False —
+        # their pinned client cert is the credential and they can't read ours.
+        headers = {}
+        if send_token:
+            tok = token or certs.read_token()
+            if tok:
+                headers["Authorization"] = f"Bearer {tok}"
         self._http = httpx.Client(base_url=self.base_url, verify=verify,
-                                  cert=identity, timeout=timeout)
+                                  cert=identity, timeout=timeout, headers=headers)
 
     @classmethod
     def for_peer(cls, name: str, host: str | None = None,
@@ -56,7 +65,8 @@ class FsyncClient:
             raise DaemonUnavailable(f"peer '{name}' is not trusted — run `fsync daemon trust`")
         return cls(base_url=f"https://{host or name}:{port}",
                    verify=str(pinned),
-                   identity=(str(certs.cert_path()), str(certs.key_path())))
+                   identity=(str(certs.cert_path()), str(certs.key_path())),
+                   send_token=False)  # authenticated by client cert, not token
 
     # ------------------------------------------------------------------ core
 
@@ -67,10 +77,13 @@ class FsyncClient:
         except httpx.TransportError as e:
             raise DaemonUnavailable(f"fsyncd not reachable at {self.base_url}: {e}") from e
         if resp.status_code >= 400:
+            detail = resp.text
             try:
-                detail = resp.json().get("detail", resp.text)
+                payload = resp.json()
+                if isinstance(payload, dict):
+                    detail = payload.get("detail", resp.text)
             except (ValueError, json.JSONDecodeError):
-                detail = resp.text
+                pass
             raise ApiError(resp.status_code, str(detail))
         return resp.json()
 

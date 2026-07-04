@@ -10,6 +10,7 @@ last-run stats — and, when a peer daemon is trusted, the peer's runner too.
 
 from __future__ import annotations
 
+import asyncio
 import time
 
 from rich.table import Table
@@ -79,6 +80,9 @@ class SyncTuiApp(App):
         self.daemon_status: dict | None = None
         self.peer_line: str | None = None
         self._tick_n = 0
+        self._polling = False           # re-entrancy guard for the async tick
+        self._prev_run_id: str | None = None  # last pointer we saw before spawning
+        self._peer_client: FsyncClient | None = None
 
     @property
     def client(self) -> FsyncClient:
@@ -186,6 +190,9 @@ class SyncTuiApp(App):
             self.msg = "all profiles are off — cycle with 1-9"
             self.render_body()
             return
+        # remember the current run pointer so 'spawning' waits for a NEW one
+        self._prev_run_id = (self.daemon_status or {}).get("runner", {}) \
+            .get("run_id") if (self.daemon_status or {}).get("runner") else None
         self.mode = "spawning"
         self.render_body()
         self.run_worker(self._run_start_worker, thread=True, exclusive=True)
@@ -218,60 +225,84 @@ class SyncTuiApp(App):
     def on_unmount(self) -> None:
         if self._client is not None:
             self._client.close()
+        if self._peer_client is not None:
+            self._peer_client.close()
 
     # ------------------------------------------------------------------ poll
 
-    def tick(self) -> None:
-        self._tick_n += 1
+    async def tick(self) -> None:
+        # All HTTP runs in a worker thread (asyncio.to_thread) so a slow or
+        # stalled daemon never blocks the Textual event loop; a re-entrancy
+        # guard stops ticks from stacking if a poll runs long.
+        if self._polling:
+            return
+        self._polling = True
         try:
-            self.daemon_status = self.client.status()
-        except (DaemonUnavailable, ApiError):
-            self.daemon_status = None
-            if self.mode not in ("no_daemon", "error"):
-                self.mode = "no_daemon"
-                self.msg = "fsyncd stopped responding"
-                self.render_body()
-        self.update_statusbar()
-        if self._tick_n % PEER_PROBE_TICKS == 1:
-            self.run_worker(self._peer_probe, thread=True, exclusive=False)
+            self._tick_n += 1
+            try:
+                self.daemon_status = await asyncio.to_thread(self.client.status)
+                if self.mode == "no_daemon":
+                    # daemon came back — recover instead of staying stuck
+                    self.start_plan()
+            except (DaemonUnavailable, ApiError):
+                self.daemon_status = None
+                if self.mode not in ("no_daemon",):
+                    self.mode = "no_daemon"
+                    self.msg = "fsyncd stopped responding"
+            self.update_statusbar()
+            if self._tick_n % PEER_PROBE_TICKS == 1:
+                self.run_worker(self._peer_probe, thread=True, exclusive=False)
 
-        if self.mode == "planning" and self.plan_job:
-            try:
-                job = self.client.plan_get(self.plan_job)
-            except (DaemonUnavailable, ApiError):
-                return
-            if job["status"] == "running":
-                if job.get("progress"):
-                    self.plan_partial = job["progress"]
-                    self.render_body()
-            elif job["status"] == "done":
-                self._plan_ready(job["result"])
-            else:
-                self._fail(f"plan failed: {job.get('error')}")
-        elif self.mode in ("progress", "spawning"):
-            try:
-                current = self.client.run_current()
-            except (DaemonUnavailable, ApiError):
-                return
-            if current and (self.run_id is None
-                            or current["pointer"].get("run_id") == self.run_id
-                            or self.mode == "spawning"):
-                self.run_id = current["pointer"].get("run_id")
+            if self.mode == "planning" and self.plan_job:
+                try:
+                    job = await asyncio.to_thread(self.client.plan_get, self.plan_job)
+                except (DaemonUnavailable, ApiError):
+                    return
+                if job["status"] == "running":
+                    if job.get("progress"):
+                        self.plan_partial = job["progress"]
+                        self.render_body()
+                elif job["status"] == "done":
+                    self._plan_ready(job["result"])
+                else:
+                    self._fail(f"plan failed: {job.get('error')}")
+            elif self.mode in ("progress", "spawning"):
+                try:
+                    current = await asyncio.to_thread(self.client.run_current)
+                except (DaemonUnavailable, ApiError):
+                    return
+                if current is None:
+                    return
+                cur_id = current["pointer"].get("run_id")
+                # in 'spawning', only adopt a run that is genuinely NEW (the
+                # run_start reply set self.run_id; else require id != prev)
+                if self.mode == "spawning":
+                    if self.run_id and cur_id != self.run_id:
+                        return
+                    if not self.run_id and cur_id == self._prev_run_id:
+                        return
+                elif cur_id != self.run_id:
+                    return
+                self.run_id = cur_id
                 self.progress = current["progress"]
                 if not current.get("running"):
                     self.mode = self._final_mode(current["progress"])
                 elif self.mode == "spawning":
                     self.mode = "progress"
                 self.render_body()
+        finally:
+            self._polling = False
 
     def _peer_probe(self) -> None:
+        from . import certs  # trust-store lookup only — not engine code
+
         line = None
         try:
-            from . import certs  # trust store lookup only — not engine code
-
             peers = certs.trusted_peers()
             if peers:
-                st = FsyncClient.for_peer(peers[0], host=f"{peers[0]}.lan").status()
+                if self._peer_client is None:
+                    self._peer_client = FsyncClient.for_peer(peers[0], host=f"{peers[0]}.lan")
+                st = self._peer_client.status()
                 runner = st.get("runner")
                 line = (f"peer {st.get('host')}: ● run {runner['run_id']}"
                         if runner else f"peer {st.get('host')}: idle")
@@ -280,8 +311,9 @@ class SyncTuiApp(App):
                 line = (f"peer {info['host']}: "
                         + ("busy" if info.get("busy")
                            else "reachable" if info.get("reachable") else "away"))
-        except (DaemonUnavailable, ApiError, Exception):
-            line = None
+        except Exception:
+            # a transient peer/probe failure must not clear a good last line
+            line = self.peer_line
         self.call_from_thread(setattr, self, "peer_line", line)
 
     # ------------------------------------------------------------------ status strip
@@ -342,6 +374,10 @@ class SyncTuiApp(App):
             body.update(self._plan_table())
         elif self.mode == "spawning":
             body.update(Text("Starting run in the backend…", style="yellow"))
+        elif self.mode == "error" and not self.progress:
+            # a plan/run start failure has a message but no progress table
+            body.update(Text(f"{self.msg or 'something went wrong'}\n\n"
+                             "p: retry   q: quit", style="red"))
         elif self.mode in ("progress", "finished", "error"):
             body.update(self._progress_table())
 

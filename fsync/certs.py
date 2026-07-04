@@ -17,6 +17,7 @@ Layout under ~/.config/fsync/tls/:
 
 from __future__ import annotations
 
+import secrets
 import socket
 import subprocess
 from pathlib import Path
@@ -82,7 +83,11 @@ def ensure_cert(extra_sans: list[str] | None = None) -> tuple[Path, Path]:
             # one cert plays both roles: server to inbound UIs/peers, client
             # identity when this box calls the peer's mTLS listener
             "-addext", "extendedKeyUsage=serverAuth,clientAuth",
-            "-addext", "basicConstraints=critical,CA:TRUE",
+            # CA:FALSE = exact-cert pin: a self-signed leaf validates only as
+            # ITSELF when used as its own trust anchor (verified: openssl
+            # accepts it). CA:TRUE would let the key mint forged leaves that
+            # also pass, defeating fingerprint-based revocation.
+            "-addext", "basicConstraints=critical,CA:FALSE",
         ],
         capture_output=True, text=True,
     )
@@ -115,6 +120,35 @@ def rebuild_bundle() -> Path | None:
 
 def trusted_peers() -> list[str]:
     return sorted(p.stem for p in trust_dir().glob("*.pem"))
+
+
+def token_path() -> Path:
+    return tls_dir() / "api-token"
+
+
+def ensure_token() -> str:
+    """Local-caller secret for the loopback listener (0600).
+
+    The loopback TLS listener authenticates the server to the client but not
+    the caller — every local account can reach 127.0.0.1. This token, readable
+    only by our own user, gates local API access; mTLS peers are authenticated
+    by their pinned client cert instead and never see this value.
+    """
+    p = token_path()
+    if p.exists():
+        return p.read_text().strip()
+    p.parent.mkdir(parents=True, exist_ok=True)
+    tok = secrets.token_urlsafe(32)
+    p.write_text(tok + "\n")
+    p.chmod(0o600)
+    return tok
+
+
+def read_token() -> str | None:
+    try:
+        return token_path().read_text().strip()
+    except OSError:
+        return None
 
 
 def cert_fingerprint(path: Path) -> str:

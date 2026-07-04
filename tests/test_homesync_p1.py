@@ -378,6 +378,97 @@ def test_report_totals():
     assert report_totals({}) == (0, 0, 0)
 
 
+def test_certs_are_exact_pin_not_ca(tmp_path, monkeypatch):
+    # regression for the review finding: peer certs must be CA:FALSE so the
+    # pin validates only the exact cert, not anything the key signs.
+    from fsync import certs
+    monkeypatch.setattr(certs, "TLS_DIR", str(tmp_path / "tls"))
+    cert, _ = certs.ensure_cert()
+    txt = run(["openssl", "x509", "-in", str(cert), "-noout", "-text"],
+              stdout=PIPE, text=True).stdout
+    assert "CA:FALSE" in txt and "CA:TRUE" not in txt
+
+
+def test_api_token_gate(tmp_path, monkeypatch):
+    from fastapi.testclient import TestClient
+    from fsync import certs
+    import fsync.homesync as hs
+    import fsync.daemon as dm
+
+    monkeypatch.setattr(certs, "TLS_DIR", str(tmp_path / "tls"))
+    monkeypatch.setattr(hs, "STATE_ROOT", str(tmp_path / "state"))
+    cfg = _write_cfg(tmp_path, "peer: {host: h}\nprofiles: {docs: {paths: [D]}}")
+    tok = certs.ensure_token()
+
+    gated = TestClient(dm.create_app(cfg, require_token=True))
+    assert gated.get("/v1/status").status_code == 401          # no token
+    assert gated.get("/v1/status", headers={"Authorization": "Bearer wrong"}).status_code == 401
+    assert gated.get("/v1/status", headers={"Authorization": f"Bearer {tok}"}).status_code == 200
+    # the mTLS app (require_token=False) needs no token: cert already authed
+    open_app = TestClient(dm.create_app(cfg, require_token=False))
+    assert open_app.get("/v1/status").status_code == 200
+
+
+def test_malformed_bodies_are_422_not_500(tmp_path, monkeypatch):
+    from fastapi.testclient import TestClient
+    import fsync.homesync as hs
+    import fsync.daemon as dm
+
+    monkeypatch.setattr(hs, "STATE_ROOT", str(tmp_path / "state"))
+    cfg = _write_cfg(tmp_path, "peer: {host: h}\nprofiles: {docs: {paths: [D]}}")
+    c = TestClient(dm.create_app(cfg))
+    assert c.post("/v1/runs", json={"profiles": [42]}).status_code == 422   # wrong item type
+    assert c.post("/v1/plan", json={"profiles": [42]}).status_code == 422
+    assert c.put("/v1/schedule", json={"interval_s": "abc"}).status_code == 422
+    # bad direction suffix is a clean 400, not a 20s hang / 502
+    assert c.post("/v1/runs", json={"profiles": ["docs=sideways"]}).status_code == 400
+
+
+def test_schedule_interval_floor(tmp_path, monkeypatch):
+    from fastapi.testclient import TestClient
+    import fsync.homesync as hs
+    import fsync.daemon as dm
+
+    monkeypatch.setattr(hs, "STATE_ROOT", str(tmp_path / "state"))
+    cfg = _write_cfg(tmp_path, "peer: {host: h}\nprofiles: {docs: {paths: [D]}}")
+    c = TestClient(dm.create_app(cfg))
+    # both the span-string and the int path must honor the 60s floor
+    assert c.put("/v1/schedule", json={"interval": "1s"}).json()["interval_s"] == 60
+    assert c.put("/v1/schedule", json={"interval_s": 1}).json()["interval_s"] == 60
+
+
+def test_plan_jobs_concurrency_cap(tmp_path, monkeypatch):
+    import fsync.homesync as hs
+    import fsync.daemon as dm
+
+    monkeypatch.setattr(hs, "STATE_ROOT", str(tmp_path / "state"))
+    jobs = dm.PlanJobs(None)
+    # inject sham in-flight jobs (no real subprocess) up to the cap
+    for i in range(dm.MAX_PLAN_JOBS_INFLIGHT):
+        jobs.jobs[f"j{i}"] = {"proc": None, "progress_path": tmp_path / f"{i}.json",
+                              "result": None, "error": None, "started": 0}
+    assert jobs.inflight() == dm.MAX_PLAN_JOBS_INFLIGHT
+    with pytest.raises(Exception) as e:
+        jobs.start(None, None)
+    assert "429" in str(e.value) or "already running" in str(e.value)
+
+
+def test_gc_run_dirs(tmp_path, monkeypatch):
+    import fsync.homesync as hs
+    from fsync.daemon import gc_run_dirs
+
+    monkeypatch.setattr(hs, "STATE_ROOT", str(tmp_path / "state"))
+    runs = tmp_path / "state" / "runs"
+    runs.mkdir(parents=True)
+    for i in range(10):
+        (runs / f"20260704-0000{i:02d}-x").mkdir()
+    (runs / "latest").write_text("20260704-000000-x")  # oldest, but protected
+    deleted = gc_run_dirs(keep=3)
+    remaining = sorted(p.name for p in runs.iterdir() if p.is_dir())
+    assert len(remaining) == 4  # 3 newest + protected latest
+    assert "20260704-000000-x" in remaining and deleted == 6
+
+
 def test_daemon_span_and_unit():
     from fsync.daemon import parse_span, render_daemon_unit
     assert parse_span("1h") == 3600

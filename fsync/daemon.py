@@ -34,10 +34,12 @@ import uuid
 from pathlib import Path
 from typing import Any
 
-from fastapi import Body, FastAPI, HTTPException
+from fastapi import Depends, FastAPI, Header, HTTPException, Request
+from pydantic import BaseModel
 
 from . import certs
 from .homesync import (
+    DIRECTIONS,
     HomesyncError,
     discover_run,
     load_config,
@@ -49,6 +51,9 @@ from .homesync import (
 
 API_VERSION = "1"
 DEFAULT_PORT = 7444
+MAX_PLAN_JOBS_INFLIGHT = 4
+RUNS_KEEP = 200       # retain this many run dirs; GC the rest after each run
+CONFLICTS_SCAN_CAP = 400  # bound the /v1/conflicts glob
 SPAN_RE = re.compile(r"^\s*(?:(\d+)\s*h)?\s*(?:(\d+)\s*min)?\s*(?:(\d+)\s*s)?\s*$")
 
 
@@ -110,7 +115,7 @@ def write_schedule(sched: dict) -> None:
 # --------------------------------------------------------------------------- #
 
 def spawn_run(selection: list[str], dry_run: bool = False, notify: bool = False,
-              config: str | None = None) -> None:
+              config: str | None = None) -> subprocess.Popen:
     cmd = [sys.executable, "-m", "fsync.cli", "sync", "run", *selection]
     if dry_run:
         cmd.append("--dry-run")
@@ -120,9 +125,36 @@ def spawn_run(selection: list[str], dry_run: bool = False, notify: bool = False,
         cmd += ["--config", config]
     log_path = state_root() / "daemon-runner.log"
     log_path.parent.mkdir(parents=True, exist_ok=True)
-    with open(log_path, "ab") as log:
-        subprocess.Popen(cmd, stdout=log, stderr=log, stdin=subprocess.DEVNULL,
-                         start_new_session=True, cwd=str(Path.home()))
+    log = open(log_path, "ab")
+    try:
+        return subprocess.Popen(cmd, stdout=log, stderr=log, stdin=subprocess.DEVNULL,
+                                start_new_session=True, cwd=str(Path.home()))
+    finally:
+        log.close()  # the child dups the fd; our handle can close
+
+
+def gc_run_dirs(keep: int = RUNS_KEEP) -> int:
+    """Remove all but the newest `keep` run dirs; returns count deleted.
+
+    The scheduler creates a run dir per fire; without this the state tree grows
+    without bound. Never touches the run named by runs/latest."""
+    import shutil
+
+    runs = state_root() / "runs"
+    if not runs.is_dir():
+        return 0
+    try:
+        latest = (runs / "latest").read_text().strip()
+    except OSError:
+        latest = None
+    dirs = sorted((p for p in runs.iterdir() if p.is_dir()), reverse=True)
+    deleted = 0
+    for d in dirs[keep:]:
+        if d.name == latest:
+            continue
+        shutil.rmtree(d, ignore_errors=True)
+        deleted += 1
+    return deleted
 
 
 def last_run_summary() -> dict | None:
@@ -163,7 +195,17 @@ class PlanJobs:
         self.jobs: dict[str, dict] = {}
         self.lock = threading.Lock()
 
+    def inflight(self) -> int:
+        with self.lock:
+            return sum(1 for j in self.jobs.values()
+                       if j["result"] is None and j["error"] is None)
+
     def start(self, profiles: list[str] | None, workers: int | None) -> str:
+        # each plan forks an ssh+hashing subprocess; cap concurrency so a UI
+        # (or a stuck caller) mashing plan can't fork-bomb the box.
+        if self.inflight() >= MAX_PLAN_JOBS_INFLIGHT:
+            raise HTTPException(status_code=429,
+                                detail=f"{MAX_PLAN_JOBS_INFLIGHT} plan jobs already running")
         job_id = time.strftime("%Y%m%d-%H%M%S-") + uuid.uuid4().hex[:6]
         progress_path = state_root() / "plan-jobs" / f"{job_id}.json"
         progress_path.parent.mkdir(parents=True, exist_ok=True)
@@ -229,20 +271,21 @@ class PlanJobs:
 # --------------------------------------------------------------------------- #
 
 class Scheduler:
-    def __init__(self, daemon_cfg: dict, config: str | None):
+    def __init__(self, daemon_cfg: dict, config: str | None,
+                 run_lock: threading.Lock):
         self.cfg = daemon_cfg
         self.config = config
+        self.run_lock = run_lock  # shared with POST /v1/runs so they can't race
         self.next_ts: float | None = None
 
-    def _compute_initial(self) -> float:
-        sched = read_schedule(self.cfg)
+    def _base_after(self, sched: dict) -> float:
         last = last_run_summary()
         base = (last or {}).get("finished_ts") or time.time()
-        due = base + sched["interval_s"] + random.uniform(0, self.cfg["jitter_s"])
-        return max(due, time.time() + 60)  # never fire in the first minute
+        return base + sched["interval_s"] + random.uniform(0, self.cfg["jitter_s"])
 
     async def run(self) -> None:
-        self.next_ts = self._compute_initial()
+        sched = read_schedule(self.cfg)
+        self.next_ts = max(self._base_after(sched), time.time() + 60)
         while True:
             await asyncio.sleep(15)
             sched = read_schedule(self.cfg)
@@ -255,27 +298,96 @@ class Scheduler:
                 continue
             found = discover_run()
             if found and found["running"]:
-                self.next_ts = time.time() + 300  # runner active: check later
+                # A run is active (ours or a manual/CLI one). Re-anchor to
+                # FINISH: don't re-fire until interval after it ends, so a run
+                # longer than the interval never immediately re-triggers.
+                self.next_ts = time.time() + 300
                 continue
-            spawn_run(["--all"], notify=True, config=self.config)
-            self.next_ts = (time.time() + sched["interval_s"]
-                            + random.uniform(0, self.cfg["jitter_s"]))
+            # take the shared lock so a concurrent POST /v1/runs can't also spawn
+            if not self.run_lock.acquire(blocking=False):
+                self.next_ts = time.time() + 30
+                continue
+            try:
+                spawn_run(["--all"], notify=True, config=self.config)
+                _await_pointer(None, timeout=15)  # let the runner register
+                gc_run_dirs()
+            finally:
+                self.run_lock.release()
+            sched = read_schedule(self.cfg)
+            self.next_ts = time.time() + sched["interval_s"] + random.uniform(0, self.cfg["jitter_s"])
+
+
+def _await_pointer(prev_run_id: str | None, timeout: float) -> dict | None:
+    """Block until a NEW run pointer appears (the runner registered) or the
+    timeout elapses. Returns the discover_run() dict, or None on timeout."""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        time.sleep(0.25)
+        found = discover_run()
+        if found and found["pointer"].get("run_id") != prev_run_id:
+            return found
+    return None
+
+
+class RunBody(BaseModel):
+    profiles: list[str] | None = None
+    dry_run: bool = False
+
+
+class PlanBody(BaseModel):
+    profiles: list[str] | None = None
+    workers: int | None = None
+
+
+class ScheduleBody(BaseModel):
+    enabled: bool | None = None
+    interval: str | None = None
+    interval_s: int | None = None
 
 
 # --------------------------------------------------------------------------- #
 # app                                                                         #
 # --------------------------------------------------------------------------- #
 
-def create_app(config: str | None = None) -> FastAPI:
+def create_app(config: str | None = None, *, require_token: bool = False,
+               shared: dict | None = None) -> FastAPI:
+    """Build the API app.
+
+    ``require_token`` gates every endpoint behind the loopback bearer token
+    (the 127.0.0.1 listener uses this — TLS there authenticates the server,
+    not the caller, and every local user can reach loopback). The mTLS
+    listener sets it False: peers are already authenticated by their pinned
+    client cert. ``shared`` carries the singleton PlanJobs/Scheduler/run-lock
+    so both apps drive the same state.
+    """
     daemon_cfg = load_daemon_cfg(config)
     app = FastAPI(title="fsyncd", version=API_VERSION)
-    plans = PlanJobs(config)
-    scheduler = Scheduler(daemon_cfg, config)
+    shared = shared if shared is not None else {}
+    run_lock: threading.Lock = shared.setdefault("run_lock", threading.Lock())
+    plans: PlanJobs = shared.setdefault("plans", PlanJobs(config))
+    scheduler: Scheduler = shared.setdefault(
+        "scheduler", Scheduler(daemon_cfg, config, run_lock))
     app.state.scheduler = scheduler
     app.state.daemon_cfg = daemon_cfg
-    started = time.time()
+    started = shared.setdefault("started", time.time())
 
-    @app.get("/v1/status")
+    expected_token = certs.ensure_token() if require_token else None
+
+    def auth(authorization: str | None = Header(default=None)) -> None:
+        if expected_token is None:
+            return
+        # constant-time compare; accept "Bearer <tok>" or the bare token
+        supplied = authorization or ""
+        if supplied.startswith("Bearer "):
+            supplied = supplied[7:]
+        import hmac
+
+        if not hmac.compare_digest(supplied, expected_token):
+            raise HTTPException(status_code=401, detail="missing or invalid API token")
+
+    protected = [Depends(auth)]
+
+    @app.get("/v1/status", dependencies=protected)
     def status() -> dict:
         found = discover_run()
         runner = None
@@ -294,7 +406,7 @@ def create_app(config: str | None = None) -> FastAPI:
                 "last": last_run_summary(),
                 "api": API_VERSION}
 
-    @app.get("/v1/profiles")
+    @app.get("/v1/profiles", dependencies=protected)
     def profiles() -> dict:
         try:
             _, profs, _ = load_config(config)
@@ -305,50 +417,69 @@ def create_app(config: str | None = None) -> FastAPI:
                        "exclude": p.exclude, "merge_jsonl": p.merge_jsonl}
                 for name, p in profs.items()}
 
-    @app.post("/v1/plan")
-    def plan_start(body: dict = Body(default={})) -> dict:
-        names = body.get("profiles")
-        if names is not None:
+    def _validate_specs(names: list[str] | None) -> None:
+        if not names:
+            return
+        try:
             _, profs, _ = load_config(config)
-            unknown = [n.partition("=")[0] for n in names
-                       if n.partition("=")[0] not in profs]
-            if unknown:
-                raise HTTPException(status_code=400, detail=f"unknown profiles: {unknown}")
-        return {"job_id": plans.start(names, body.get("workers"))}
+        except HomesyncError as e:
+            raise HTTPException(status_code=500, detail=str(e))
+        for spec in names:
+            name, _, direction = str(spec).partition("=")
+            if name not in profs:
+                raise HTTPException(status_code=400, detail=f"unknown profile: {name}")
+            if direction and direction not in DIRECTIONS:
+                raise HTTPException(status_code=400,
+                                    detail=f"{spec}: direction must be one of {DIRECTIONS}")
 
-    @app.get("/v1/plan/{job_id}")
+    @app.post("/v1/plan", dependencies=protected)
+    def plan_start(body: PlanBody = PlanBody()) -> dict:
+        _validate_specs(body.profiles)
+        return {"job_id": plans.start(body.profiles, body.workers)}
+
+    @app.get("/v1/plan/{job_id}", dependencies=protected)
     def plan_get(job_id: str) -> dict:
         return plans.get(job_id)
 
-    @app.post("/v1/runs")
-    def run_start(body: dict = Body(default={})) -> dict:
-        found = discover_run()
-        if found and found["running"]:
-            raise HTTPException(status_code=409,
-                                detail=f"run {found['pointer'].get('run_id')} already active")
-        names = body.get("profiles")
-        selection: list[str] = []
-        if names:
-            _, profs, _ = load_config(config)
-            for spec in names:
-                if spec.partition("=")[0] not in profs:
-                    raise HTTPException(status_code=400, detail=f"unknown profile: {spec}")
-                selection += ["--profile", spec]
-        else:
-            selection = ["--all"]
-        prev = (found or {}).get("pointer", {}).get("run_id")
-        spawn_run(selection, dry_run=bool(body.get("dry_run")), config=config)
-        deadline = time.time() + 20
-        while time.time() < deadline:
-            time.sleep(0.3)
-            now_found = discover_run()
-            if now_found and now_found["pointer"].get("run_id") != prev:
+    @app.post("/v1/runs", dependencies=protected)
+    def run_start(body: RunBody = RunBody()) -> dict:
+        _validate_specs(body.profiles)
+        selection = (["--all"] if not body.profiles
+                     else [a for spec in body.profiles for a in ("--profile", spec)])
+        # Serialize check-then-spawn against the scheduler and other POSTs so
+        # two callers can't both pass the 409 gate and race two runners.
+        if not run_lock.acquire(blocking=False):
+            raise HTTPException(status_code=409, detail="another run is being started")
+        try:
+            found = discover_run()
+            if found and found["running"]:
+                raise HTTPException(status_code=409,
+                                    detail=f"run {found['pointer'].get('run_id')} already active")
+            prev = (found or {}).get("pointer", {}).get("run_id")
+            proc = spawn_run(selection, dry_run=body.dry_run, config=config)
+            now_found = _await_pointer(prev, timeout=20)
+            if now_found:
+                gc_run_dirs()
                 return {"run_id": now_found["pointer"]["run_id"],
                         "running": now_found["running"]}
-        raise HTTPException(status_code=502,
-                            detail=f"runner did not start — see {state_root() / 'daemon-runner.log'}")
+            # No pointer appeared: the child either deferred cleanly (peer
+            # busy/unreachable -> exit 0) or failed (bad args -> exit != 0).
+            # Inspect its exit to answer with a precise code, not a blind 502.
+            rc = proc.poll()
+            if rc == 0:
+                raise HTTPException(status_code=409,
+                                    detail="run deferred — peer busy or unreachable, nothing to do")
+            if rc is not None:
+                raise HTTPException(status_code=400,
+                                    detail=f"runner exited {rc} without starting — check profiles/config "
+                                           f"(see {state_root() / 'daemon-runner.log'})")
+            raise HTTPException(status_code=502,
+                                detail=f"runner still starting after 20s — see "
+                                       f"{state_root() / 'daemon-runner.log'}")
+        finally:
+            run_lock.release()
 
-    @app.get("/v1/runs/current")
+    @app.get("/v1/runs/current", dependencies=protected)
     def run_current() -> dict:
         found = discover_run()
         if not found:
@@ -356,7 +487,7 @@ def create_app(config: str | None = None) -> FastAPI:
         return {"running": found["running"], "pointer": found["pointer"],
                 "progress": found["progress"]}
 
-    @app.get("/v1/runs")
+    @app.get("/v1/runs", dependencies=protected)
     def runs_list(limit: int = 20) -> list[dict]:
         out: list[dict] = []
         runs = state_root() / "runs"
@@ -374,7 +505,7 @@ def create_app(config: str | None = None) -> FastAPI:
             out.append(entry)
         return out
 
-    @app.get("/v1/runs/{run_id}")
+    @app.get("/v1/runs/{run_id}", dependencies=protected)
     def run_progress(run_id: str) -> dict:
         d = run_dir_for(run_id)
         try:
@@ -382,7 +513,7 @@ def create_app(config: str | None = None) -> FastAPI:
         except (OSError, ValueError):
             raise HTTPException(status_code=404, detail="no progress for run")
 
-    @app.get("/v1/runs/{run_id}/report")
+    @app.get("/v1/runs/{run_id}/report", dependencies=protected)
     def run_report(run_id: str) -> dict:
         d = run_dir_for(run_id)
         try:
@@ -390,7 +521,7 @@ def create_app(config: str | None = None) -> FastAPI:
         except (OSError, ValueError):
             raise HTTPException(status_code=404, detail="no report (run still active?)")
 
-    @app.get("/v1/runs/{run_id}/conflicts")
+    @app.get("/v1/runs/{run_id}/conflicts", dependencies=protected)
     def run_conflicts(run_id: str) -> dict:
         d = run_dir_for(run_id)
         files = {}
@@ -401,18 +532,27 @@ def create_app(config: str | None = None) -> FastAPI:
                 continue
         return {"run_id": run_id, "conflicts": files}
 
-    @app.get("/v1/conflicts")
+    @app.get("/v1/conflicts", dependencies=protected)
     def latest_conflicts() -> dict:
         runs = state_root() / "runs"
         newest: Path | None = None
-        for f in runs.glob("*/*/*.conflicts.json"):
-            if newest is None or f.stat().st_mtime > newest.stat().st_mtime:
-                newest = f
+        newest_mtime = -1.0
+        scanned = 0
+        # newest run dir first so the cap keeps the RECENT conflicts, and bail
+        # once we have a hit to avoid stat-ing every conflict file ever written
+        for d in sorted((p for p in runs.iterdir() if p.is_dir()), reverse=True) if runs.is_dir() else []:
+            for f in d.glob("*/*.conflicts.json"):
+                scanned += 1
+                m = f.stat().st_mtime
+                if m > newest_mtime:
+                    newest, newest_mtime = f, m
+            if newest is not None or scanned >= CONFLICTS_SCAN_CAP:
+                break
         if newest is None:
             return {"run_id": None, "conflicts": {}}
         return run_conflicts(newest.parent.parent.name)
 
-    @app.get("/v1/peer")
+    @app.get("/v1/peer", dependencies=protected)
     def peer_status() -> dict:
         try:
             peer, _, _ = load_config(config)
@@ -422,21 +562,28 @@ def create_app(config: str | None = None) -> FastAPI:
         return {"host": peer.host, "target": peer.target, "reachable": reachable,
                 "busy": peer_busy(peer) if reachable else None}
 
-    @app.get("/v1/schedule")
+    @app.get("/v1/schedule", dependencies=protected)
     def schedule_get() -> dict:
         return {**read_schedule(daemon_cfg), "next_ts": scheduler.next_ts}
 
-    @app.put("/v1/schedule")
-    def schedule_put(body: dict = Body(...)) -> dict:
+    @app.put("/v1/schedule", dependencies=protected)
+    def schedule_put(body: ScheduleBody = ScheduleBody()) -> dict:
         sched = read_schedule(daemon_cfg)
-        if "enabled" in body:
-            sched["enabled"] = bool(body["enabled"])
-        if "interval" in body:
-            sched["interval_s"] = parse_span(body["interval"], sched["interval_s"])
-        if "interval_s" in body:
-            sched["interval_s"] = max(60, int(body["interval_s"]))
-        write_schedule(sched)
-        scheduler.next_ts = (time.time() + sched["interval_s"]) if sched["enabled"] else None
+        changed = False
+        if body.enabled is not None:
+            sched["enabled"] = body.enabled
+            changed = True
+        if body.interval is not None:
+            sched["interval_s"] = max(60, parse_span(body.interval, sched["interval_s"]))
+            changed = True
+        if body.interval_s is not None:
+            sched["interval_s"] = max(60, int(body.interval_s))
+            changed = True
+        if changed:
+            # only re-anchor next_ts when something actually changed, so a
+            # repeated no-op PUT can't keep postponing the next run
+            write_schedule(sched)
+            scheduler.next_ts = (time.time() + sched["interval_s"]) if sched["enabled"] else None
         return {**sched, "next_ts": scheduler.next_ts}
 
     return app
@@ -447,17 +594,32 @@ def create_app(config: str | None = None) -> FastAPI:
 # --------------------------------------------------------------------------- #
 
 def detect_lan_host(peer_host: str | None) -> str | None:
-    """The local address a LAN peer would reach us on (UDP-connect trick)."""
+    """The local address a LAN peer would reach us on.
+
+    Tries the UDP-connect trick against the peer, then a well-known public
+    IP (works offline — no packet is sent), then enumerates non-loopback
+    IPv4s. A peer-name DNS failure must NOT disable the mTLS listener, so
+    every step falls through instead of giving up."""
+    for target in ([peer_host] if peer_host else []) + ["192.168.1.1", "10.255.255.255"]:
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+                s.connect((target, 7))
+                addr = s.getsockname()[0]
+            if not addr.startswith("127."):
+                return addr
+        except OSError:
+            continue
     try:
-        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
-            s.connect((peer_host or "192.168.1.1", 7))
-            addr = s.getsockname()[0]
-        return None if addr.startswith("127.") else addr
+        for info in socket.getaddrinfo(socket.gethostname(), None, socket.AF_INET):
+            addr = info[4][0]
+            if not addr.startswith("127."):
+                return addr
     except OSError:
-        return None
+        pass
+    return None
 
 
-async def _serve(app: FastAPI, daemon_cfg: dict, config: str | None) -> None:
+async def _serve(daemon_cfg: dict, config: str | None) -> None:
     import uvicorn
 
     class QuietServer(uvicorn.Server):
@@ -470,9 +632,15 @@ async def _serve(app: FastAPI, daemon_cfg: dict, config: str | None) -> None:
             yield
 
     cert, key = certs.ensure_cert()
+    certs.ensure_token()
+    shared: dict = {}
+    # loopback app requires the local token (defends against other local
+    # users); the app instances share PlanJobs/Scheduler/run-lock via `shared`.
+    local_app = create_app(config, require_token=True, shared=shared)
+    scheduler = shared["scheduler"]
     servers: list[uvicorn.Server] = []
 
-    local = uvicorn.Config(app, host="127.0.0.1", port=daemon_cfg["port"],
+    local = uvicorn.Config(local_app, host="127.0.0.1", port=daemon_cfg["port"],
                            ssl_certfile=str(cert), ssl_keyfile=str(key),
                            timeout_graceful_shutdown=5,  # never hang on idle keep-alives
                            log_level="warning")
@@ -489,7 +657,10 @@ async def _serve(app: FastAPI, daemon_cfg: dict, config: str | None) -> None:
             pass
         lan_host = detect_lan_host(peer_host)
     if bundle and lan_host:
-        lan = uvicorn.Config(app, host=lan_host, port=daemon_cfg["port"],
+        # peers authenticate by their pinned client cert (CERT_REQUIRED), so
+        # this app does NOT require the local token
+        lan_app = create_app(config, require_token=False, shared=shared)
+        lan = uvicorn.Config(lan_app, host=lan_host, port=daemon_cfg["port"],
                              ssl_certfile=str(cert), ssl_keyfile=str(key),
                              ssl_ca_certs=str(bundle),
                              ssl_cert_reqs=ssl.CERT_REQUIRED,
@@ -501,9 +672,9 @@ async def _serve(app: FastAPI, daemon_cfg: dict, config: str | None) -> None:
     else:
         why = "no trusted peers" if not bundle else "no LAN address detected"
         print(f"fsyncd: mTLS listener disabled ({why})", flush=True)
-    print(f"fsyncd: TLS listener on 127.0.0.1:{daemon_cfg['port']}", flush=True)
+    print(f"fsyncd: TLS listener on 127.0.0.1:{daemon_cfg['port']} (token-gated)", flush=True)
 
-    sched_task = asyncio.create_task(app.state.scheduler.run())
+    sched_task = asyncio.create_task(scheduler.run())
     server_tasks = [asyncio.create_task(s.serve()) for s in servers]
 
     def _stop() -> None:
@@ -522,9 +693,8 @@ async def _serve(app: FastAPI, daemon_cfg: dict, config: str | None) -> None:
 
 def run_daemon(config: str | None = None) -> int:
     daemon_cfg = load_daemon_cfg(config)
-    app = create_app(config)
     try:
-        asyncio.run(_serve(app, daemon_cfg, config))
+        asyncio.run(_serve(daemon_cfg, config))
     except KeyboardInterrupt:
         pass
     return 0
