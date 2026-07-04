@@ -379,3 +379,65 @@ def test_statusbar_helpers():
     assert timer_next_from_json("[]") is None            # timer not installed
     assert timer_next_from_json(json.dumps([{"next": None}])) is None
     assert timer_next_from_json("garbage") is None
+
+
+# --------------------------------------------------------------------------- #
+# history.jsonl union-merge                                                   #
+# --------------------------------------------------------------------------- #
+
+def _hline(ts, text):
+    return json.dumps({"display": text, "timestamp": ts})
+
+
+def test_union_merge_jsonl_interleaves_and_dedupes():
+    from fsync.homesync import union_merge_jsonl
+    common = _hline(100, "on both")
+    a = "\n".join([common, _hline(300, "a later")]) + "\n"
+    b = "\n".join([common, _hline(200, "b middle")]) + "\n"
+    merged = union_merge_jsonl(a, b)
+    lines = merged.splitlines()
+    assert lines == [common, _hline(200, "b middle"), _hline(300, "a later")]
+    # idempotent + symmetric-converging: merging the merge changes nothing
+    assert union_merge_jsonl(merged, a) == merged
+    assert union_merge_jsonl(merged, b) == merged
+    assert union_merge_jsonl(b, a) == merged
+
+
+def test_union_merge_jsonl_edge_cases():
+    from fsync.homesync import union_merge_jsonl
+    assert union_merge_jsonl("", "") == ""
+    only_a = _hline(1, "x") + "\n"
+    assert union_merge_jsonl(only_a, "") == only_a
+    # malformed lines are preserved (after timestamped ones), never dropped
+    bad = "not json at all"
+    merged = union_merge_jsonl(_hline(5, "ok") + "\n" + bad + "\n", "")
+    assert merged.splitlines() == [_hline(5, "ok"), bad]
+    # blank lines vanish, exact duplicates collapse
+    assert union_merge_jsonl("\n\n" + only_a, only_a) == only_a
+
+
+def test_profile_merge_jsonl_config(tmp_path):
+    _, profiles, _ = load_config(_write_cfg(tmp_path, """
+peer: {host: h}
+profiles:
+  c: {paths: [.claude], conflict: review, merge_jsonl: ["history.jsonl"]}
+  d: {paths: [x]}
+"""))
+    assert profiles["c"].merge_jsonl == ["history.jsonl"]
+    assert profiles["d"].merge_jsonl == []
+
+
+def test_compare_scales_linearly():
+    # regression guard for the O(n^2) matched-list scans: 40k+40k files must
+    # compare in seconds, not minutes (the quadratic version needs ~1 min).
+    import time as _time
+    from fsync.fileindex import compare_file_lists
+    n = 40_000
+    a = [{"path": f"d/{i}.txt", "name": f"{i}.txt", "hash": f"h{i}", "mtime": 1.0} for i in range(n)]
+    b = [{"path": f"d/{i}.txt", "name": f"{i}.txt", "hash": f"h{i}", "mtime": 1.0} for i in range(500, n + 500)]
+    t0 = _time.monotonic()
+    rep = compare_file_lists(a, b)
+    took = _time.monotonic() - t0
+    assert len(rep["exact_matches"]) == n - 500
+    assert len(rep["only_in_a"]) == 500 and len(rep["only_in_b"]) == 500
+    assert took < 5, f"compare took {took:.1f}s — quadratic regression?"

@@ -32,6 +32,7 @@ from .fileindex import (
     compare_file_lists,
     default_cache_path,
     list_files_with_metadata,
+    matches_exclude,
 )
 
 DEFAULT_CONFIG = "~/.config/fsync/sync-profiles.yaml"
@@ -85,6 +86,12 @@ profiles:
     # whose mtime is always "now" — syncing it ping-pongs every run.
     exclude: [".venv", "venv", "node_modules", "__pycache__", ".pytest_cache",
               "*.pyc", "backups", "mtab", "fsync/scratchpad/repo-sync/*"]
+  primary:
+    # Client workspace. .metadata is Eclipse runtime state (locks, caches,
+    # per-machine UI state) — never sync it.
+    paths: [workspaces/primary]
+    exclude: [".venv", "venv", "node_modules", "__pycache__", ".pytest_cache",
+              "*.pyc", "backups", "mtab", ".metadata/*"]
   claude:
     # Durable artifacts only (memories, agents, skills, plugins). Session
     # ephemera (transcripts, file-history, todos, plans, caches) are managed
@@ -92,6 +99,10 @@ profiles:
     # receiver's next cleanup deletes them and the next sync re-copies them.
     paths: [.claude]
     conflict: review
+    # history.jsonl is append-only JSONL that diverges whenever both boxes
+    # are used; whole-file resolution can only clobber a side. Union-merge
+    # dedupes lines and interleaves by timestamp instead.
+    merge_jsonl: ["history.jsonl"]
     exclude: [
       ".credentials.json", "backups/*", "statsig/*", "shell-snapshots/*",
       "file-history/*", "projects/*.jsonl", "todos/*", "tasks/*", "plans/*",
@@ -150,6 +161,33 @@ def discover_run() -> dict[str, Any] | None:
         alive = False
     return {"pointer": pointer, "progress": progress,
             "running": alive and progress.get("status") == "running"}
+
+
+def union_merge_jsonl(a_text: str, b_text: str) -> str:
+    """Line-union of two append-only JSONL files.
+
+    Exact duplicate lines collapse; entries are ordered by their `timestamp`
+    field (Claude Code's history.jsonl carries ms-epoch timestamps on every
+    line), so both boxes' entries interleave chronologically. Lines without
+    a parseable timestamp are preserved after the timestamped ones in
+    first-seen order. Merging the merge with either input is a no-op, so
+    repeated runs converge.
+    """
+    seen: dict[str, Any] = {}
+    for text in (a_text, b_text):
+        for line in text.splitlines():
+            if line.strip() and line not in seen:
+                try:
+                    ts = json.loads(line).get("timestamp")
+                except ValueError:
+                    ts = None
+                seen[line] = ts if isinstance(ts, (int, float)) else None
+    timed = sorted(
+        ((ts, i, ln) for i, (ln, ts) in enumerate(seen.items()) if ts is not None)
+    )
+    untimed = [ln for ln, ts in seen.items() if ts is None]
+    merged = [ln for _, _, ln in timed] + untimed
+    return "\n".join(merged) + "\n" if merged else ""
 
 
 def report_totals(report: dict) -> tuple[int, int, int]:
@@ -257,6 +295,7 @@ class Profile:
     rename_min_size: int = 64
     workers: int = 8
     direction: str = "both"
+    merge_jsonl: list[str] = field(default_factory=list)
 
 
 def load_config(path: str | None) -> tuple[Peer, dict[str, Profile], dict[str, Any]]:
@@ -301,6 +340,7 @@ def load_config(path: str | None) -> tuple[Peer, dict[str, Profile], dict[str, A
             rename_min_size=int(raw.get("rename_min_size", defaults.get("rename_min_size", 64))),
             workers=int(raw.get("workers", defaults.get("workers", 8))),
             direction=direction,
+            merge_jsonl=[str(p) for p in raw.get("merge_jsonl", defaults.get("merge_jsonl", []))],
         )
     if not profiles:
         raise HomesyncError(f"{cfg_path}: no profiles defined")
@@ -644,6 +684,45 @@ def run_profile(
         a_paths = [it["path"] for it in plan["a_to_b"] if it.get("path")]
         b_paths = [it["path"] for it in plan["b_to_a"] if it.get("path")]
 
+        # Union-merge interception: files matching merge_jsonl that differ on
+        # both sides are resolved by line-union (never clobbered, never held).
+        # The merged result is written locally (old copy backed up) and pushed
+        # when direction allows; under pull only the local side gains the union.
+        merged_files: list[str] = []
+        if prof.merge_jsonl:
+            merge_set = {p for p in changed_paths
+                         if p and matches_exclude(p, prof.merge_jsonl)}
+            if merge_set:
+                a_paths = [p for p in a_paths if p not in merge_set]
+                b_paths = [p for p in b_paths if p not in merge_set]
+                kept_pairs = {pr[0].get("path"): pr for pr in plan["conflicts"]}
+                plan["conflicts"] = [pr for pr in plan["conflicts"]
+                                     if pr[0].get("path") not in merge_set]
+                if progress:
+                    progress.path_phase(prof.name, rel, "merging")
+                for relp in sorted(merge_set):
+                    try:
+                        proc = _ssh(peer, f"cat {shlex.quote(remote_root + '/' + relp)}")
+                        if proc.returncode != 0:
+                            raise HomesyncError(proc.stderr.strip().splitlines()[-1]
+                                                if proc.stderr.strip() else f"cat rc={proc.returncode}")
+                        local_file = local_root / relp
+                        merged = union_merge_jsonl(local_file.read_text(), proc.stdout)
+                        bak = Path(local_backup) / relp
+                        bak.parent.mkdir(parents=True, exist_ok=True)
+                        bak.write_text(local_file.read_text())
+                        tmp = local_file.with_suffix(local_file.suffix + ".fsync-merge")
+                        tmp.write_text(merged)
+                        os.replace(tmp, local_file)
+                        merged_files.append(relp)
+                        if prof.direction in ("both", "push"):
+                            a_paths.append(relp)
+                    except (OSError, HomesyncError) as e:
+                        # merge failed -> keep it a held conflict, never guess
+                        if relp in kept_pairs:
+                            plan["conflicts"].append(kept_pairs[relp])
+                        log(f"  {prof.name}/{rel}: merge of {relp} failed ({e}) — held for review")
+
         # Direction filters ROUTING, it never overrides newest-wins: in push
         # mode a file the peer has newer is skipped (reported), not clobbered
         # with our older copy. One-way here is still additive — no deletes.
@@ -690,6 +769,7 @@ def run_profile(
             "a_to_b": leg_ab,
             "b_to_a": leg_ba,
             "direction": prof.direction,
+            "merged": merged_files,
             "skipped_by_direction": skipped_by_direction,
             "conflicts": len(conflicts),
             "renames_pending": len(plan["renames"]),
@@ -705,6 +785,7 @@ def run_profile(
             + f", B->A {len(b_paths)}"
             + (f" ({over_ba} overwrite->backup)" if over_ba else "")
             + f", conflicts {len(conflicts)}, identical {plan['noop']}"
+            + (f", merged {len(merged_files)}" if merged_files else "")
             + (f", {prof.direction}-only ({skipped_by_direction} skipped)"
                if prof.direction != "both" else "")
             + f" [{result['paths'][rel]['seconds']}s]"

@@ -79,7 +79,11 @@ profiles:
     paths: [.claude]
     conflict: review        # R5: involved pipeline
     exclude: [".credentials.json", "backups/*"]
-    merge_assist: memory-index   # superset-check + keyed merge for memory/*.md
+    merge_jsonl: ["history.jsonl"]   # line-union, timestamp-interleaved:
+        # append-only JSONL diverges whenever both boxes are used, and
+        # whole-file resolution can only clobber a side. Matching files are
+        # deduped+merged (old copies backed up both sides), pushed when
+        # direction allows, and never held as conflicts. SHIPPED 2026-07-04.
 ```
 
 ### Backup mechanics (R4)

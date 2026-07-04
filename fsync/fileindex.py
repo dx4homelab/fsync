@@ -498,6 +498,10 @@ def compare_file_lists(
     hash_matches_diff_name: List[Tuple[Dict[str, Any], Dict[str, Any]]] = []
 
     matched_b = set()  # set of indices in b_list
+    # Matched A items tracked by id(): membership must be O(1) — scanning the
+    # match lists per file is O(n^2) and turned a 168k-file compare into ~20
+    # CPU-minutes before this set existed.
+    matched_a = set()
 
     # First pass: find exact matches (name+hash)
     for a in a_list:
@@ -514,11 +518,11 @@ def compare_file_lists(
         if found_idx is not None:
             exact_matches.append((a, b_list[found_idx]))
             matched_b.add(found_idx)
+            matched_a.add(id(a))
 
     # Second pass: name matches but different hash
     for a in a_list:
-        # skip already matched
-        if any(a is pair[0] for pair in exact_matches):
+        if id(a) in matched_a:
             continue
         key = a.get(match_on) if match_on in a else a.get("name")
         candidates = name_index_b.get(key, [])
@@ -534,10 +538,11 @@ def compare_file_lists(
         if found_idx is not None:
             name_matches_diff_hash.append((a, b_list[found_idx]))
             matched_b.add(found_idx)
+            matched_a.add(id(a))
 
     # Third pass: same hash but different name
     for a in a_list:
-        if any(a is pair[0] for pair in exact_matches) or any(a is pair[0] for pair in name_matches_diff_hash):
+        if id(a) in matched_a:
             continue
         candidates = hash_index_b.get(a["hash"], [])
         found_idx = None
@@ -551,14 +556,9 @@ def compare_file_lists(
         if found_idx is not None:
             hash_matches_diff_name.append((a, b_list[found_idx]))
             matched_b.add(found_idx)
+            matched_a.add(id(a))
 
-    # Collect unmatched
-    only_in_a = []
-    for a in a_list:
-        if any(a is pair[0] for pair in exact_matches) or any(a is pair[0] for pair in name_matches_diff_hash) or any(a is pair[0] for pair in hash_matches_diff_name):
-            continue
-        only_in_a.append(a)
-
+    only_in_a = [a for a in a_list if id(a) not in matched_a]
     only_in_b = [b for idx, b in enumerate(b_list) if idx not in matched_b]
 
     return {

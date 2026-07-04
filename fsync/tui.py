@@ -55,6 +55,7 @@ def timer_next_from_json(text: str) -> str | None:
 
 PHASE_LABEL = {
     "indexing": "indexing…",
+    "merging": "⇄ merging",
     "a_to_b": "→ pushing",
     "b_to_a": "← pulling",
     "done": "done",
