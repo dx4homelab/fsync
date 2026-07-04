@@ -327,19 +327,28 @@ def test_render_timer_units():
     assert "WantedBy=timers.target" in timer
 
 
-def test_tui_run_args_direction_states():
+def test_tui_run_specs_direction_states():
     from fsync.tui import SyncTuiApp
     app = SyncTuiApp()
     app.plan = {"profiles": {"documents": {}, "tools": {}, "claude": {}}}
     app.state = {"documents": "both", "tools": "push", "claude": "off"}
-    assert app.run_args() == ["--profile", "documents=both", "--profile", "tools=push"]
-    app.config = "/tmp/x.yaml"
-    assert app.run_args()[-2:] == ["--config", "/tmp/x.yaml"]
+    assert app.run_specs() == ["documents=both", "tools=push"]
     # digit cycle order: both -> push -> pull -> off -> both
     assert app.CYCLE["both"] == "push"
     assert app.CYCLE["push"] == "pull"
     assert app.CYCLE["pull"] == "off"
     assert app.CYCLE["off"] == "both"
+
+
+def test_ui_imports_no_engine_modules():
+    # R9 boundary: the TUI and API client must never pull in engine code.
+    r = run([sys.executable, "-c",
+             "import sys; import fsync.tui, fsync.client; "
+             "bad = [m for m in sys.modules if m in "
+             "('fsync.homesync', 'fsync.fileindex', 'fsync.daemon')]; "
+             "sys.exit('engine leaked into UI: %s' % bad if bad else 0)"],
+            stdout=PIPE, stderr=PIPE, text=True)
+    assert r.returncode == 0, r.stderr or r.stdout
 
 
 def test_profile_direction_config_and_override(tmp_path):
@@ -369,16 +378,86 @@ def test_report_totals():
     assert report_totals({}) == (0, 0, 0)
 
 
-def test_statusbar_helpers():
-    import time as _time
-    from fsync.tui import parse_systemd_show, timer_next_from_json
-    props = parse_systemd_show("ActiveState=active\nNextElapseUSecRealtime=\n")
-    assert props["ActiveState"] == "active" and props["NextElapseUSecRealtime"] == ""
-    usec = int(_time.mktime((2026, 7, 3, 17, 16, 0, 0, 0, -1))) * 1_000_000
-    assert timer_next_from_json(json.dumps([{"next": usec, "unit": "fsync-sync.timer"}])) == "17:16"
-    assert timer_next_from_json("[]") is None            # timer not installed
-    assert timer_next_from_json(json.dumps([{"next": None}])) is None
-    assert timer_next_from_json("garbage") is None
+def test_daemon_span_and_unit():
+    from fsync.daemon import parse_span, render_daemon_unit
+    assert parse_span("1h") == 3600
+    assert parse_span("30min") == 1800
+    assert parse_span("90s") == 90
+    assert parse_span("1h30min") == 5400
+    assert parse_span("garbage", 42) == 42
+    unit = render_daemon_unit("/opt/venv/bin/python")
+    assert "ExecStart=/opt/venv/bin/python -m fsync.cli daemon run" in unit
+    assert "Restart=always" in unit and "WantedBy=default.target" in unit
+
+
+def test_certs_generation_and_trust(tmp_path, monkeypatch):
+    from fsync import certs
+    monkeypatch.setattr(certs, "TLS_DIR", str(tmp_path / "tls"))
+    cert, key = certs.ensure_cert()
+    assert cert.exists() and key.exists()
+    assert (key.stat().st_mode & 0o777) == 0o600
+    fp = certs.cert_fingerprint(cert)
+    assert len(fp.replace(":", "")) == 64  # sha256
+    # idempotent: second call must not regenerate
+    assert certs.ensure_cert()[0].read_text() == cert.read_text()
+    # pin a "peer" (use our own cert as stand-in) and build the bundle
+    with pytest.raises(certs.CertError):
+        certs.trust_peer("bogus", "not a pem")
+    certs.trust_peer("peerbox", cert.read_text())
+    assert certs.trusted_peers() == ["peerbox"]
+    assert certs.bundle_path().exists()
+
+
+def test_daemon_api_endpoints(tmp_path, monkeypatch):
+    from fastapi.testclient import TestClient
+    import fsync.homesync as hs
+    import fsync.daemon as dm
+
+    monkeypatch.setattr(hs, "STATE_ROOT", str(tmp_path / "state"))
+    cfg = _write_cfg(tmp_path, """
+peer: {host: peerbox, user: dev, home: /home/dev}
+daemon: {port: 7555, interval: 30min}
+profiles:
+  docs: {paths: [Documents]}
+""")
+    # fabricate one finished run
+    run_dir = tmp_path / "state" / "runs" / "20260704-010101-aaaa"
+    run_dir.mkdir(parents=True)
+    (run_dir / "report.json").write_text(json.dumps({
+        "profiles": {"docs": {"paths": {"Documents": {
+            "conflicts": 1, "a_to_b": {"files_transferred": 2}, "b_to_a": {}}}}},
+        "errors": [], "finished": "x", "dry_run": False}))
+    (run_dir / "progress.json").write_text(json.dumps(
+        {"status": "done", "finished_ts": 1234.0, "run_id": run_dir.name}))
+    (tmp_path / "state" / "runs" / "latest").write_text(run_dir.name)
+
+    client = TestClient(dm.create_app(cfg))
+    st = client.get("/v1/status").json()
+    assert st["runner"] is None
+    assert st["last"]["moved"] == 2 and st["last"]["conflicts"] == 1
+    assert st["schedule"]["interval_s"] == 1800
+
+    profs = client.get("/v1/profiles").json()
+    assert profs["docs"]["direction"] == "both"
+
+    runs = client.get("/v1/runs").json()
+    assert runs[0]["run_id"] == run_dir.name and runs[0]["moved"] == 2
+    assert client.get(f"/v1/runs/{run_dir.name}/report").status_code == 200
+    assert client.get("/v1/runs/../../etc").status_code in (400, 404)
+    assert client.get("/v1/runs/current").status_code == 404  # pointer absent
+
+    # schedule round-trip
+    put = client.put("/v1/schedule", json={"interval": "45min", "enabled": True}).json()
+    assert put["interval_s"] == 2700
+    assert client.get("/v1/schedule").json()["interval_s"] == 2700
+
+    # 409 while a "runner" is alive (our own pid plays the runner)
+    ptr = {"run_id": "r-live", "pid": __import__("os").getpid(), "run_dir": str(run_dir)}
+    (tmp_path / "state" / "current-run.json").write_text(json.dumps(ptr))
+    (run_dir / "progress.json").write_text(json.dumps(
+        {"status": "running", "run_id": "r-live", "started_ts": 1.0}))
+    assert client.post("/v1/runs", json={}).status_code == 409
+    assert client.get("/v1/runs/current").json()["running"] is True
 
 
 # --------------------------------------------------------------------------- #

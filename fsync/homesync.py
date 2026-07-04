@@ -61,6 +61,13 @@ peer:
   host: minis4dx.lan   # router DNS name; bare hostname resolution is not reliable here
   user: developer
   home: /var/home/developer
+daemon:
+  # fsyncd (P4): REST over TLS on 127.0.0.1:<port>, mTLS on the LAN address
+  # once a peer cert is pinned (fsync daemon trust). The daemon schedules
+  # runs itself — interval + up-to-jitter delay after each run finishes.
+  port: 7444
+  interval: 1h
+  jitter: 240s
 defaults:
   conflict: newer
   rename_min_size: 64

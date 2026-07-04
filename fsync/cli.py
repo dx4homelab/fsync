@@ -724,12 +724,23 @@ def build_parser() -> argparse.ArgumentParser:
                               help="Run cadence as a systemd time span (default: 1h)")
     p_sync_timer.add_argument("--verbose", action="count", default=0, help="Increase verbosity")
 
-    # tui: plan -> one confirmation -> detached run with live, re-attachable progress
-    p_tui = sub.add_parser("tui", help="Terminal UI for sync: preview, confirm once, watch progress (runner survives the UI)")
-    p_tui.add_argument("--config", help="Profiles YAML (default: ~/.config/fsync/sync-profiles.yaml)")
+    # tui: thin client of fsyncd — plan -> one confirmation -> backend run
+    p_tui = sub.add_parser("tui", help="Terminal UI for sync (thin client of fsyncd)")
     p_tui.add_argument("--profile", action="append", default=None,
                        help="Limit to profile NAME (repeatable); default: all profiles")
+    p_tui.add_argument("--port", type=int, default=None, help="fsyncd port (default: 7444)")
     p_tui.add_argument("--verbose", action="count", default=0, help="Increase verbosity")
+
+    # daemon: the operational backend (REST over TLS/mTLS + scheduler)
+    p_dmn = sub.add_parser("daemon", help="fsyncd backend: REST API over TLS/mTLS, absorbs run scheduling")
+    p_dmn.add_argument("action", choices=("run", "install", "remove", "status", "trust", "cert"),
+                       help="run: serve in foreground; install: systemd user service (retires the timer); "
+                            "trust: pin a peer's cert over ssh; cert: show this box's cert")
+    p_dmn.add_argument("host", nargs="?", help="(trust) ssh target of the peer, e.g. minis4dx.lan")
+    p_dmn.add_argument("--name", help="(trust) name to pin the peer under (default: host short name)")
+    p_dmn.add_argument("--show", action="store_true", help="(cert) print the PEM to stdout")
+    p_dmn.add_argument("--config", help="Profiles YAML (default: ~/.config/fsync/sync-profiles.yaml)")
+    p_dmn.add_argument("--verbose", action="count", default=0, help="Increase verbosity")
 
     return p
 
@@ -771,6 +782,10 @@ def main(argv: list[str] | None = None) -> int:
             print("fsync tui requires the 'textual' package: pip install textual", file=sys.stderr)
             return 2
         return run_tui(args)
+    if args.cmd == "daemon":
+        from .daemon import cmd_daemon
+
+        return cmd_daemon(args)
     parser.print_help()
     return 1
 

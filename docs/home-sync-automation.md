@@ -196,6 +196,53 @@ Textual app, four screens:
   "peer away" (clean no-op) — correct behavior, but check the name if runs
   keep no-opping unexpectedly.
 
+## P4 — engine/UI split + multi-UI (requirements recorded 2026-07-04)
+
+### Requirements
+
+- **R9 — UI/engine separation.** UI code and operational code live apart. No
+  UI imports engine internals; every operation and observation goes through
+  the backend's API. The engine keeps working with no UI attached.
+- **R10 — REST backend, TLS-first.** The operational backend (`fsyncd`) is a
+  persistent per-box daemon (systemd user service) exposing a web/REST API:
+  plain TLS on localhost, **mTLS for any non-local client**. Self-signed
+  certificates to start (pinned peer-style, like the ssh host keys); scoped
+  to the LAN pair for now — off-LAN reach is a later tunnel/cert iteration.
+  The daemon absorbs scheduling (the systemd timer becomes a thin POST or
+  retires in favor of daemon-internal scheduling) and serves: profiles,
+  plan/preview, run trigger + live progress, reports/history, held
+  conflicts, backup browsing/restore, peer status.
+- **R11 — pluggable UI family.** All thin clients of R10's API:
+  (a) **TUI** — the existing Textual app refactored into an API client;
+  (b) **local web** — browser UI served locally;
+  (c) **native Linux GUI** — Python GTK, with **always-on-top** window
+  support (a compact sync status/control panel that floats over work).
+- **R12 — dream4ui-lite.** The UI layer is built on a NEW feature branch in
+  the dream4ui framework (dream4devops repo): a limited/basic component set
+  (status strip, table, progress, action buttons, conflict list) defined as
+  data (YAML/Pydantic, per dream4devops house style) with per-target
+  renderers (Textual / web / GTK). Explicitly **not required to be
+  compatible** with the rest of dream4ui.
+
+### Decisions (settled 2026-07-04)
+
+1. Backend lifecycle: **persistent daemon** on each box.
+2. mTLS reach: **LAN pair only for now**; design must not preclude off-LAN
+   later, but certs/SANs target fury4dx ↔ minis4dx today.
+3. Order: **TUI first** — P4.1 split engine + fsyncd (REST/TLS) + TUI as
+   client; P4.2 dream4ui-lite + local web; P4.3 GTK always-on-top panel;
+   P4.4 mTLS hardening / off-LAN.
+
+### Notes
+
+- `fsyncd` is the natural evolution of the existing control-plane pieces
+  (`fsync agent`, catalog_api's FastAPI) — one daemon can eventually carry
+  both home-sync and scanner/catalog duties.
+- The progress/report snapshot files (progress.json, report.json,
+  current-run.json) become the daemon's internal state; the API replaces
+  file-polling for UIs (poll or SSE), which also fixes the status strip's
+  per-box blindness — a UI could show BOTH boxes' runners via their APIs.
+
 ## Decisions (settled 2026-07-03)
 
 1. `secrets/` **joins the streamlined newest-wins set** — backup-dir preservation

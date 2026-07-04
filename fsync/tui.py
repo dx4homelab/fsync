@@ -1,21 +1,16 @@
-"""Textual TUI for fsync home-sync (P2 of docs/home-sync-automation.md).
+"""Textual TUI for fsync home-sync — a THIN CLIENT of fsyncd (P4.1, R9/R11).
 
-Flow: plan preview ("what is coming") -> ONE confirmation -> the run executes
-in a DETACHED process (start_new_session) that survives this UI -> live
-progress polled from the runner's progress.json. Restarting the TUI while a
-run is active re-attaches to it; after completion it shows the final state.
-
-The TUI never holds the sync itself: killing it mid-run loses nothing.
+This module talks only to fsync.client (HTTP over TLS); it imports nothing
+from the engine and reads no state files. Flow is unchanged from P2: plan
+preview ("what is coming") -> ONE confirmation -> the run executes in the
+backend (detached from this UI) -> live progress; restarting the TUI
+re-attaches. The status strip shows this box's runner, the daemon schedule,
+last-run stats — and, when a peer daemon is trusted, the peer's runner too.
 """
 
 from __future__ import annotations
 
-import json
-import os
-import subprocess
-import sys
 import time
-from pathlib import Path
 
 from rich.table import Table
 from rich.text import Text
@@ -25,33 +20,10 @@ from textual.binding import Binding
 from textual.containers import VerticalScroll
 from textual.widgets import Footer, Header, Static
 
-from .homesync import discover_run, report_totals, state_root
+from .client import ApiError, DaemonUnavailable, FsyncClient
 
 POLL_SECONDS = 0.4
-TIMER_PROBE_TICKS = 35  # systemd probe every ~14s; file reads happen every tick
-
-
-def parse_systemd_show(text: str) -> dict:
-    """Parse `systemctl show` KEY=VALUE output."""
-    out: dict[str, str] = {}
-    for line in text.splitlines():
-        key, _, value = line.partition("=")
-        out[key] = value
-    return out
-
-
-def timer_next_from_json(text: str) -> str | None:
-    """Extract 'HH:MM' of the next elapse from `list-timers --output=json`.
-
-    Works for monotonic timers too (whose NextElapseUSecRealtime is empty in
-    `systemctl show`). Returns None when the timer is absent or unscheduled.
-    """
-    try:
-        entries = json.loads(text)
-        usec = entries[0].get("next")
-        return time.strftime("%H:%M", time.localtime(usec / 1_000_000)) if usec else None
-    except (ValueError, IndexError, KeyError, TypeError):
-        return None
+PEER_PROBE_TICKS = 75  # ssh + remote-API probes every ~30s
 
 PHASE_LABEL = {
     "indexing": "indexing…",
@@ -71,6 +43,10 @@ def fmt_bytes(n: int | None) -> str:
     return "?"
 
 
+def fmt_clock(ts: float | None) -> str:
+    return time.strftime("%H:%M", time.localtime(ts)) if ts else "?"
+
+
 class SyncTuiApp(App):
     TITLE = "fsync sync"
     CSS = """
@@ -84,28 +60,31 @@ class SyncTuiApp(App):
         Binding("p", "replan", "Re-plan"),
     ]
 
-    def __init__(self, config: str | None = None, profile_names: list[str] | None = None):
+    def __init__(self, client: FsyncClient | None = None,
+                 profile_names: list[str] | None = None):
         super().__init__()
-        self.config = config
+        self._client = client
         self.profile_names = profile_names
-        self.mode = "loading"          # loading|planning|no_peer|plan|spawning|progress|finished|error
+        # loading|no_daemon|planning|no_peer|plan|spawning|progress|finished|error
+        self.mode = "loading"
         self.plan: dict | None = None
-        self.plan_partial: dict | None = None  # live per-path planning snapshot
-        self.plan_progress_path: Path | None = None
-        # per-profile run state, cycled by the profile's digit key:
-        # both (⇅) -> push (→) -> pull (←) -> off (·) -> both …
+        self.plan_partial: dict | None = None
+        self.plan_job: str | None = None
         self.state: dict[str, str] = {}
         self.dry = False
         self.progress: dict | None = None
-        self.run_dir: Path | None = None
-        self.prev_run_id: str | None = None
-        self.spawn_deadline = 0.0
+        self.run_id: str | None = None
         self.msg = ""
-        # status strip state
-        self.timer_state = "…"
-        self.timer_next: str | None = None
+        # status strip
+        self.daemon_status: dict | None = None
+        self.peer_line: str | None = None
         self._tick_n = 0
-        self._activity_cache: tuple | None = None  # ((run_id, mtime), summary)
+
+    @property
+    def client(self) -> FsyncClient:
+        if self._client is None:
+            self._client = FsyncClient()
+        return self._client
 
     # ------------------------------------------------------------------ setup
 
@@ -117,76 +96,63 @@ class SyncTuiApp(App):
 
     def on_mount(self) -> None:
         self.set_interval(POLL_SECONDS, self.tick)
-        found = discover_run()
-        self.update_statusbar(found)
-        self.run_worker(self._timer_probe, thread=True, exclusive=False)
-        if found:
-            self.prev_run_id = found["pointer"].get("run_id")
-            if found["running"]:
-                self.attach(found)
-                return
+        try:
+            current = self.client.run_current()
+        except DaemonUnavailable as e:
+            self.mode = "no_daemon"
+            self.msg = str(e)
+            self.render_body()
+            return
+        except ApiError:
+            current = None
+        if current and current.get("running"):
+            self.attach(current)
+            return
         self.start_plan()
 
-    def attach(self, found: dict) -> None:
-        self.run_dir = Path(found["pointer"]["run_dir"])
-        self.progress = found["progress"]
-        self.mode = "progress" if found["running"] else self._final_mode(found["progress"])
+    def attach(self, current: dict) -> None:
+        self.progress = current["progress"]
+        self.run_id = current["pointer"].get("run_id")
+        self.mode = "progress" if current.get("running") else self._final_mode(current["progress"])
         self.render_body()
 
     @staticmethod
     def _final_mode(progress: dict) -> str:
         if progress.get("status") == "running":
-            return "error"  # runner died mid-run (stale 'running' + dead pid)
+            return "error"  # runner died mid-run (stale 'running' state)
         return "finished"
 
     # ------------------------------------------------------------------ plan
-
-    def sel_args(self) -> list[str]:
-        args: list[str] = []
-        if self.profile_names:
-            for n in self.profile_names:
-                args += ["--profile", n]
-        else:
-            args.append("--all")
-        if self.config:
-            args += ["--config", self.config]
-        return args
 
     def start_plan(self) -> None:
         self.mode = "planning"
         self.msg = ""
         self.plan_partial = None
-        self.plan_progress_path = state_root() / f"plan-progress-{os.getpid()}.json"
-        self.plan_progress_path.unlink(missing_ok=True)
+        self.plan_job = None
         self.render_body()
-        self.run_worker(self._plan_worker, thread=True, exclusive=True)
+        self.run_worker(self._plan_start_worker, thread=True, exclusive=True)
 
-    def _plan_worker(self) -> None:
-        cmd = [sys.executable, "-m", "fsync.cli", "sync", "run", "--plan-only",
-               "--plan-progress", str(self.plan_progress_path)] + self.sel_args()
-        proc = subprocess.run(cmd, capture_output=True, text=True)
-        data = None
-        if proc.returncode == 0:
-            try:
-                data = json.loads(proc.stdout)
-            except ValueError:
-                pass
-        self.call_from_thread(self._plan_ready, data, proc.stderr.strip())
+    def _plan_start_worker(self) -> None:
+        try:
+            job = self.client.plan_start(self.profile_names)
+        except (DaemonUnavailable, ApiError) as e:
+            self.call_from_thread(self._fail, f"plan failed: {e}")
+            return
+        self.call_from_thread(setattr, self, "plan_job", job)
 
-    def _plan_ready(self, data: dict | None, stderr: str) -> None:
-        if self.plan_progress_path:
-            self.plan_progress_path.unlink(missing_ok=True)
-        if data is None:
-            self.mode = "error"
-            self.msg = f"plan failed: {stderr.splitlines()[-1] if stderr else 'no output'}"
-        elif not data.get("peer_reachable", False):
+    def _fail(self, message: str) -> None:
+        self.mode = "error"
+        self.msg = message
+        self.render_body()
+
+    def _plan_ready(self, result: dict) -> None:
+        if not result.get("peer_reachable", True):
             self.mode = "no_peer"
-            self.msg = data.get("peer", "peer")
+            self.msg = result.get("peer", "peer")
         else:
-            self.plan = data
-            # start from each profile's configured direction
+            self.plan = result
             self.state = {n: p.get("direction", "both")
-                          for n, p in data.get("profiles", {}).items()}
+                          for n, p in result.get("profiles", {}).items()}
             self.mode = "plan"
         self.render_body()
 
@@ -197,17 +163,9 @@ class SyncTuiApp(App):
     STATE_MARK = {"both": ("⇅", "green"), "push": ("→", "cyan"),
                   "pull": ("←", "cyan"), "off": ("·", "dim")}
 
-    def run_args(self) -> list[str]:
-        """Runner selection args: every non-off profile is passed explicitly
-        with its (possibly cycled) direction — the override is idempotent."""
-        args: list[str] = []
-        for n in self.plan_profile_names():
-            st = self.state.get(n, "both")
-            if st != "off":
-                args += ["--profile", f"{n}={st}"]
-        if self.config:
-            args += ["--config", self.config]
-        return args
+    def run_specs(self) -> list[str]:
+        return [f"{n}={st}" for n in self.plan_profile_names()
+                if (st := self.state.get(n, "both")) != "off"]
 
     def on_key(self, event: events.Key) -> None:
         if self.mode != "plan" or not event.key.isdigit():
@@ -224,20 +182,25 @@ class SyncTuiApp(App):
     def action_run_sync(self) -> None:
         if self.mode != "plan":
             return
-        if all(st == "off" for st in self.state.values()):
+        if not self.run_specs():
             self.msg = "all profiles are off — cycle with 1-9"
             self.render_body()
             return
-        cmd = [sys.executable, "-m", "fsync.cli", "sync", "run"] + self.run_args()
-        if self.dry:
-            cmd.append("--dry-run")
-        log_path = state_root() / "tui-runner.log"
-        log_path.parent.mkdir(parents=True, exist_ok=True)
-        with open(log_path, "ab") as log:
-            subprocess.Popen(cmd, stdout=log, stderr=log, stdin=subprocess.DEVNULL,
-                             start_new_session=True, cwd=str(Path.home()))
         self.mode = "spawning"
-        self.spawn_deadline = time.time() + 30
+        self.render_body()
+        self.run_worker(self._run_start_worker, thread=True, exclusive=True)
+
+    def _run_start_worker(self) -> None:
+        try:
+            resp = self.client.run_start(self.run_specs(), dry_run=self.dry)
+        except (DaemonUnavailable, ApiError) as e:
+            self.call_from_thread(self._fail, f"run failed to start: {e}")
+            return
+        self.call_from_thread(self._run_started, resp)
+
+    def _run_started(self, resp: dict) -> None:
+        self.run_id = resp.get("run_id")
+        self.mode = "progress"
         self.render_body()
 
     def action_toggle_dry(self) -> None:
@@ -246,99 +209,114 @@ class SyncTuiApp(App):
             self.render_body()
 
     def action_replan(self) -> None:
-        if self.mode in ("plan", "no_peer", "finished", "error"):
+        if self.mode in ("plan", "no_peer", "finished", "error", "no_daemon"):
             self.start_plan()
 
     def action_quit_ui(self) -> None:
         self.exit(0)
 
+    def on_unmount(self) -> None:
+        if self._client is not None:
+            self._client.close()
+
     # ------------------------------------------------------------------ poll
 
     def tick(self) -> None:
         self._tick_n += 1
-        found = discover_run()
-        self.update_statusbar(found)
-        if self._tick_n % TIMER_PROBE_TICKS == 0:
-            self.run_worker(self._timer_probe, thread=True, exclusive=False)
+        try:
+            self.daemon_status = self.client.status()
+        except (DaemonUnavailable, ApiError):
+            self.daemon_status = None
+            if self.mode not in ("no_daemon", "error"):
+                self.mode = "no_daemon"
+                self.msg = "fsyncd stopped responding"
+                self.render_body()
+        self.update_statusbar()
+        if self._tick_n % PEER_PROBE_TICKS == 1:
+            self.run_worker(self._peer_probe, thread=True, exclusive=False)
 
-        if self.mode == "planning":
+        if self.mode == "planning" and self.plan_job:
             try:
-                self.plan_partial = json.loads(self.plan_progress_path.read_text())
+                job = self.client.plan_get(self.plan_job)
+            except (DaemonUnavailable, ApiError):
+                return
+            if job["status"] == "running":
+                if job.get("progress"):
+                    self.plan_partial = job["progress"]
+                    self.render_body()
+            elif job["status"] == "done":
+                self._plan_ready(job["result"])
+            else:
+                self._fail(f"plan failed: {job.get('error')}")
+        elif self.mode in ("progress", "spawning"):
+            try:
+                current = self.client.run_current()
+            except (DaemonUnavailable, ApiError):
+                return
+            if current and (self.run_id is None
+                            or current["pointer"].get("run_id") == self.run_id
+                            or self.mode == "spawning"):
+                self.run_id = current["pointer"].get("run_id")
+                self.progress = current["progress"]
+                if not current.get("running"):
+                    self.mode = self._final_mode(current["progress"])
+                elif self.mode == "spawning":
+                    self.mode = "progress"
                 self.render_body()
-            except (OSError, ValueError, AttributeError):
-                pass  # snapshot not written yet (engine push / peer probe phase)
-        elif self.mode == "spawning":
-            if found and found["pointer"].get("run_id") != self.prev_run_id:
-                self.prev_run_id = found["pointer"].get("run_id")
-                self.attach(found)
-            elif time.time() > self.spawn_deadline:
-                self.mode = "error"
-                self.msg = f"runner did not start — see {state_root() / 'tui-runner.log'}"
-                self.render_body()
-        elif self.mode == "progress":
-            if found:
-                self.progress = found["progress"]
-                if not found["running"]:
-                    self.mode = self._final_mode(found["progress"])
-                self.render_body()
+
+    def _peer_probe(self) -> None:
+        line = None
+        try:
+            from . import certs  # trust store lookup only — not engine code
+
+            peers = certs.trusted_peers()
+            if peers:
+                st = FsyncClient.for_peer(peers[0], host=f"{peers[0]}.lan").status()
+                runner = st.get("runner")
+                line = (f"peer {st.get('host')}: ● run {runner['run_id']}"
+                        if runner else f"peer {st.get('host')}: idle")
+            else:
+                info = self.client.peer()
+                line = (f"peer {info['host']}: "
+                        + ("busy" if info.get("busy")
+                           else "reachable" if info.get("reachable") else "away"))
+        except (DaemonUnavailable, ApiError, Exception):
+            line = None
+        self.call_from_thread(setattr, self, "peer_line", line)
 
     # ------------------------------------------------------------------ status strip
 
-    def _timer_probe(self) -> None:
-        state = subprocess.run(
-            ["systemctl", "--user", "is-active", "fsync-sync.timer"],
-            capture_output=True, text=True,
-        ).stdout.strip()
-        timers = subprocess.run(
-            ["systemctl", "--user", "list-timers", "fsync-sync.timer", "--output=json"],
-            capture_output=True, text=True,
-        ).stdout
-        self.call_from_thread(self._timer_ready, state, timers)
-
-    def _timer_ready(self, state: str, timers_json: str) -> None:
-        self.timer_state = state or "unknown"
-        self.timer_next = timer_next_from_json(timers_json)
-
-    def _last_activity(self) -> str:
-        try:
-            run_id = (state_root() / "runs" / "latest").read_text().strip()
-            rep_path = state_root() / "runs" / run_id / "report.json"
-            key = (run_id, rep_path.stat().st_mtime)
-        except OSError:
-            return "no completed runs yet"
-        if self._activity_cache and self._activity_cache[0] == key:
-            return self._activity_cache[1]
-        try:
-            report = json.loads(rep_path.read_text())
-        except (OSError, ValueError):
-            return "no completed runs yet"
-        moved, conflicts, errors = report_totals(report)
-        when = f"{run_id[9:11]}:{run_id[11:13]}" if len(run_id) >= 13 else run_id
-        summary = (f"last {when} — {moved} moved, {conflicts} held"
-                   + (f", {errors} ERROR" if errors else "")
-                   + (" [dry]" if report.get("dry_run") else ""))
-        self._activity_cache = (key, summary)
-        return summary
-
-    def update_statusbar(self, found: dict | None) -> None:
+    def update_statusbar(self) -> None:
         t = Text()
-        if found and found["running"]:
-            prog = found["progress"]
-            elapsed = time.time() - (prog.get("started_ts") or time.time())
-            t.append("● ", style="bold green")
-            t.append(f"run {found['pointer']['run_id']} active "
-                     f"(pid {found['pointer']['pid']}, {elapsed:.0f}s)", style="green")
+        st = self.daemon_status
+        if st is None:
+            t.append("✗ fsyncd unreachable", style="bold red")
         else:
-            t.append("○ no sync running", style="dim")
-        t.append("  ·  ", style="dim")
-        if self.timer_state == "active":
-            t.append(f"timer: next {self.timer_next}" if self.timer_next else "timer: on")
-        elif self.timer_state in ("…", "unknown"):
-            t.append("timer: …", style="dim")
-        else:
-            t.append("timer: off", style="yellow")
-        t.append("  ·  ", style="dim")
-        t.append(self._last_activity())
+            runner = st.get("runner")
+            if runner:
+                t.append("● ", style="bold green")
+                t.append(f"run {runner['run_id']} active "
+                         f"(pid {runner['pid']}, {runner['elapsed']:.0f}s)", style="green")
+            else:
+                t.append("○ no sync running", style="dim")
+            sched = st.get("schedule") or {}
+            t.append("  ·  ", style="dim")
+            if not sched.get("enabled"):
+                t.append("schedule: off", style="yellow")
+            else:
+                t.append(f"next {fmt_clock(sched.get('next_ts'))}")
+            last = st.get("last")
+            t.append("  ·  ", style="dim")
+            if last:
+                t.append(f"last {last['run_id'][9:11]}:{last['run_id'][11:13]} — "
+                         f"{last['moved']} moved, {last['conflicts']} held"
+                         + (f", {last['errors']} ERROR" if last["errors"] else "")
+                         + (" [dry]" if last.get("dry_run") else ""))
+            else:
+                t.append("no completed runs yet")
+        if self.peer_line:
+            t.append("  ·  ", style="dim")
+            t.append(self.peer_line, style="cyan")
         self.query_one("#statusbar", Static).update(t)
 
     # ------------------------------------------------------------------ render
@@ -347,23 +325,27 @@ class SyncTuiApp(App):
         body = self.query_one("#body", Static)
         if self.mode == "loading":
             body.update("starting…")
+        elif self.mode == "no_daemon":
+            body.update(Text(f"fsyncd is not running.\n\n{self.msg}\n\n"
+                             "Start it:  systemctl --user start fsync-daemon\n"
+                             "Install:   fsync daemon install\n\n"
+                             "p: retry   q: quit", style="red"))
         elif self.mode == "planning":
             if self.plan_partial:
                 body.update(self._planning_table())
             else:
-                body.update(Text("Planning… connecting to peer and pushing engine", style="yellow"))
+                body.update(Text("Planning… backend is indexing both boxes", style="yellow"))
         elif self.mode == "no_peer":
             body.update(Text(f"Peer {self.msg} is not reachable — nothing to sync.\n\n"
                              "p: retry   q: quit", style="red"))
         elif self.mode == "plan":
             body.update(self._plan_table())
         elif self.mode == "spawning":
-            body.update(Text("Starting detached sync run…", style="yellow"))
+            body.update(Text("Starting run in the backend…", style="yellow"))
         elif self.mode in ("progress", "finished", "error"):
             body.update(self._progress_table())
 
     def _planning_table(self):
-        """Same shape as the plan preview, filling in as each path is planned."""
         partial = self.plan_partial or {}
         done = total = 0
         table = Table(title="Planning… (both boxes hash locally; cached files are stat-only)",
@@ -437,7 +419,7 @@ class SyncTuiApp(App):
                 if st != "off":
                     totals[2] += over
                     totals[3] += d["conflicts"]
-        active = sum(1 for s in self.state.values() if s != "off")
+        active = len(self.run_specs())
         table.add_section()
         table.add_row("", f"TOTAL ({active}/{len(self.plan_profile_names())} profiles active)",
                       str(totals[0]), str(totals[1]), str(totals[2]),
@@ -509,8 +491,7 @@ class SyncTuiApp(App):
             lines.append("\nRun continues even if you quit — `fsync tui` re-attaches.  q: quit", style="dim")
         else:
             if conflicts_total:
-                lines.append(f"\n{conflicts_total} conflict(s) held for review — see "
-                             f"{prog.get('run_dir', '')}/*/‌*.conflicts.json", style="yellow")
+                lines.append(f"\n{conflicts_total} conflict(s) held for review", style="yellow")
             lines.append(f"\nreport: {prog.get('run_dir', '')}/report.json", style="dim")
             lines.append("\np: plan a new run   q: quit", style="dim")
         from rich.console import Group
@@ -518,7 +499,12 @@ class SyncTuiApp(App):
 
 
 def run_tui(args) -> int:
-    profile_names = getattr(args, "profile", None) or None
-    app = SyncTuiApp(config=getattr(args, "config", None), profile_names=profile_names)
+    try:
+        client = FsyncClient(port=getattr(args, "port", None) or 7444)
+    except DaemonUnavailable as e:
+        print(f"error: {e}", file=__import__("sys").stderr)
+        return 2
+    app = SyncTuiApp(client=client,
+                     profile_names=getattr(args, "profile", None) or None)
     app.run()
     return 0

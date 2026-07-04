@@ -4,7 +4,10 @@ fsync/__init__.py
 fsync/agent.py
 fsync/catalog_api.py
 fsync/catalog_client.py
+fsync/certs.py
 fsync/cli.py
+fsync/client.py
+fsync/daemon.py
 fsync/db.py
 fsync/eventbus.py
 fsync/fileindex.py
