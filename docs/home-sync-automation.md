@@ -253,6 +253,34 @@ TOCTOU, fast deferrals, scheduler re-anchor, interval floor, 422 bodies,
 plan cap, run-dir GC, async TUI, DNS-failure mTLS) was fixed with regression
 tests. 69 tests pass.
 
+### P4.2 SHIPPED + DEPLOYED 2026-07-04
+
+**dream4ui-lite** (dream4devops `feature/ui-lite`, `src/dream4devops/ui_lite/`):
+a render-target-agnostic UI toolkit — pure-Pydantic `Screen` of Strip/Table/
+Bar/Actions/Note (zero UI deps), a Rich renderer (`render_textual`) and an
+HTML renderer (`render_web`, stdlib-only, escaped, `Tone`→CSS). One spec
+renders to terminal AND browser. Deliberately not compatible with the richer
+dream4ui.
+
+**fsync** (`p4.1-fsyncd`): `views.py` builds lite Screens from fsyncd API
+data — the single source of truth. `tui.py` rewired to render those via
+`render_textual` (all Rich-table code deleted; import boundary holds). `web.py`
++ `fsync web`: a loopback renderer process holding one FsyncClient (browser
+needs no credential), rendering the SAME Screens via `render_web`, with a
+~30-line vanilla-JS htmx shim served locally (no CDN). View builders return
+CONTENT ONLY; each surface places the status strip itself (TUI → pinned
+widget, web → `views.with_strip`).
+
+Decisions taken (the user, as architect): shared spec drives BOTH TUI and web
+now; separate `fsync web` renderer process; htmx fragment polling.
+
+Adversarial review (27 agents) → 5 confirmed, all fixed: web CSRF +
+DNS-rebinding closed by a per-route guard (Host must be loopback; Sec-Fetch-
+Site must be same-origin/none); TUI status-strip double-render; web session
+races (poll() under lock, screen() snapshots + guards plan==None, prev-run
+adoption guard, cached peer client). Tests: 75 fsync + 5 ui_lite pass;
+web/TUI e2e green; `fsync web` verified serving + guards on both boxes.
+
 ### Decisions (settled 2026-07-04)
 
 1. Backend lifecycle: **persistent daemon** on each box.
