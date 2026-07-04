@@ -96,6 +96,11 @@ profiles:
       ".credentials.json", "backups/*", "statsig/*", "shell-snapshots/*",
       "file-history/*", "projects/*.jsonl", "todos/*", "tasks/*", "plans/*",
       "cache/*", "debug/*", "session-env/*",
+      # per-machine noise (2026-07-03 triage): live-session records, caches,
+      # updater/GC state, approval residue, self-refreshing plugin registry.
+      # What remains reviewable on purpose: settings.json and memory/.
+      "sessions/*", "stats-cache.json", ".last-update-result.json",
+      ".last-cleanup", "settings.local.json", "plugins/*",
     ]
 """
 
