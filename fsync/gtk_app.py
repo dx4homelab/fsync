@@ -28,6 +28,22 @@ import threading
 import time
 
 
+def _gtk_env(compact: bool, scale: float) -> dict[str, str]:
+    """The GDK environment to set (before GTK init) for a given mode+scale.
+
+    XWayland is forced when EITHER always-on-top (set_keep_above is X11-only)
+    OR an explicit scale is requested — because GDK_SCALE is IGNORED on native
+    Wayland (window.get_scale_factor() stays 1) and only takes effect under
+    X11/XWayland. On native Wayland the correct scale is the GNOME per-monitor
+    setting, which GTK follows automatically without any flag.
+    """
+    env: dict[str, str] = {}
+    if compact or (scale and scale > 0):
+        env["GDK_BACKEND"] = "x11"
+    env.update(_scale_env(scale))
+    return env
+
+
 def _scale_env(scale: float) -> dict[str, str]:
     """GDK environment for a HiDPI scale factor (e.g. 2.0 for 200%).
 
@@ -69,12 +85,9 @@ def _ensure_gi() -> bool:
 
 def run_gtk(args) -> int:
     compact = bool(getattr(args, "always_on_top", False))
-    if compact:
-        # force XWayland before GTK initialises so set_keep_above is honored
-        os.environ.setdefault("GDK_BACKEND", "x11")
-    # HiDPI scale (must be set before GTK reads it at init). Only override when
-    # asked — on native Wayland GTK auto-detects the monitor scale correctly.
-    for k, v in _scale_env(getattr(args, "scale", None) or 0).items():
+    scale = getattr(args, "scale", None) or 0
+    # set GDK_BACKEND/GDK_SCALE before GTK reads them at init (see _gtk_env)
+    for k, v in _gtk_env(compact, scale).items():
         os.environ.setdefault(k, v)
 
     if not _ensure_gi():

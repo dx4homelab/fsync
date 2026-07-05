@@ -198,3 +198,14 @@ def test_gtk_scale_env():
     assert frac["GDK_SCALE"] == "1" and frac["GDK_DPI_SCALE"] == "1.500"
     frac25 = _scale_env(2.5)
     assert frac25["GDK_SCALE"] == "2" and frac25["GDK_DPI_SCALE"] == "1.250"
+
+
+def test_gtk_env_forces_xwayland_for_scale():
+    from fsync.gtk_app import _gtk_env
+    # plain window, no scale: leave the backend to GTK (native Wayland auto-scales)
+    assert _gtk_env(compact=False, scale=0) == {}
+    # --scale REQUIRES XWayland — GDK_SCALE is ignored on native Wayland
+    assert _gtk_env(compact=False, scale=2) == {"GDK_BACKEND": "x11", "GDK_SCALE": "2"}
+    # always-on-top forces XWayland regardless (set_keep_above is X11-only)
+    assert _gtk_env(compact=True, scale=0) == {"GDK_BACKEND": "x11"}
+    assert _gtk_env(compact=True, scale=2) == {"GDK_BACKEND": "x11", "GDK_SCALE": "2"}

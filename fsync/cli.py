@@ -736,8 +736,9 @@ def build_parser() -> argparse.ArgumentParser:
     p_gtk.add_argument("--always-on-top", action="store_true",
                        help="Compact glanceable panel pinned above other windows")
     p_gtk.add_argument("--scale", type=float, default=None, metavar="N",
-                       help="HiDPI scale factor, e.g. 2 for 200%% (sets GDK_SCALE; useful for "
-                            "--always-on-top, which uses XWayland and won't auto-scale)")
+                       help="HiDPI scale factor, e.g. 2 for 200%%. Runs under XWayland (GDK_SCALE "
+                            "is ignored on native Wayland). On native Wayland the GNOME per-monitor "
+                            "scale is followed automatically without this flag.")
     p_gtk.add_argument("--profile", action="append", default=None,
                        help="Limit to profile NAME (repeatable); default: all profiles")
     p_gtk.add_argument("--port", type=int, default=None, help="fsyncd port (default: 7444)")
