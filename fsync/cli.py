@@ -735,6 +735,9 @@ def build_parser() -> argparse.ArgumentParser:
     p_gtk = sub.add_parser("gtk", help="Native GTK panel for sync (normal window, or --always-on-top compact panel)")
     p_gtk.add_argument("--always-on-top", action="store_true",
                        help="Compact glanceable panel pinned above other windows")
+    p_gtk.add_argument("--scale", type=float, default=None, metavar="N",
+                       help="HiDPI scale factor, e.g. 2 for 200%% (sets GDK_SCALE; useful for "
+                            "--always-on-top, which uses XWayland and won't auto-scale)")
     p_gtk.add_argument("--profile", action="append", default=None,
                        help="Limit to profile NAME (repeatable); default: all profiles")
     p_gtk.add_argument("--port", type=int, default=None, help="fsyncd port (default: 7444)")

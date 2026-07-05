@@ -28,6 +28,25 @@ import threading
 import time
 
 
+def _scale_env(scale: float) -> dict[str, str]:
+    """GDK environment for a HiDPI scale factor (e.g. 2.0 for 200%).
+
+    GDK_SCALE takes an INTEGER and scales the whole rendering crisply — the
+    right knob for 200%. A fractional remainder goes to GDK_DPI_SCALE (text
+    DPI). This matters most in --always-on-top mode: it forces XWayland, and
+    XWayland apps don't inherit GNOME's monitor scale, so without this they
+    render at 1x and the compositor upscales them blurry.
+    """
+    if not scale or scale <= 0:
+        return {}
+    integer = max(1, int(scale))
+    env = {"GDK_SCALE": str(integer)}
+    frac = scale / integer
+    if abs(frac - 1.0) > 0.01:
+        env["GDK_DPI_SCALE"] = f"{frac:.3f}"
+    return env
+
+
 def _ensure_gi() -> bool:
     """Make PyGObject importable from a venv by borrowing the system gi
     (same Python ABI). Returns True if gi is available."""
@@ -53,6 +72,10 @@ def run_gtk(args) -> int:
     if compact:
         # force XWayland before GTK initialises so set_keep_above is honored
         os.environ.setdefault("GDK_BACKEND", "x11")
+    # HiDPI scale (must be set before GTK reads it at init). Only override when
+    # asked — on native Wayland GTK auto-detects the monitor scale correctly.
+    for k, v in _scale_env(getattr(args, "scale", None) or 0).items():
+        os.environ.setdefault(k, v)
 
     if not _ensure_gi():
         print("fsync gtk requires PyGObject/GTK3 (Fedora: it ships in the base image; "

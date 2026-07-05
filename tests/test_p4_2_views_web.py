@@ -187,3 +187,14 @@ def test_gtk_renderer_if_available():
     # clicking a button routes to on_action with its key
     next(b for b in btns if "Sync now" in b.get_label()).emit("clicked")
     assert clicked == ["r"]
+
+
+def test_gtk_scale_env():
+    from fsync.gtk_app import _scale_env
+    assert _scale_env(0) == {} and _scale_env(None or 0) == {}
+    assert _scale_env(2) == {"GDK_SCALE": "2"}          # 200% — crisp integer
+    assert _scale_env(3) == {"GDK_SCALE": "3"}          # 300%
+    frac = _scale_env(1.5)                                # 150% — int + dpi remainder
+    assert frac["GDK_SCALE"] == "1" and frac["GDK_DPI_SCALE"] == "1.500"
+    frac25 = _scale_env(2.5)
+    assert frac25["GDK_SCALE"] == "2" and frac25["GDK_DPI_SCALE"] == "1.250"
