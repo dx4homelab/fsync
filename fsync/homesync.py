@@ -26,6 +26,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from . import git_repo_sync as grs
 from .fileindex import (
     DEFAULT_RSYNC_SSH,
     build_sync_plan,
@@ -38,6 +39,8 @@ from .fileindex import (
 DEFAULT_CONFIG = "~/.config/fsync/sync-profiles.yaml"
 STATE_ROOT = "~/.local/state/fsync"
 ENGINE_DIR = ".local/lib/fsync-engine"  # relative to the peer's $HOME
+DEFAULT_GIT_BUNDLE_DIR = "~/.fsync/git-bundles"  # P5: kind=git bundles land here
+DEFAULT_GIT_BACKUP_ROOT = "~/.fsync/backups"     # pre-apply receiver backups
 
 SSH_OPTS = ["-o", "BatchMode=yes", "-o", "ConnectTimeout=5", "-o", "StrictHostKeyChecking=yes"]
 # rsync exits that mean "the sync itself is fine": 24 = source files vanished
@@ -296,6 +299,10 @@ class Profile:
     workers: int = 8
     direction: str = "both"
     merge_jsonl: list[str] = field(default_factory=list)
+    # P5 git-repo-sync: kind="git" profiles carry full git working state via
+    # bundles instead of additive rsync (docs/git-repo-sync.md).
+    kind: str = "files"
+    mirror_branches: bool = False
 
 
 def load_config(path: str | None) -> tuple[Peer, dict[str, Profile], dict[str, Any]]:
@@ -331,6 +338,9 @@ def load_config(path: str | None) -> tuple[Peer, dict[str, Profile], dict[str, A
         direction = raw.get("direction", defaults.get("direction", "both"))
         if direction not in DIRECTIONS:
             raise HomesyncError(f"{cfg_path}: profile '{name}': direction must be one of {DIRECTIONS}")
+        kind = raw.get("kind", "files")
+        if kind not in ("files", "git"):
+            raise HomesyncError(f"{cfg_path}: profile '{name}': kind must be 'files' or 'git', got {kind!r}")
         profiles[name] = Profile(
             name=name,
             paths=[str(p) for p in paths],
@@ -341,6 +351,8 @@ def load_config(path: str | None) -> tuple[Peer, dict[str, Profile], dict[str, A
             workers=int(raw.get("workers", defaults.get("workers", 8))),
             direction=direction,
             merge_jsonl=[str(p) for p in raw.get("merge_jsonl", defaults.get("merge_jsonl", []))],
+            kind=kind,
+            mirror_branches=bool(raw.get("mirror_branches", False)),
         )
     if not profiles:
         raise HomesyncError(f"{cfg_path}: no profiles defined")
@@ -620,6 +632,11 @@ def build_run_preview(
 
     out: dict[str, Any] = {"profiles": {}}
     for prof in selected:
+        if prof.kind == "git":
+            # Git profiles don't rsync; the preview lists their repos instead.
+            out["profiles"][prof.name] = {"kind": "git",
+                                          "repos": [r["rel"] for r in _discover_git_repos(prof)]}
+            continue
         pp: dict[str, Any] = {"conflict": prof.conflict, "direction": prof.direction, "paths": {}}
         for rel in prof.paths:
             if prog is not None:
@@ -797,6 +814,158 @@ def run_profile(
 # CLI entry                                                                   #
 # --------------------------------------------------------------------------- #
 
+# --------------------------------------------------------------------------- #
+# P5 git-repo-sync: kind=git profiles carry full git working state via bundles #
+# (docs/git-repo-sync.md). Snapshot is producer-side and timer-safe; apply is  #
+# receiver-side, on-demand, and always backs the receiver up first (R15).      #
+# --------------------------------------------------------------------------- #
+
+def _home() -> Path:
+    return Path(os.path.expanduser("~"))
+
+
+def _discover_git_repos(prof: Profile) -> list[dict]:
+    """Repos under a git profile's paths, as ``{name, rel, path}`` (rel = path
+    relative to $HOME, shared by both boxes)."""
+    home = _home()
+    out: list[dict] = []
+    seen: set[str] = set()
+    for p in prof.paths:
+        for name, path in grs.discover_repos(home / p, prof.exclude):
+            rel = path.relative_to(home).as_posix()
+            if rel in seen:
+                continue
+            seen.add(rel)
+            out.append({"name": name, "rel": rel, "path": path})
+    return out
+
+
+def snapshot_git_profile(prof: Profile, bundle_dir: str | Path, log) -> dict[str, Any]:
+    """Producer side: capture every repo in the profile into ``bundle_dir``."""
+    bundle_dir = Path(bundle_dir).expanduser()
+    bundle_dir.mkdir(parents=True, exist_ok=True)
+    out: dict[str, Any] = {"kind": "git", "repos": []}
+    repos = _discover_git_repos(prof)
+    if not repos:
+        log(f"  {prof.name}: no git repos found under {prof.paths}")
+        return out
+    for r in repos:
+        meta = grs.snapshot_repo(r["path"], bundle_dir, name=r["name"], rel=r["rel"])
+        out["repos"].append({"name": r["name"], "rel": r["rel"], "branch": meta["branch"],
+                             "dirty": meta["dirty"], "bytes": meta["bytes"]})
+        log(f"  {prof.name}: snapshot {r['rel']} ({meta['bytes']}B"
+            f"{', dirty' if meta['dirty'] else ''})")
+    return out
+
+
+def _select_git_profiles(profiles: dict[str, Profile], args) -> list[Profile] | None:
+    if getattr(args, "profile", None):
+        sel = []
+        for n in args.profile:
+            if n not in profiles:
+                print(f"unknown git profile: {n} (available: {', '.join(profiles) or 'none'})",
+                      file=sys.stderr)
+                return None
+            sel.append(profiles[n])
+        return sel
+    return list(profiles.values())  # default + --all: every git profile
+
+
+def _load_bundle_metas(bundle_dir: Path, only: str | None = None) -> list[dict]:
+    if not bundle_dir.exists():
+        return []
+    metas = []
+    for mp in sorted(bundle_dir.glob("*.meta.json")):
+        try:
+            meta = json.loads(mp.read_text())
+        except (OSError, ValueError):
+            continue
+        if only and meta.get("name") != only:
+            continue
+        metas.append(meta)
+    return metas
+
+
+def cmd_git(args) -> int:
+    """`fsync git snapshot|apply|status` — full-fidelity git-repo sync."""
+    def log(msg: str) -> None:
+        print(msg, file=sys.stderr)
+
+    action = getattr(args, "git_cmd", None)
+    if action not in ("snapshot", "apply", "status"):
+        print("usage: fsync git {snapshot|apply|status} [--profile NAME ...] [--all]",
+              file=sys.stderr)
+        return 2
+    try:
+        _peer, profiles, _defaults = load_config(getattr(args, "config", None))
+    except HomesyncError as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 2
+    bundle_dir = Path(getattr(args, "bundle_dir", None) or DEFAULT_GIT_BUNDLE_DIR).expanduser()
+
+    if action == "snapshot":
+        git_profiles = {n: p for n, p in profiles.items() if p.kind == "git"}
+        if not git_profiles:
+            print("no kind:git profiles in config — add one (see docs/git-repo-sync.md)",
+                  file=sys.stderr)
+            return 2
+        selected = _select_git_profiles(git_profiles, args)
+        if selected is None:
+            return 2
+        total = 0
+        try:
+            for prof in selected:
+                total += len(snapshot_git_profile(prof, bundle_dir, log)["repos"])
+        except grs.GitSyncError as e:
+            print(f"error: {e}", file=sys.stderr)
+            return 1
+        print(f"snapshot: {total} repo(s) -> {bundle_dir}")
+        return 0
+
+    # apply / status operate on the bundles present in bundle_dir (carried here
+    # by the file-sync, or written locally by snapshot).
+    metas = _load_bundle_metas(bundle_dir, only=getattr(args, "repo", None))
+    if not metas:
+        where = f" matching {args.repo}" if getattr(args, "repo", None) else ""
+        print(f"no bundles in {bundle_dir}{where} — run `fsync git snapshot` on the "
+              f"source box (and let the file-sync carry {bundle_dir.name}/) first",
+              file=sys.stderr)
+        return 2
+
+    home = _home()
+    if action == "status":
+        for meta in metas:
+            rel = meta.get("rel") or meta["name"]
+            prev = grs.preview_apply(home / rel, meta)
+            flag = "CHANGE" if prev["would_change"] else "up-to-date"
+            newmark = "" if prev["exists"] else "  (new: absent locally)"
+            print(f"{meta['name']}: {rel} [{flag}] incoming "
+                  f"{meta['branch'] or 'DETACHED'}@{meta['head'][:9]}"
+                  f"{' dirty' if meta['dirty'] else ''}{newmark}")
+        return 0
+
+    # apply
+    backup_root = Path(getattr(args, "backup_root", None) or DEFAULT_GIT_BACKUP_ROOT).expanduser()
+    backup_dir = backup_root / (time.strftime("%Y%m%d-%H%M%S") + "-git")
+    rc = 0
+    for meta in metas:
+        rel = meta.get("rel") or meta["name"]
+        bundle = bundle_dir / f"{meta['name']}.bundle"
+        try:
+            res = grs.apply_repo(home / rel, bundle, meta, backup_dir=backup_dir,
+                                 mirror_branches=getattr(args, "mirror_branches", False))
+        except grs.GitSyncError as e:
+            print(f"{meta['name']}: ERROR {e}", file=sys.stderr)
+            rc = 1
+            continue
+        print(f"{meta['name']}: applied -> {rel} ({meta['branch'] or 'DETACHED'}"
+              f"@{meta['head'][:9]}{', dirty' if meta['dirty'] else ''}"
+              f"{', created' if res['created'] else ''})"
+              + (f"  backup {res['backup']}" if res["backup"] else ""))
+    log(f"apply: receiver backups under {backup_dir}")
+    return rc
+
+
 def _cmd_init(args) -> int:
     cfg_path = Path(getattr(args, "config", None) or DEFAULT_CONFIG).expanduser()
     if cfg_path.exists() and not args.force:
@@ -908,12 +1077,19 @@ def _cmd_run(args) -> int:
 
     for prof in selected:
         try:
-            report["profiles"][prof.name] = run_profile(
-                peer, prof, run_dir=run_dir, run_id=run_id,
-                dry_run=args.dry_run, workers=args.workers, log=log, progress=progress,
-            )
+            if prof.kind == "git":
+                # Producer-side snapshot only: writes/refreshes local bundles
+                # (safe + idempotent). Bundles travel via a files-profile that
+                # carries the bundle dir; `fsync git apply` restores on demand.
+                report["profiles"][prof.name] = snapshot_git_profile(
+                    prof, DEFAULT_GIT_BUNDLE_DIR, log)
+            else:
+                report["profiles"][prof.name] = run_profile(
+                    peer, prof, run_dir=run_dir, run_id=run_id,
+                    dry_run=args.dry_run, workers=args.workers, log=log, progress=progress,
+                )
             progress.profile_done(prof.name)
-        except HomesyncError as e:
+        except (HomesyncError, grs.GitSyncError) as e:
             report["profiles"].setdefault(prof.name, {})["status"] = "error"
             report["errors"].append(f"{prof.name}: {e}")
             progress.error(f"{prof.name}: {e}")

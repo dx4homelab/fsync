@@ -724,6 +724,27 @@ def build_parser() -> argparse.ArgumentParser:
                               help="Run cadence as a systemd time span (default: 1h)")
     p_sync_timer.add_argument("--verbose", action="count", default=0, help="Increase verbosity")
 
+    # git: full-fidelity git-repo sync via bundles (docs/git-repo-sync.md)
+    p_git = sub.add_parser("git", help="Full-fidelity git-repo sync: snapshot/apply exact working state via bundles")
+    git_sub = p_git.add_subparsers(dest="git_cmd")
+    for _name, _help in (("snapshot", "Producer: capture kind:git profiles' repos into bundles"),
+                         ("apply", "Receiver: reconstruct exact working state (backs the receiver up first)"),
+                         ("status", "Preview: what an apply would change (no mutation)")):
+        gp = git_sub.add_parser(_name, help=_help)
+        gp.add_argument("--config", help="Profiles YAML (default: ~/.config/fsync/sync-profiles.yaml)")
+        gp.add_argument("--bundle-dir", help=f"Bundle staging dir (default: {'~/.fsync/git-bundles'})")
+        gp.add_argument("--verbose", action="count", default=0, help="Increase verbosity")
+        if _name == "snapshot":
+            gp.add_argument("--profile", action="append", default=None,
+                            help="Limit to git profile NAME (repeatable); default: all git profiles")
+            gp.add_argument("--all", action="store_true", help="Snapshot every git profile (default)")
+        else:  # apply / status act on bundles present in the bundle dir
+            gp.add_argument("--repo", help="Limit to a single repo by bundle NAME")
+        if _name == "apply":
+            gp.add_argument("--mirror-branches", action="store_true",
+                            help="Prune local branches the producer no longer has (safe: receiver is backed up)")
+            gp.add_argument("--backup-root", help="Where pre-apply receiver backups go (default: ~/.fsync/backups)")
+
     # tui: plan -> one confirmation -> detached run with live, re-attachable progress
     p_tui = sub.add_parser("tui", help="Terminal UI for sync: preview, confirm once, watch progress (runner survives the UI)")
     p_tui.add_argument("--config", help="Profiles YAML (default: ~/.config/fsync/sync-profiles.yaml)")
@@ -764,6 +785,10 @@ def main(argv: list[str] | None = None) -> int:
         from .homesync import cmd_sync
 
         return cmd_sync(args)
+    if args.cmd == "git":
+        from .homesync import cmd_git
+
+        return cmd_git(args)
     if args.cmd == "tui":
         try:
             from .tui import run_tui

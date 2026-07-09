@@ -216,30 +216,65 @@ receiver's prior work; simulate a dirty receiver and verify recovery.
 
 ## Phased plan
 
-- **P5.1 — capture/reconstruct core (library + tests).** `git_repo_sync.py`:
-  `snapshot_repo() → (bundle, meta)`, `apply_repo()` with R15 always-backup. No
-  fsync wiring yet. Prove R13 fidelity via the round-trip matrix first — this is
-  the risky heart.
-- **P5.2 — profile kind + discovery + CLI.** `kind: git`, repo discovery under
-  `paths` (respecting excludes), `fsync git snapshot|apply|status`; snapshot
-  wired into `sync run` producer path; `git-bundles/` carried as a files-profile.
-- **P5.3 — safe-apply hardening + adversarial review.** `index.lock`/busy guard,
-  `mirror_branches` prune semantics, backup retention, on-demand ergonomics,
-  submodule/LFS detect-and-warn. Adversarial pass (the P4 pattern).
+- **P5.1 — capture/reconstruct core (library + tests).** ✅ SHIPPED.
+  `fsync/git_repo_sync.py`: `snapshot_repo()`, `apply_repo()` (R15
+  always-backup), `discover_repos()`, `preview_apply()`. R13 fidelity proven by
+  the round-trip matrix in `tests/test_git_repo_sync.py`.
+- **P5.2 — profile kind + discovery + CLI.** ✅ SHIPPED. `kind: git` in
+  `load_config`, repo discovery under `paths`, `fsync git snapshot|apply|status`;
+  snapshot wired into `sync run` (producer path); designed to be carried by a
+  `git-bundles/` files-profile. CLI integration + end-to-end smoke green.
+- **P5.3 — safe-apply hardening + adversarial review.** TODO next. `index.lock`/
+  busy guard, backup retention/GC, submodule/LFS detect-and-warn, an adversarial
+  review pass (the P4 pattern), and enabling it on the live config.
 - **P5.4 — (Roadmap, out of v1 scope).** Incremental bundles (`<base>..HEAD`,
   needs a basis ref) + a state layer (sqlite sidecar → central Postgres control
   plane per `fsync-control-plane`) enabling **divergence detection** and thus
   optional bidirectional git-sync. This is where ideas (a) Postgres and
   incremental transport return, once v1 proves the transport.
 
-## Open decisions for review
+## Decisions taken (v1, implemented)
 
-1. **Branch-delete semantics** — default additive (keep receiver's extra
-   branches) vs mirror-prune to the producer's set. R15 makes prune safe;
-   default is off. Confirm.
-2. **Which profiles are `kind: git`** — just `primary`, or also `homelab`
-   (currently plain-file with `.git` included)? Splitting repos out of the file
-   profiles also fixes the phantom-deletion class for good.
-3. **Untracked capture bound** — rely on `.gitignore` only, or also apply the
-   profile `exclude` as an `add -A` pathspec (keeps stray large untracked dirs
-   out of the bundle)?
+The three open questions were resolved as follows while building P5.1–P5.2:
+
+1. **Branch-delete semantics** → **additive by default** (`mirror_branches:
+   false`). Shared branches are always fast-forwarded to the producer's tips;
+   receiver-only branches are kept unless `mirror_branches: true` (per-profile)
+   or `fsync git apply --mirror-branches` is used. R15 backup makes prune safe.
+2. **Which profiles are `kind: git`** → the **capability** is implemented and
+   tested, but no *live* profile was flipped — enabling it on the deployed
+   `sync-profiles.yaml` (both boxes) is a deploy step (see below), not a code
+   change. Recommended target: split `workspaces/primary` (and later
+   `workspaces/homelab`) repos into a `kind: git` profile, which also
+   permanently kills the phantom-deletion class.
+3. **Untracked capture bound** → **`.gitignore` only** for v1 (`git add -A` in a
+   throwaway index). Applying the profile `exclude` as an `add -A` pathspec is a
+   P5.3 refinement. Excludes *are* honored for repo **discovery**.
+
+Also decided in build: bundles use **stable per-repo filenames** (overwritten,
+newest-wins) with **deterministic snapshot commits** (fixed identity+date) so an
+unchanged working state hashes to the same objects and the bundle doesn't churn;
+first-time apply into a **missing/empty repo** is supported (init-from-bundle, no
+backup — nothing to lose); `sync run` **snapshots** git profiles (producer-side,
+idempotent) but never auto-applies (R17).
+
+## Enabling it (deploy step — not yet done on the live boxes)
+
+Add to `~/.config/fsync/sync-profiles.yaml` on **both** boxes:
+
+```yaml
+profiles:
+  # 1. capture primary's repos to bundles (replaces file-syncing their .git)
+  primary-repos:
+    kind: git
+    paths: [workspaces/primary]
+    exclude: ['.venv', 'venv', 'node_modules']
+    # mirror_branches: false   # default
+  # 2. carry the bundle dir between boxes (ordinary additive file-sync)
+  git-bundles:
+    paths: ['.fsync/git-bundles']
+```
+Then on the source box `fsync sync run --all` (snapshots + carries bundles), and
+on the other box `fsync git status` / `fsync git apply`. Remove
+`workspaces/primary` from the old file `primary` profile at the same time so the
+two mechanisms don't both touch the repos.
