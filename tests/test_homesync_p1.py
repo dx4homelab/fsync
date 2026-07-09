@@ -597,6 +597,66 @@ profiles:
     assert profiles["d"].merge_jsonl == []
 
 
+def _merge_dry_run(tmp_path, monkeypatch, dry_run):
+    """run_profile over one merge_jsonl conflict; returns (path, result)."""
+    from subprocess import CompletedProcess
+
+    from fsync import homesync as hs
+
+    # the real run backs up under ~/.fsync/backups — keep it out of the real HOME
+    monkeypatch.setenv("HOME", str(tmp_path))
+
+    root = tmp_path / "home" / ".claude"
+    root.mkdir(parents=True)
+    hist = root / "history.jsonl"
+    hist.write_text(_hline(1, "local") + "\n")
+
+    prof = hs.Profile(name="claude", paths=[".claude"], conflict="review",
+                      direction="push", merge_jsonl=["history.jsonl"])
+    peer = hs.Peer(host="peer.lan", user="dev", home="/remote")
+    plan = {"a_to_b": [], "b_to_a": [], "a_delete": [], "b_delete": [],
+            "conflicts": [({"path": "history.jsonl"}, {"path": "history.jsonl"})],
+            "renames": [], "renames_suppressed": [], "noop": 0}
+
+    monkeypatch.setattr(hs, "peer_home", lambda p: "/remote")
+    monkeypatch.setattr(hs, "_plan_path",
+                        lambda pe, pr, rel, n: (root, "/remote/.claude", plan, {"history.jsonl"}))
+    monkeypatch.setattr(hs, "run_rsync_leg", lambda *a, **k: {"files": 0, "bytes": 0})
+    if dry_run:
+        def _no_ssh(*a, **k):
+            raise AssertionError("a dry run must not reach the peer to merge")
+        monkeypatch.setattr(hs, "_ssh", _no_ssh)
+    else:
+        monkeypatch.setattr(hs, "_ssh", lambda *a, **k: CompletedProcess(
+            [], 0, stdout=_hline(2, "remote") + "\n", stderr=""))
+
+    result = hs.run_profile(peer, prof, run_dir=tmp_path / "run", run_id="R",
+                            dry_run=dry_run, workers=1, log=lambda m: None)
+    return hist, result["paths"][".claude"]
+
+
+def test_dry_run_never_writes_merge_jsonl(tmp_path, monkeypatch):
+    """--dry-run is a preview: the merge is reported, never performed."""
+    hist, path = _merge_dry_run(tmp_path, monkeypatch, dry_run=True)
+
+    assert hist.read_text() == _hline(1, "local") + "\n"   # untouched
+    assert path["merged"] == []
+    assert path["would_merge"] == ["history.jsonl"]
+    # the merge still de-conflicts the plan, so nothing is held for review
+    assert path["conflicts"] == 0
+
+
+def test_real_run_performs_merge_jsonl(tmp_path, monkeypatch):
+    """The same call without --dry-run does union-merge and write."""
+    hist, path = _merge_dry_run(tmp_path, monkeypatch, dry_run=False)
+
+    body = hist.read_text()
+    assert "local" in body and "remote" in body   # union of both sides
+    assert path["merged"] == ["history.jsonl"]
+    assert path["would_merge"] == []
+    assert path["conflicts"] == 0
+
+
 def test_compare_scales_linearly():
     # regression guard for the O(n^2) matched-list scans: 40k+40k files must
     # compare in seconds, not minutes (the quadratic version needs ~1 min).

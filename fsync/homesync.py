@@ -745,7 +745,10 @@ def run_profile(
         # both sides are resolved by line-union (never clobbered, never held).
         # The merged result is written locally (old copy backed up) and pushed
         # when direction allows; under pull only the local side gains the union.
+        # A dry run is a preview and writes nothing: it reports the merges a
+        # real run would perform and leaves both sides byte-for-byte untouched.
         merged_files: list[str] = []
+        would_merge: list[str] = []
         if prof.merge_jsonl:
             merge_set = {p for p in changed_paths
                          if p and matches_exclude(p, prof.merge_jsonl)}
@@ -755,6 +758,11 @@ def run_profile(
                 kept_pairs = {pr[0].get("path"): pr for pr in plan["conflicts"]}
                 plan["conflicts"] = [pr for pr in plan["conflicts"]
                                      if pr[0].get("path") not in merge_set]
+            if merge_set and dry_run:
+                would_merge = sorted(merge_set)
+                if prof.direction in ("both", "push"):
+                    a_paths.extend(would_merge)
+            elif merge_set:
                 if progress:
                     progress.path_phase(prof.name, rel, "merging")
                 for relp in sorted(merge_set):
@@ -827,6 +835,7 @@ def run_profile(
             "b_to_a": leg_ba,
             "direction": prof.direction,
             "merged": merged_files,
+            "would_merge": would_merge,
             "skipped_by_direction": skipped_by_direction,
             "conflicts": len(conflicts),
             "renames_pending": len(plan["renames"]),
@@ -843,6 +852,7 @@ def run_profile(
             + (f" ({over_ba} overwrite->backup)" if over_ba else "")
             + f", conflicts {len(conflicts)}, identical {plan['noop']}"
             + (f", merged {len(merged_files)}" if merged_files else "")
+            + (f", would merge {len(would_merge)}" if would_merge else "")
             + (f", {prof.direction}-only ({skipped_by_direction} skipped)"
                if prof.direction != "both" else "")
             + f" [{result['paths'][rel]['seconds']}s]"
