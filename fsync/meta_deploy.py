@@ -82,29 +82,48 @@ def build_pyz(out_path: str | Path = DEFAULT_PYZ, *, modules: list[str] | None =
 # --------------------------------------------------------------------------- #
 
 def _match_host_key(hosts: dict, hostname: str) -> str | None:
+    """Symmetric short-name matching: gethostname() may be short while the
+    config keys are FQDNs, or vice versa — both directions must identify self,
+    else self could be treated as a deploy target and clobbered."""
     if hostname in hosts:
         return hostname
     short = hostname.split(".")[0]
-    return short if short in hosts else None
+    if short in hosts:
+        return short
+    for hk in hosts:
+        if hk.split(".")[0] == short:
+            return hk
+    return None
 
 
 def remote_targets(data: dict, self_host: str) -> list[tuple[str, str]]:
     """(host_key, ssh_target) for every host except self. ssh_target comes from
     `hosts[R].ssh`; for a 2-box config with no `ssh:`, it falls back to self's
-    `peer` (self's peer *is* the remote)."""
+    `peer` (self's peer *is* the remote). Refuses to run when self can't be
+    identified, and refuses any target that resolves back to self — deploying to
+    the source box would replace its editable install with the pyz."""
     hosts = data.get("hosts") or {}
     self_key = _match_host_key(hosts, self_host)
+    if hosts and self_key is None:
+        raise DeployError(
+            f"this box '{self_host}' is not in the config hosts {sorted(hosts)} — "
+            f"refusing to deploy (cannot tell self from remotes)")
+    self_short = self_host.split(".")[0]
     out: list[tuple[str, str]] = []
     for hk, hcfg in hosts.items():
         if hk == self_key:
             continue
         ssh = (hcfg or {}).get("ssh")
-        if not ssh and self_key and len(hosts) == 2:
+        if not ssh and len(hosts) == 2:
             peer = (hosts.get(self_key) or {}).get("peer") or {}
             if peer.get("host"):
                 ssh = (f"{peer['user']}@" if peer.get("user") else "") + peer["host"]
         if not ssh:
             raise DeployError(
                 f"host '{hk}' has no ssh: address (needed to deploy to it)")
+        if ssh.split("@")[-1].split(".")[0] == self_short:
+            raise DeployError(
+                f"host '{hk}' resolves to this box ({ssh}) — refusing self-deploy "
+                f"(check the peer/ssh addresses in the config)")
         out.append((hk, ssh))
     return out

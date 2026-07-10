@@ -371,12 +371,18 @@ def _resolve_config(cfg_path: Path, yaml) -> dict:
 
 
 def _match_host(hosts: dict, hostname: str) -> str | None:
-    """Match a hostname to a hosts: key — exact, else the label before the first
-    dot (so 'fury4dx' matches gethostname 'fury4dx.lan')."""
+    """Match a hostname to a hosts: key — exact, else short-name in BOTH
+    directions ('fury4dx' matches gethostname 'fury4dx.lan' and a config key
+    'fury4dx.lan' matches gethostname 'fury4dx')."""
     if hostname in hosts:
         return hostname
     short = hostname.split(".")[0]
-    return short if short in hosts else None
+    if short in hosts:
+        return short
+    for hk in hosts:
+        if hk.split(".")[0] == short:
+            return hk
+    return None
 
 
 def _select_host_config(data: dict, hostname: str) -> dict:
@@ -1298,21 +1304,45 @@ def _rsync_push(src: str, target: str, dst_rel: str) -> None:
 
 
 def _deploy_to(target: str, pyz: str, cfg: str) -> dict:
-    """Atomic install of the pyz + config on one remote (R24): back up current,
-    push to temp, chmod+mv into place, verify with `fsync meta version`."""
+    """Install the pyz + config on one remote as an atomic PAIR (R24):
+
+    1. strict backup-first — an absent current file is fine (first deploy), but
+       a FAILED cp aborts before anything is overwritten (never swallow it: a
+       later rollback would have no valid .bak);
+    2. push both to temp, chmod+mv both into place;
+    3. verify with `meta version` — and on ANY post-overwrite failure (partial
+       mv or failed verify) restore the pair from the .bak copies (cp, not mv:
+       the .bak stays on disk for inspection either way)."""
     from . import meta_deploy as md
     binp, cfgp = md.REMOTE_BIN_REL, md.REMOTE_CONFIG_REL
-    _ssh_to(target, "mkdir -p ~/.local/bin ~/.config/fsync ~/.fsync/deploy", timeout=30)
-    _ssh_to(target, f"cp -f ~/{binp} ~/{binp}.bak 2>/dev/null; "
-                    f"cp -f ~/{cfgp} ~/{cfgp}.bak 2>/dev/null; true", timeout=30)
+    _ssh_to(target, "mkdir -p ~/.local/bin ~/.config/fsync", timeout=30)
+    bk = _ssh_to(target,
+                 f"if [ -e ~/{binp} ]; then cp -f ~/{binp} ~/{binp}.bak; fi && "
+                 f"if [ -e ~/{cfgp} ]; then cp -f ~/{cfgp} ~/{cfgp}.bak; fi",
+                 timeout=30)
+    if bk.returncode != 0:
+        raise md.DeployError(f"{target}: backup failed — aborting before overwrite: "
+                             f"{bk.stderr.strip()}")
     _rsync_push(pyz, target, f"{binp}.tmp")
     _rsync_push(cfg, target, f"{cfgp}.tmp")
+    restore = (f"if [ -e ~/{binp}.bak ]; then cp -f ~/{binp}.bak ~/{binp}; fi; "
+               f"if [ -e ~/{cfgp}.bak ]; then cp -f ~/{cfgp}.bak ~/{cfgp}; fi")
     inst = _ssh_to(target, f"chmod +x ~/{binp}.tmp && mv ~/{binp}.tmp ~/{binp} && "
                            f"mv ~/{cfgp}.tmp ~/{cfgp}", timeout=30)
     if inst.returncode != 0:
-        raise md.DeployError(f"{target}: install failed: {inst.stderr.strip()}")
+        rb = _ssh_to(target, restore, timeout=30)
+        raise md.DeployError(
+            f"{target}: install failed ({inst.stderr.strip()}); "
+            + ("rolled back from .bak" if rb.returncode == 0
+               else "ROLLBACK ALSO FAILED — inspect *.bak on the remote"))
     ver = _ssh_to(target, f"~/{binp} meta version", timeout=30)
-    return {"target": target, "verify_rc": ver.returncode, "verify": ver.stdout.strip()}
+    ok = ver.returncode == 0 and "fsync_version" in ver.stdout
+    rolled_back = False
+    if not ok:
+        rb = _ssh_to(target, restore, timeout=30)
+        rolled_back = rb.returncode == 0
+    return {"target": target, "verify_rc": 0 if ok else (ver.returncode or 1),
+            "verify": ver.stdout.strip(), "rolled_back": rolled_back}
 
 
 def cmd_deploy(args) -> int:
@@ -1366,8 +1396,13 @@ def cmd_deploy(args) -> int:
     if action == "status":
         rc = 0
         for hk, tgt in targets:
-            p = _ssh_to(tgt, f"~/{md.REMOTE_BIN_REL} meta version 2>/dev/null || "
-                             f"fsync meta version 2>/dev/null", timeout=30)
+            try:
+                p = _ssh_to(tgt, f"~/{md.REMOTE_BIN_REL} meta version 2>/dev/null || "
+                                 f"fsync meta version 2>/dev/null", timeout=30)
+            except (subprocess.SubprocessError, OSError):
+                print(f"{hk} ({tgt}): unreachable (ssh timed out)", file=sys.stderr)
+                rc = 1
+                continue
             if p.returncode == 0 and '"fsync_version"' in p.stdout:
                 try:
                     m = json.loads(p.stdout)
@@ -1402,14 +1437,22 @@ def cmd_deploy(args) -> int:
         log(f"deploying to {hk} ({tgt}) ...")
         try:
             res = _deploy_to(tgt, pyz, str(cfg_file))
-        except md.DeployError as e:
+        except (md.DeployError, subprocess.SubprocessError, OSError) as e:
+            # keep going: one slow/failed host must not strand the rest of the
+            # fleet un-attempted (a mid-install failure already rolled back)
             print(f"{hk}: ERROR {e}", file=sys.stderr)
             rc = 1
             continue
         ok = res["verify_rc"] == 0 and "fsync_version" in res["verify"]
-        print(f"{hk} ({tgt}): {'OK (verified)' if ok else 'INSTALLED but verify FAILED'}")
-        if not ok:
+        if ok:
+            print(f"{hk} ({tgt}): OK (verified)")
+        else:
             rc = 1
+            print(f"{hk} ({tgt}): verify FAILED — "
+                  + ("rolled back to the previous install"
+                     if res.get("rolled_back")
+                     else "ROLLBACK ALSO FAILED (inspect *.bak on the remote)"),
+                  file=sys.stderr)
             log(f"  verify output: {res['verify'][:200]}")
     return rc
 

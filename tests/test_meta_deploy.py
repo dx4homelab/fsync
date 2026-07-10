@@ -104,6 +104,123 @@ def test_remote_targets_missing_ssh_errors():
         remote_targets(data, "a")
 
 
+def test_remote_targets_fqdn_keys_short_self_excludes_self():
+    """Review #3a: FQDN config keys + short gethostname must still identify
+    self — else self becomes a deploy target and its install is clobbered."""
+    from fsync.meta_deploy import remote_targets
+    data = {"hosts": {
+        "minis4dx.lan": {"ssh": "dev@minis4dx.lan"},
+        "fury4dx.lan": {"ssh": "dev@fury4dx.lan"},
+    }}
+    assert remote_targets(data, "minis4dx") == [("fury4dx.lan", "dev@fury4dx.lan")]
+
+
+def test_remote_targets_unknown_self_refuses():
+    """Self not in hosts: refuse outright rather than treating every host
+    (including possibly self) as a remote."""
+    from fsync.meta_deploy import DeployError, remote_targets
+    data = {"hosts": {"a": {"ssh": "d@a"}, "b": {"ssh": "d@b"}}}
+    with pytest.raises(DeployError) as e:
+        remote_targets(data, "stranger")
+    assert "refusing" in str(e.value)
+
+
+def test_remote_targets_self_pointing_peer_refused():
+    """Review #3b: a misconfigured peer that points back at self must not
+    become a deploy target."""
+    from fsync.meta_deploy import DeployError, remote_targets
+    data = {"hosts": {
+        "a": {"peer": {"host": "a.lan", "user": "dev"}},   # a's peer is itself
+        "b": {},
+    }}
+    with pytest.raises(DeployError) as e:
+        remote_targets(data, "a")
+    assert "self-deploy" in str(e.value)
+
+
+# --------------------------------------------------------------------------- #
+# _deploy_to: backup-first + pair rollback (review findings #1, #2, #4)        #
+# --------------------------------------------------------------------------- #
+
+from subprocess import CompletedProcess
+
+
+class _FakeRemote:
+    """Records ssh commands + rsync pushes; fails any command matching `fail`.
+    Distinguishing substrings: backup cp ends '<file>.bak; fi', restore cp is
+    'cp -f ~/<file>.bak ~/<file>' (contains '.bak ~/')."""
+    def __init__(self, fail=lambda cmd: False):
+        self.cmds, self.pushed, self.fail = [], [], fail
+
+    def ssh(self, target, cmd, **kw):
+        self.cmds.append(cmd)
+        if self.fail(cmd):
+            return CompletedProcess([], 1, stdout="", stderr="boom")
+        out = '{"fsync_version": "0.2.0"}' if "meta version" in cmd else ""
+        return CompletedProcess([], 0, stdout=out, stderr="")
+
+    def push(self, src, target, dst):
+        self.pushed.append(dst)
+
+
+def _wire(monkeypatch, fake):
+    import fsync.homesync as hs
+    monkeypatch.setattr(hs, "_ssh_to", fake.ssh)
+    monkeypatch.setattr(hs, "_rsync_push", fake.push)
+    return hs
+
+
+def _is_restore(cmd):
+    return ".bak ~/" in cmd            # cp FROM .bak back into place
+
+
+def test_deploy_to_happy_path_backs_up_before_overwrite(monkeypatch):
+    fake = _FakeRemote()
+    hs = _wire(monkeypatch, fake)
+    res = hs._deploy_to("dev@remote", "p.pyz", "c.yaml")
+    assert res["verify_rc"] == 0 and res["rolled_back"] is False
+    assert fake.pushed == [".local/bin/fsync.tmp",
+                           ".config/fsync/sync-profiles.yaml.tmp"]   # temp, then mv
+    backup_idx = next(i for i, c in enumerate(fake.cmds) if ".bak; fi" in c)
+    mv_idx = next(i for i, c in enumerate(fake.cmds) if c.startswith("chmod +x"))
+    assert backup_idx < mv_idx                       # backup strictly first
+    assert not any(_is_restore(c) for c in fake.cmds)  # no rollback ran
+
+
+def test_deploy_to_verify_failure_rolls_back(monkeypatch):
+    """Review #1 (brick): failed verify must restore the previous install."""
+    fake = _FakeRemote(fail=lambda c: "meta version" in c)
+    hs = _wire(monkeypatch, fake)
+    res = hs._deploy_to("dev@remote", "p.pyz", "c.yaml")
+    assert res["verify_rc"] != 0
+    assert res["rolled_back"] is True
+    assert any(_is_restore(c) for c in fake.cmds)
+
+
+def test_deploy_to_partial_mv_rolls_back_and_raises(monkeypatch):
+    """Review #4: a failed install mv must restore the PAIR, not leave a new
+    binary with an old config."""
+    from fsync.meta_deploy import DeployError
+    fake = _FakeRemote(fail=lambda c: c.startswith("chmod +x"))
+    hs = _wire(monkeypatch, fake)
+    with pytest.raises(DeployError) as e:
+        hs._deploy_to("dev@remote", "p.pyz", "c.yaml")
+    assert "rolled back" in str(e.value)
+    assert any(_is_restore(c) for c in fake.cmds)
+
+
+def test_deploy_to_backup_failure_aborts_before_overwrite(monkeypatch):
+    """Review #2: a FAILED backup cp (disk full, perms) must abort the deploy
+    before anything is pushed or overwritten — never proceed without a .bak."""
+    from fsync.meta_deploy import DeployError
+    fake = _FakeRemote(fail=lambda c: ".bak; fi" in c)    # the backup command
+    hs = _wire(monkeypatch, fake)
+    with pytest.raises(DeployError) as e:
+        hs._deploy_to("dev@remote", "p.pyz", "c.yaml")
+    assert "backup failed" in str(e.value)
+    assert fake.pushed == []                              # nothing overwritten
+
+
 # --------------------------------------------------------------------------- #
 # pyz build                                                                   #
 # --------------------------------------------------------------------------- #

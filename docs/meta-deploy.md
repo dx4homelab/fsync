@@ -119,11 +119,15 @@ is one executable file (`chmod +x fsync.pyz; ./fsync.pyz meta version`).
 - **`fsync deploy build [--config F] [--out P]`** — assemble + zipapp the pyz to
   `P` (default `~/.fsync/deploy/fsync.pyz`). Prints size + bundled modules.
 - **`fsync deploy push [--config F] [--host N] [--dry-run]`** — build, then for
-  each host in `hosts:` except self: rsync the pyz → `~/.local/bin/fsync.tmp` and
-  the config → `~/.config/fsync/fsync-hosts.yaml.tmp` over SSH; back up the
-  remote's current binary+config; `chmod +x` + atomic `mv` both into place;
-  verify with `ssh <remote> fsync meta version`. `--dry-run` prints the plan
-  (targets, files, sizes) and does nothing.
+  each host in `hosts:` except self: back up the remote's current binary+config
+  (strictly — a failed backup aborts before anything is overwritten); rsync the
+  pyz and the config to `*.tmp` paths over SSH; `chmod +x` + `mv` both into
+  place; verify with `ssh <remote> fsync meta version`; **on any post-overwrite
+  failure (partial mv, failed verify) restore the pair from the `.bak` copies**.
+  Note: whatever file `--config` names is installed on the remote **as**
+  `~/.config/fsync/sync-profiles.yaml` (the path the pyz reads by default) — the
+  local file may be called `fsync-hosts.yaml`; it is renamed on push. `--dry-run`
+  prints the plan and does nothing.
 - **`fsync deploy status [--config F]`** — for each remote, `ssh fsync meta
   version`; report deployed version + features + whether it matches local and
   self-selected the right host.
@@ -157,6 +161,36 @@ a target** — minis keeps its editable dev install.
 - **P6.4 — cutover (deploy step, user-run):** author `fsync-hosts.yaml` from the
   current shared config, `fsync deploy push` to fury, verify, then retire fury's
   fsync source checkout (source becomes minis-only per R26).
+
+## Adversarial review outcomes (P6.3)
+
+A background adversarial review (findings empirically reproduced, incl. real
+`ssh localhost` deploy simulation) surfaced 6 issues; all fixed:
+
+- **#1 (brick):** a failed post-install verify left the broken pyz live with no
+  rollback → `_deploy_to` now restores the binary+config pair from `.bak` on any
+  post-overwrite failure and reports "rolled back".
+- **#2 (brick):** the backup `cp` swallowed real failures (`; true`), so an
+  install could proceed with no valid `.bak` → backup is now strict: an absent
+  file is fine (first deploy), a *failed* cp aborts before anything is touched.
+- **#3 (self-clobber):** `remote_targets` could target SELF (FQDN config keys +
+  short `gethostname()`, or a self-pointing `peer` in the 2-box fallback) —
+  which on the source box would replace the editable install with the pyz →
+  symmetric short-name matching both directions; refuse when self can't be
+  identified; refuse any target that resolves back to self.
+- **#4:** the binary/config `mv` pair wasn't atomic (new binary + old config on
+  partial failure) → shared rollback path restores the pair.
+- **#5:** an ssh/rsync timeout aborted the whole fleet loop after a partial
+  install → per-host catch of `SubprocessError`/`OSError`, remaining hosts still
+  attempted, per-host status reported.
+- **#6:** doc/code config-filename mismatch → documented that `--config F` is
+  installed on the remote as `sync-profiles.yaml`.
+
+Verified sound by the same review: the pyz import chain is pure-stdlib at
+startup (all heavy deps lazy), every core command runs headless on bare
+`python3`, vendored pure-Python yaml suffices, `_select_host_config` carries
+`requires` (the gate fires on the selected config), rsync-relative-to-`$HOME`
+and non-interactive `~` expansion both work.
 
 ## Roadmap (out of v1)
 
