@@ -265,11 +265,42 @@ restorable (git limitation). See Non-goals.
 **Verified non-bug:** `read-tree --reset -u` force-overwrites untracked
 collisions and dir↔file flips (scratchpad proof), so reconstruct needs no
 pre-clean.
-- **P5.4 — (Roadmap, out of v1 scope).** Incremental bundles (`<base>..HEAD`,
+- **P5.4 polish — SHIPPED.** `restore_backup()` + `fsync git restore` (one-command
+  undo of an apply, from the bundle+meta / tar / ignored-copies), and pre-apply
+  backup **retention** (`--keep N`, default 10). See Meta-synchronization below
+  for the code/config coordination layer.
+- **P5.4 — (Roadmap, still out of scope).** Incremental bundles (`<base>..HEAD`,
   needs a basis ref) + a state layer (sqlite sidecar → central Postgres control
   plane per `fsync-control-plane`) enabling **divergence detection** and thus
   optional bidirectional git-sync. This is where ideas (a) Postgres and
   incremental transport return, once v1 proves the transport.
+
+## Meta-synchronization
+
+Rolling out a capability like `kind: git` changes **both code and config on both
+boxes** — and if they drift (config reaches a box before the code, or vice
+versa) you get breakage. Meta-sync keeps the sync *tooling itself* coherent:
+
+- **Code propagates for free.** fsync is an *editable* install (`~/.local/bin/fsync`
+  → the repo `.venv`), and the repo travels via its own file-profile
+  (`workspaces/homelab`). Sync the repo → both boxes run the same fsync. (The
+  remote-index engine copy is also refreshed each run by `ensure_peer_engine`.)
+- **Config propagates via `include:`.** Split the config: the box-local
+  `sync-profiles.yaml` keeps `peer:` and `defaults.direction` and does
+  `include: [shared-profiles.yaml]`; the **shared** file holds the profile
+  definitions and travels as an ordinary synced file. `load_config` merges them,
+  box-local overlaying the shared parts — so editing a profile once and syncing
+  propagates it, while each box keeps its own peer/direction.
+- **A `requires:` compatibility gate.** The config declares the capabilities it
+  needs (`requires: [git-sync]`); `load_config` checks them against this build's
+  `fsync.FEATURES` and **refuses with a clear message** if the code is too old —
+  turning the skew window into a safe, informative failure instead of a crash.
+- **`fsync meta` for visibility.** `meta version` (JSON: version + capabilities +
+  config summary), `meta check` (validate local config against this build),
+  `meta status` (probe the peer's installed fsync over SSH and report version
+  drift + whether each box satisfies the other's config `requires`).
+
+`fsync.__version__` is `0.2.0`; `FEATURES = {home-sync, git-sync, meta-sync}`.
 
 ## Decisions taken (v1, implemented)
 
@@ -296,23 +327,37 @@ first-time apply into a **missing/empty repo** is supported (init-from-bundle, n
 backup — nothing to lose); `sync run` **snapshots** git profiles (producer-side,
 idempotent) but never auto-applies (R17).
 
-## Enabling it (deploy step — not yet done on the live boxes)
+## Enabling it (deploy playbook — not yet done on the live boxes)
 
-Add to `~/.config/fsync/sync-profiles.yaml` on **both** boxes:
+Coordinated via meta-sync so code and config move together safely:
 
-```yaml
-profiles:
-  # 1. capture primary's repos to bundles (replaces file-syncing their .git)
-  primary-repos:
-    kind: git
-    paths: [workspaces/primary]
-    exclude: ['.venv', 'venv', 'node_modules']
-    # mirror_branches: false   # default
-  # 2. carry the bundle dir between boxes (ordinary additive file-sync)
-  git-bundles:
-    paths: ['.fsync/git-bundles']
-```
-Then on the source box `fsync sync run --all` (snapshots + carries bundles), and
-on the other box `fsync git status` / `fsync git apply`. Remove
-`workspaces/primary` from the old file `primary` profile at the same time so the
-two mechanisms don't both touch the repos.
+1. **Ship the code first.** With the p5-git-sync branch merged/checked out on both
+   boxes (editable install), each box has `git-sync` in `fsync.FEATURES`. Verify:
+   `fsync meta check` on each box, and `fsync meta status` to confirm the peer is
+   also up to date (it reports version drift + capability gaps).
+2. **Put the shared profiles in an included file** so config propagates by
+   file-sync. `~/.config/fsync/shared-profiles.yaml` (synced, identical on both):
+   ```yaml
+   requires: [git-sync]              # compatibility gate
+   profiles:
+     primary-repos:                  # capture repos to bundles (not file-sync their .git)
+       kind: git
+       paths: [workspaces/primary]
+       exclude: ['.venv', 'venv', 'node_modules']
+     git-bundles:                    # carry the bundle dir between boxes
+       paths: ['.fsync/git-bundles']
+   ```
+   Keep `~/.config/fsync/sync-profiles.yaml` box-local:
+   `peer:`, `defaults.direction`, and `include: [shared-profiles.yaml]`.
+   Add a synced file-profile for the shared config itself (e.g. include
+   `.config/fsync/shared-profiles.yaml` in an existing dotfiles/config profile).
+3. **Remove `workspaces/primary` from the old file `primary` profile** so the two
+   mechanisms don't both touch the repos (this also ends the phantom-deletion
+   class permanently).
+4. On the source box `fsync sync run --all` (snapshots git repos + carries the
+   bundle dir); on the other box `fsync git status` then `fsync git apply` (undo
+   with `fsync git restore`).
+
+The `requires: [git-sync]` line means if the shared config reaches a box whose
+fsync is older, `load_config` refuses with a clear upgrade message rather than
+misbehaving — code and config stay coupled.

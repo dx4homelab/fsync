@@ -473,3 +473,82 @@ def test_tags_are_reconstructed(tmp_path):
     recv = tmp_path / "fresh"                                # init-from-bundle
     grs.apply_repo(recv, meta["bundle"], meta, backup_dir=tmp_path / "bk")
     assert "v1.0" in git(recv, "tag").split()
+
+
+# --------------------------------------------------------------------------- #
+# P5.4 polish: restore (undo an apply) + backup retention                      #
+# --------------------------------------------------------------------------- #
+
+def test_restore_backup_reverts_apply(tmp_path):
+    """restore_backup returns the receiver to its exact pre-apply state,
+    including a git-ignored file the apply had overwritten (D3 + restore)."""
+    prod = tmp_path / "p"; make_base_repo(prod)
+    recv = tmp_path / "r"; clone(prod, recv)
+    (recv / ".gitignore").write_text("secret\n")
+    (recv / "secret").write_text("RECEIVER-SECRET\n")       # ignored
+    (recv / "b.txt").write_text("receiver-edit\n")          # tracked unstaged edit
+    pre_status = status(recv)
+    pre_b = (recv / "b.txt").read_text()
+
+    (prod / "secret").write_text("PRODUCER\n")              # producer now tracks it
+    git(prod, "add", "secret"); git(prod, "commit", "-qm", "c2")
+    bundles = tmp_path / "bundles"
+    meta = grs.snapshot_repo(prod, bundles, name="app")
+    bk = tmp_path / "bk"
+    grs.apply_repo(recv, meta["bundle"], meta, backup_dir=bk)
+    assert (recv / "secret").read_text() == "PRODUCER\n"    # apply won
+
+    res = grs.restore_backup(recv, bk, "app")
+    assert res["mode"] == "bundle"
+    assert res["restored_ignored"] == 1
+    assert status(recv) == pre_status                       # exact prior state
+    assert (recv / "b.txt").read_text() == pre_b
+    assert (recv / "secret").read_text() == "RECEIVER-SECRET\n"   # ignored restored
+
+
+def test_restore_backup_tar_mode(tmp_path):
+    """D1 restore: a populated non-git dir comes back verbatim, no .git left."""
+    prod = tmp_path / "p"; make_base_repo(prod)
+    bundles = tmp_path / "bundles"
+    meta = grs.snapshot_repo(prod, bundles, name="app")
+    recv = tmp_path / "recv"; recv.mkdir()
+    (recv / "precious.txt").write_text("KEEP\n")
+    bk = tmp_path / "bk"
+    grs.apply_repo(recv, meta["bundle"], meta, backup_dir=bk)   # created -> tar backup
+    assert not (recv / "precious.txt").exists()
+
+    res = grs.restore_backup(recv, bk, "app")
+    assert res["mode"] == "tar"
+    assert (recv / "precious.txt").read_text() == "KEEP\n"
+    assert not (recv / ".git").exists()                         # back to a plain dir
+
+
+def test_prune_backup_runs(tmp_path):
+    root = tmp_path / "backups"; root.mkdir()
+    for ts in ("20260101-000001-git", "20260101-000002-git", "20260101-000003-git"):
+        (root / ts).mkdir()
+    (root / "unrelated").mkdir()                                 # not a -git run
+    removed = grs.prune_backup_runs(root, keep=2)
+    assert removed == 1
+    assert not (root / "20260101-000001-git").exists()
+    assert (root / "20260101-000002-git").exists()
+    assert (root / "20260101-000003-git").exists()
+    assert (root / "unrelated").exists()
+
+
+def test_git_cli_restore_roundtrip(tmp_path, monkeypatch):
+    monkeypatch.setenv("HOME", str(tmp_path))
+    from fsync.cli import main
+
+    repo = tmp_path / "workspaces" / "primary" / "app"
+    make_base_repo(repo); make_mixed_state(repo)
+    cfg = _write_git_config(tmp_path)
+    assert main(["git", "snapshot", "--config", str(cfg)]) == 0
+    snap_status = status(repo)
+
+    (repo / "a.txt").write_text("diverged\n")               # move away from snapshot
+    assert main(["git", "apply", "--config", str(cfg)]) == 0
+    assert status(repo) == snap_status                      # applied
+    # now restore undoes the apply back to the receiver's pre-apply state
+    assert main(["git", "restore", "--config", str(cfg)]) == 0
+    assert (repo / "a.txt").read_text() == "diverged\n"     # receiver's prior edit is back

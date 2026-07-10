@@ -274,11 +274,12 @@ def read_meta(bundle_dir: str | Path, name: str) -> dict[str, Any]:
     return json.loads(mp.read_text())
 
 
-def _backup_receiver(repo: str | Path, backup_dir: Path, name: str) -> str | None:
+def _backup_receiver(repo: str | Path, backup_dir: Path, name: str,
+                     rel: str | None = None) -> str | None:
     """R15: bundle the receiver's own current state so an apply is reversible.
-    Writes a sidecar meta recording the receiver's prior branch/HEAD/dirty so the
-    bundle is interpretable for recovery. Returns the backup bundle path, or None
-    for an empty/unborn repo (nothing to lose)."""
+    Writes a sidecar meta (receiver branch/HEAD/dirty + rel + mode) so the bundle
+    is interpretable by ``restore_backup``. Returns the backup bundle path, or
+    None for an empty/unborn repo (nothing to lose)."""
     if not _has_head(repo):
         return None
     state = capture_state(repo, ref=WIP_REF)  # receiver's own 3-tree snapshot
@@ -286,7 +287,7 @@ def _backup_receiver(repo: str | Path, backup_dir: Path, name: str) -> str | Non
     bpath = backup_dir / f"{name}.pre-apply.bundle"
     _bundle(repo, bpath, "--branches", "--tags", WIP_REF, "HEAD")
     (backup_dir / f"{name}.pre-apply.meta.json").write_text(
-        json.dumps({**state.to_meta(), "name": name}, indent=2))
+        json.dumps({**state.to_meta(), "name": name, "rel": rel, "mode": "bundle"}, indent=2))
     return str(bpath)
 
 
@@ -407,6 +408,8 @@ def apply_repo(repo: str | Path, bundle_path: str | Path, meta: dict[str, Any], 
         # empty/missing directory has nothing to lose.
         if repo.exists() and any(repo.iterdir()):
             raw_backup = _tar_dir(repo, backup_dir, name)
+            (backup_dir / f"{name}.pre-apply.meta.json").write_text(
+                json.dumps({"name": name, "rel": meta.get("rel"), "mode": "tar"}, indent=2))
         repo.mkdir(parents=True, exist_ok=True)
         _git(repo, "init", "-q")
     else:
@@ -424,8 +427,8 @@ def apply_repo(repo: str | Path, bundle_path: str | Path, meta: dict[str, Any], 
     backup = raw_backup
     saved_ignored = 0
     if not created:
-        backup = _backup_receiver(repo, backup_dir, name)                     # R15
-        saved_ignored = _backup_ignored_collisions(repo, meta["cwork"],       # D3
+        backup = _backup_receiver(repo, backup_dir, name, rel=meta.get("rel"))  # R15
+        saved_ignored = _backup_ignored_collisions(repo, meta["cwork"],         # D3
                                                    backup_dir, name)
 
     try:
@@ -472,3 +475,73 @@ def preview_apply(repo: str | Path, meta: dict[str, Any]) -> dict[str, Any]:
         "would_change": (not exists) or local_head != meta["head"] or bool(local_dirty)
                         or meta["dirty"],
     }
+
+
+# --------------------------------------------------------------------------- #
+# restore + retention (P5.4): make R15 backups a one-command undo             #
+# --------------------------------------------------------------------------- #
+
+def restore_backup(repo: str | Path, backup_dir: str | Path, name: str) -> dict[str, Any]:
+    """Inverse of ``apply_repo``: put the receiver's repo back to the exact state
+    it was in before an apply, using the artifacts the apply wrote
+    (``<name>.pre-apply.{bundle,meta.json,dir.tar.gz}`` + ``<name>.ignored/``)."""
+    repo = Path(repo)
+    backup_dir = Path(backup_dir)
+    meta_p = backup_dir / f"{name}.pre-apply.meta.json"
+    if not meta_p.exists():
+        raise GitSyncError(f"no backup for '{name}' in {backup_dir}")
+    meta = json.loads(meta_p.read_text())
+
+    if meta.get("mode") == "tar":
+        # D1 case: the receiver was a populated non-git dir. Wipe what apply
+        # created and extract the original tree back.
+        tar = backup_dir / f"{name}.pre-apply.dir.tar.gz"
+        if not tar.exists():
+            raise GitSyncError(f"tar backup missing: {tar}")
+        if repo.exists():
+            for child in repo.iterdir():
+                shutil.rmtree(child) if child.is_dir() and not child.is_symlink() else child.unlink()
+        repo.mkdir(parents=True, exist_ok=True)
+        with tarfile.open(tar) as tf:
+            tf.extractall(repo)  # our own archive
+        return {"repo": str(repo), "name": name, "mode": "tar"}
+
+    # bundle case: reconstruct the receiver's own prior working state
+    bundle = backup_dir / f"{name}.pre-apply.bundle"
+    if not bundle.exists():
+        raise GitSyncError(f"backup bundle missing: {bundle}")
+    if not is_git_repo(repo):
+        repo.mkdir(parents=True, exist_ok=True)
+        _git(repo, "init", "-q")
+    _git(repo, "fetch", str(bundle),
+         f"refs/heads/*:{INCOMING}/heads/*",
+         f"refs/tags/*:{INCOMING}/tags/*",
+         f"{WIP_REF}:{INCOMING}/wip")
+    _reconstruct(repo, meta, mirror_branches=False)
+
+    # restore any ignored files apply had copied aside (producer overwrote them)
+    restored_ignored = 0
+    ign = backup_dir / f"{name}.ignored"
+    if ign.is_dir():
+        for src in ign.rglob("*"):
+            if src.is_file() or src.is_symlink():
+                out = repo / src.relative_to(ign)
+                out.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(src, out, follow_symlinks=False)
+                restored_ignored += 1
+    return {"repo": str(repo), "name": name, "mode": "bundle",
+            "branch": meta.get("branch"), "restored_ignored": restored_ignored}
+
+
+def prune_backup_runs(backup_root: str | Path, keep: int = 10) -> int:
+    """Keep only the newest ``keep`` per-run backup dirs (``*-git``); remove
+    older ones. Timestamp-prefixed names sort chronologically. Returns the number
+    removed."""
+    backup_root = Path(backup_root)
+    if keep <= 0 or not backup_root.exists():
+        return 0
+    runs = sorted(d for d in backup_root.iterdir() if d.is_dir() and d.name.endswith("-git"))
+    victims = runs[:-keep] if len(runs) > keep else []
+    for d in victims:
+        shutil.rmtree(d, ignore_errors=True)
+    return len(victims)

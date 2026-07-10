@@ -729,7 +729,8 @@ def build_parser() -> argparse.ArgumentParser:
     git_sub = p_git.add_subparsers(dest="git_cmd")
     for _name, _help in (("snapshot", "Producer: capture kind:git profiles' repos into bundles"),
                          ("apply", "Receiver: reconstruct exact working state (backs the receiver up first)"),
-                         ("status", "Preview: what an apply would change (no mutation)")):
+                         ("status", "Preview: what an apply would change (no mutation)"),
+                         ("restore", "Receiver: undo an apply from its pre-apply backup")):
         gp = git_sub.add_parser(_name, help=_help)
         gp.add_argument("--config", help="Profiles YAML (default: ~/.config/fsync/sync-profiles.yaml)")
         gp.add_argument("--bundle-dir", help=f"Bundle staging dir (default: {'~/.fsync/git-bundles'})")
@@ -738,12 +739,28 @@ def build_parser() -> argparse.ArgumentParser:
             gp.add_argument("--profile", action="append", default=None,
                             help="Limit to git profile NAME (repeatable); default: all git profiles")
             gp.add_argument("--all", action="store_true", help="Snapshot every git profile (default)")
-        else:  # apply / status act on bundles present in the bundle dir
+        else:  # apply / status / restore act on a single repo or all discovered
             gp.add_argument("--repo", help="Limit to a single repo by bundle NAME")
         if _name == "apply":
             gp.add_argument("--mirror-branches", action="store_true",
                             help="Prune local branches the producer no longer has (safe: receiver is backed up)")
-            gp.add_argument("--backup-root", help="Where pre-apply receiver backups go (default: ~/.fsync/backups)")
+            gp.add_argument("--keep", type=int, default=10,
+                            help="Keep only the newest N pre-apply backup runs (default 10; 0 = keep all)")
+        if _name in ("apply", "restore"):
+            gp.add_argument("--backup-root", help="Where pre-apply receiver backups live (default: ~/.fsync/backups)")
+        if _name == "restore":
+            gp.add_argument("--from", dest="from_dir",
+                            help="Restore from this specific backup-run dir (default: newest containing the repo)")
+
+    # meta: meta-synchronization — fsync version/capabilities + config compatibility
+    p_meta = sub.add_parser("meta", help="Meta-sync: fsync version/capabilities + config compatibility across boxes")
+    meta_sub = p_meta.add_subparsers(dest="meta_cmd")
+    for _n, _h in (("version", "Print this box's fsync version + capabilities (JSON)"),
+                   ("check", "Validate the local config against this build; list profiles"),
+                   ("status", "Compare local vs peer fsync version/capabilities + config compatibility")):
+        mp = meta_sub.add_parser(_n, help=_h)
+        mp.add_argument("--config", help="Profiles YAML (default: ~/.config/fsync/sync-profiles.yaml)")
+        mp.add_argument("--verbose", action="count", default=0, help="Increase verbosity")
 
     # tui: plan -> one confirmation -> detached run with live, re-attachable progress
     p_tui = sub.add_parser("tui", help="Terminal UI for sync: preview, confirm once, watch progress (runner survives the UI)")
@@ -789,6 +806,10 @@ def main(argv: list[str] | None = None) -> int:
         from .homesync import cmd_git
 
         return cmd_git(args)
+    if args.cmd == "meta":
+        from .homesync import cmd_meta
+
+        return cmd_meta(args)
     if args.cmd == "tui":
         try:
             from .tui import run_tui
