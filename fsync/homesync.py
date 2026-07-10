@@ -541,21 +541,36 @@ def peer_home(peer: Peer) -> str:
     return peer.home
 
 
+def _engine_push_args(pkg_dir: Path) -> tuple[list[str], str]:
+    """(rsync source args, destination rel-path) for pushing the engine.
+
+    From a source install the package DIRECTORY is pushed (delta, as before).
+    From a deployed zipapp ``pkg_dir`` is a zip member, not a directory — push
+    the running .pyz itself instead: python imports fsync straight off a zip on
+    PYTHONPATH, so one file IS the engine (P6.4 live-test finding)."""
+    if pkg_dir.is_dir():
+        return (["--delete", "--exclude", "__pycache__", f"{pkg_dir}/"],
+                f"{ENGINE_DIR}/fsync/")
+    archive = pkg_dir.parent  # .../fsync.pyz/fsync -> the .pyz file
+    if not archive.is_file():
+        raise HomesyncError(f"cannot locate engine source (pkg at {pkg_dir})")
+    return ([str(archive)], f"{ENGINE_DIR}/fsync.pyz")
+
+
 def ensure_peer_engine(peer: Peer) -> None:
-    """Push this box's fsync package to the peer so it can index locally.
+    """Push this box's fsync engine to the peer so it can index locally.
 
     The peer needs nothing pre-installed beyond python3: ``fsync index`` only
-    imports the standard library, and the engine copy is refreshed (delta) on
-    every run so both sides always execute the same code.
-    """
-    pkg_dir = Path(__file__).resolve().parent
+    imports the standard library, and the engine copy is refreshed on every
+    run so both sides always execute the same code. The engine is the package
+    dir (source install) or the running .pyz (deployed box)."""
+    src_args, dst = _engine_push_args(Path(__file__).resolve().parent)
     mk = _ssh(peer, f"mkdir -p {shlex.quote(ENGINE_DIR)}/fsync", timeout=30)
     if mk.returncode != 0:
         raise HomesyncError(f"peer engine dir creation failed: {mk.stderr.strip()}")
     proc = subprocess.run(
-        ["rsync", "-a", "--delete", "--exclude", "__pycache__",
-         "-e", "ssh " + " ".join(SSH_OPTS),
-         f"{pkg_dir}/", f"{peer.target}:{ENGINE_DIR}/fsync/"],
+        ["rsync", "-a", "-e", "ssh " + " ".join(SSH_OPTS),
+         *src_args, f"{peer.target}:{dst}"],
         capture_output=True, text=True, timeout=120,
     )
     if proc.returncode != 0:
@@ -575,7 +590,10 @@ def remote_index(
     if _ssh(peer, f"test -d {shlex.quote(root)}", timeout=30).returncode != 0:
         return []  # absent on the peer -> everything local flows over as additive
     parts = [
-        f"PYTHONPATH=$HOME/{ENGINE_DIR}",
+        # both engine forms on PYTHONPATH: the .pyz (pushed by a deployed box —
+        # listed first, it wins over any stale dir copy from the pre-pyz era)
+        # and the package dir (pushed by a source install)
+        f"PYTHONPATH=$HOME/{ENGINE_DIR}/fsync.pyz:$HOME/{ENGINE_DIR}",
         "python3", "-m", "fsync.cli", "index", shlex.quote(root),
         "--format", "jsonl", "--cache", "--workers", str(workers), "--hash", hash_algo,
     ]

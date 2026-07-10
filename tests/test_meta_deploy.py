@@ -209,6 +209,24 @@ def test_deploy_to_partial_mv_rolls_back_and_raises(monkeypatch):
     assert any(_is_restore(c) for c in fake.cmds)
 
 
+def test_engine_push_args_source_vs_pyz(tmp_path):
+    """P6.4 live-test finding: from a zipapp the engine push must send the .pyz
+    itself (the package 'dir' is a zip member rsync can't read)."""
+    from fsync.homesync import ENGINE_DIR, HomesyncError, _engine_push_args
+
+    pkg = tmp_path / "fsync"; pkg.mkdir()                 # source install: a real dir
+    src_args, dst = _engine_push_args(pkg)
+    assert dst == f"{ENGINE_DIR}/fsync/" and "--delete" in src_args
+
+    pyz = tmp_path / "fsync.pyz"; pyz.write_bytes(b"PK")  # zipapp: pkg is zip member
+    src_args, dst = _engine_push_args(pyz / "fsync")
+    assert dst == f"{ENGINE_DIR}/fsync.pyz"
+    assert src_args == [str(pyz)]
+
+    with pytest.raises(HomesyncError):                    # neither dir nor zip
+        _engine_push_args(tmp_path / "ghost" / "fsync")
+
+
 def test_deploy_to_backup_failure_aborts_before_overwrite(monkeypatch):
     """Review #2: a FAILED backup cp (disk full, perms) must abort the deploy
     before anything is pushed or overwritten — never proceed without a .bak."""
