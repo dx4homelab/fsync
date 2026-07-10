@@ -72,8 +72,14 @@ boxes, box-to-box, touching no external remote.*
   unconditional backup is the safety net instead. Revisited in Roadmap.
 - **Bidirectional git-sync.** One-way fury4dx → minis4dx, matching current file
   profiles.
-- Stashes, reflog, per-repo hooks/config, **git-ignored** files (build output),
-  submodule working states, git-LFS. All listed in Roadmap.
+- Stashes, reflog, per-repo hooks/config, submodule working states, git-LFS
+  object content. All listed in Roadmap.
+- **Git-ignored files and stray nested repos on the receiver are left untouched**
+  (`clean -fdq`, no `-x`/`-ff`) — never wiped, but also not made to match the
+  producer, so `git status` may show a stray nested repo. R13's worktree
+  identity is over *tracked + untracked-non-ignored* content; ignored build
+  output is out of scope by design (you don't want `node_modules` nuked). Empty
+  untracked directories don't survive (git can't track them).
 
 ## Layered architecture
 
@@ -224,9 +230,41 @@ receiver's prior work; simulate a dirty receiver and verify recovery.
   `load_config`, repo discovery under `paths`, `fsync git snapshot|apply|status`;
   snapshot wired into `sync run` (producer path); designed to be carried by a
   `git-bundles/` files-profile. CLI integration + end-to-end smoke green.
-- **P5.3 — safe-apply hardening + adversarial review.** TODO next. `index.lock`/
-  busy guard, backup retention/GC, submodule/LFS detect-and-warn, an adversarial
-  review pass (the P4 pattern), and enabling it on the live config.
+- **P5.3 — safe-apply hardening + adversarial review.** LARGELY DONE (see
+  outcomes below). Repo-busy guard, submodule/LFS warnings, adversarial
+  edge-case tests, and the fixes from a 17-finding adversarial review. TODO:
+  backup retention/GC, a `restore_backup()` inverse, and the live-config deploy.
+
+### Adversarial review outcomes (P5.3)
+
+A background adversarial review (git 2.55, all findings reproduced) surfaced 11
+issues. Resolution:
+
+**Fixed (data-loss / correctness):**
+- **D1** — apply into a *populated non-git directory* used to skip the backup
+  (`created=True`) and then `clean` wiped it. Now: only truly empty/missing dirs
+  skip the backup; a populated non-git dir is tar'd to `backup_dir` first.
+- **D3** — a receiver git-*ignored* file at a path the producer now *tracks* was
+  overwritten and absent from the bundle backup (`add -A` skips ignored). Now:
+  ignored collisions with the incoming tree are copied to
+  `backup_dir/<name>.ignored/` before reconstruct.
+- **F3** — tags were fetched but never recreated. Now reconstructed.
+- **R1/F2** — `index.lock` / mid-merge-rebase repos: `repo_busy()` guard skips on
+  snapshot, refuses on apply, at both the CLI and library layers.
+- **R3** — pre-apply bundle now ships a `.pre-apply.meta.json` (receiver
+  branch/HEAD/dirty) so it's interpretable for recovery.
+- **R2** — a mid-reconstruct failure now raises pointing at the backup path.
+- **R4** — `is_git_repo` uses `--show-toplevel` equality (handles linked
+  worktrees / `.git` symlinks).
+
+**Accepted + documented (safety-over-fidelity):** D4 (ignored strays), F1 (stray
+nested repos) — `clean` deliberately keeps them (no `-x`/`-ff`), so `git status`
+can differ; wiping them is worse than the mismatch. Empty untracked dirs aren't
+restorable (git limitation). See Non-goals.
+
+**Verified non-bug:** `read-tree --reset -u` force-overwrites untracked
+collisions and dir↔file flips (scratchpad proof), so reconstruct needs no
+pre-clean.
 - **P5.4 — (Roadmap, out of v1 scope).** Incremental bundles (`<base>..HEAD`,
   needs a basis ref) + a state layer (sqlite sidecar → central Postgres control
   plane per `fsync-control-plane`) enabling **divergence detection** and thus

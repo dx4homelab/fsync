@@ -23,8 +23,10 @@ from __future__ import annotations
 import fnmatch
 import json
 import os
+import shutil
 import socket
 import subprocess
+import tarfile
 import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -55,7 +57,8 @@ class GitSyncError(RuntimeError):
 # --------------------------------------------------------------------------- #
 
 def _git(repo: str | Path, *args: str, index_file: str | None = None,
-         check: bool = True, timeout: int = 300) -> subprocess.CompletedProcess:
+         input_text: str | None = None, check: bool = True,
+         timeout: int = 300) -> subprocess.CompletedProcess:
     env = {**os.environ, **_SNAP_ENV,
            # Never let the user's global/system config change plumbing behaviour.
            "GIT_CONFIG_SYSTEM": os.environ.get("GIT_CONFIG_SYSTEM", "/dev/null")}
@@ -63,7 +66,7 @@ def _git(repo: str | Path, *args: str, index_file: str | None = None,
         env["GIT_INDEX_FILE"] = index_file
     proc = subprocess.run(
         ["git", "-C", str(repo), *args],
-        capture_output=True, text=True, env=env, timeout=timeout,
+        capture_output=True, text=True, env=env, timeout=timeout, input=input_text,
     )
     if check and proc.returncode != 0:
         raise GitSyncError(
@@ -78,16 +81,60 @@ def _out(repo: str | Path, *args: str, **kw) -> str:
 
 
 def is_git_repo(path: str | Path) -> bool:
-    """True if ``path`` is the top of a git working tree (has a .git)."""
+    """True if ``path`` is the TOP of a git working tree (not a subdir of one, not
+    a bare repo). Uses ``--show-toplevel`` rather than a ``.git`` existence
+    heuristic so linked worktrees (``.git`` file) work and ``.git`` symlinks to a
+    deleted target don't misclassify."""
     p = Path(path)
     if not p.is_dir():
         return False
-    return _git(p, "rev-parse", "--is-inside-work-tree", check=False).returncode == 0 \
-        and (p / ".git").exists()
+    top = _git(p, "rev-parse", "--show-toplevel", check=False)
+    if top.returncode != 0 or not top.stdout.strip():
+        return False
+    try:
+        return Path(top.stdout.strip()).resolve() == p.resolve()
+    except OSError:
+        return False
 
 
 def _has_head(repo: str | Path) -> bool:
     return _git(repo, "rev-parse", "--verify", "-q", "HEAD", check=False).returncode == 0
+
+
+def repo_busy(repo: str | Path) -> str | None:
+    """A short reason string when the repo has an operation in flight — so we
+    must neither snapshot nor mutate it — else None. Guards against racing a
+    concurrent git process (index.lock) or clobbering an in-progress
+    merge/rebase/cherry-pick/revert/bisect."""
+    proc = _git(repo, "rev-parse", "--absolute-git-dir", check=False)
+    if proc.returncode != 0:
+        return None
+    gd = Path(proc.stdout.strip())
+    if (gd / "index.lock").exists():
+        return "index.lock present (a git process is running)"
+    for marker, label in (("MERGE_HEAD", "merge"), ("rebase-merge", "rebase"),
+                          ("rebase-apply", "rebase/am"), ("CHERRY_PICK_HEAD", "cherry-pick"),
+                          ("REVERT_HEAD", "revert"), ("BISECT_LOG", "bisect")):
+        if (gd / marker).exists():
+            return f"{label} in progress"
+    return None
+
+
+def special_warnings(repo: str | Path) -> list[str]:
+    """Fidelity caveats worth surfacing: submodule working state and git-LFS
+    object content don't travel in a working-tree bundle (v1 non-goals)."""
+    repo = Path(repo)
+    out: list[str] = []
+    if (repo / ".gitmodules").exists():
+        out.append("submodules present — nested submodule working state is NOT "
+                   "captured (gitlink commit only)")
+    ga = repo / ".gitattributes"
+    try:
+        if ga.exists() and "filter=lfs" in ga.read_text(errors="ignore"):
+            out.append("git-LFS in use — LFS pointer files travel, not object content")
+    except OSError:
+        pass
+    return out
 
 
 # --------------------------------------------------------------------------- #
@@ -204,6 +251,9 @@ def snapshot_repo(repo: str | Path, bundle_dir: str | Path, *,
     repo = Path(repo)
     name = name or repo.name
     bundle_dir = Path(bundle_dir)
+    busy = repo_busy(repo)
+    if busy:
+        raise GitSyncError(f"{repo}: {busy} — not snapshotting (repo not quiescent)")
     state = capture_state(repo)
     bundle_path = bundle_dir / f"{name}.bundle"
     size = _bundle(repo, bundle_path, "--branches", "--tags", WIP_REF, "HEAD")
@@ -226,15 +276,54 @@ def read_meta(bundle_dir: str | Path, name: str) -> dict[str, Any]:
 
 def _backup_receiver(repo: str | Path, backup_dir: Path, name: str) -> str | None:
     """R15: bundle the receiver's own current state so an apply is reversible.
-    Returns the backup bundle path, or None for an empty/unborn repo (nothing to
-    lose)."""
+    Writes a sidecar meta recording the receiver's prior branch/HEAD/dirty so the
+    bundle is interpretable for recovery. Returns the backup bundle path, or None
+    for an empty/unborn repo (nothing to lose)."""
     if not _has_head(repo):
         return None
-    capture_state(repo, ref=WIP_REF)  # receiver's own 3-tree snapshot
+    state = capture_state(repo, ref=WIP_REF)  # receiver's own 3-tree snapshot
     backup_dir.mkdir(parents=True, exist_ok=True)
     bpath = backup_dir / f"{name}.pre-apply.bundle"
     _bundle(repo, bpath, "--branches", "--tags", WIP_REF, "HEAD")
+    (backup_dir / f"{name}.pre-apply.meta.json").write_text(
+        json.dumps({**state.to_meta(), "name": name}, indent=2))
     return str(bpath)
+
+
+def _tar_dir(repo: Path, backup_dir: Path, name: str) -> str:
+    """D1: preserve a populated NON-git directory verbatim before
+    init-from-bundle + clean would wipe it. Returns the archive path."""
+    backup_dir.mkdir(parents=True, exist_ok=True)
+    tar_path = backup_dir / f"{name}.pre-apply.dir.tar.gz"
+    with tarfile.open(tar_path, "w:gz") as tf:
+        tf.add(str(repo), arcname=".")
+    return str(tar_path)
+
+
+def _backup_ignored_collisions(repo: Path, cwork: str, backup_dir: Path, name: str) -> int:
+    """D3: the pre-apply bundle (git add -A) skips git-ignored files, but
+    reconstruct overwrites any receiver file at a path the producer tracks —
+    ignored ones included. Copy those ignored collisions aside so nothing is lost.
+    Returns the count saved. Requires the producer objects already fetched."""
+    listing = _git(repo, "ls-tree", "-r", "-z", "--name-only", cwork).stdout
+    producer_paths = [p for p in listing.split("\0") if p]
+    existing = [p for p in producer_paths
+                if (repo / p).is_symlink() or (repo / p).is_file()]
+    if not existing:
+        return 0
+    # check-ignore reports only paths matching ignore rules AND not tracked —
+    # exactly the files the normal bundle backup would miss.
+    proc = _git(repo, "check-ignore", "-z", "--stdin",
+                input_text="\0".join(existing) + "\0", check=False)
+    ignored = [p for p in proc.stdout.split("\0") if p]
+    if not ignored:
+        return 0
+    dest = backup_dir / f"{name}.ignored"
+    for p in ignored:
+        out = dest / p
+        out.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(repo / p, out, follow_symlinks=False)
+    return len(ignored)
 
 
 def _reconstruct(repo: str | Path, meta: dict[str, Any], *, mirror_branches: bool) -> None:
@@ -255,6 +344,13 @@ def _reconstruct(repo: str | Path, meta: dict[str, Any], *, mirror_branches: boo
         producer_names.add(bname)
         tip = _out(repo, "rev-parse", ref)
         _git(repo, "update-ref", f"refs/heads/{bname}", tip)
+
+    # Recreate producer tags too (fidelity of `git tag`); they were fetched.
+    for ref in _out(repo, "for-each-ref", "--format=%(refname)",
+                    f"{INCOMING}/tags/").splitlines():
+        if ref:
+            tname = ref[len(f"{INCOMING}/tags/"):]
+            _git(repo, "update-ref", f"refs/tags/{tname}", _out(repo, "rev-parse", ref))
 
     # Point HEAD at the producer's checked-out branch (or detach at HEAD commit).
     if branch:
@@ -303,20 +399,44 @@ def apply_repo(repo: str | Path, bundle_path: str | Path, meta: dict[str, Any], 
     if not bundle_path.exists():
         raise GitSyncError(f"bundle not found: {bundle_path}")
 
-    created = False
-    if not is_git_repo(repo):
+    created = not is_git_repo(repo)
+    raw_backup = None
+    if created:
+        # D1: a populated NON-git directory holds real user files that
+        # reconstruct's clean would wipe — preserve it verbatim first. An
+        # empty/missing directory has nothing to lose.
+        if repo.exists() and any(repo.iterdir()):
+            raw_backup = _tar_dir(repo, backup_dir, name)
         repo.mkdir(parents=True, exist_ok=True)
         _git(repo, "init", "-q")
-        created = True
+    else:
+        busy = repo_busy(repo)
+        if busy:
+            raise GitSyncError(f"{repo}: receiver {busy} — refusing to apply")
 
-    backup = None if created else _backup_receiver(repo, backup_dir, name)
-
-    # Bring producer objects/refs in from the bundle (never touches local refs).
+    # Fetch producer objects first (into INCOMING; never touches local refs) so
+    # the backup can inspect the incoming tree for ignored-file collisions.
     _git(repo, "fetch", str(bundle_path),
          f"refs/heads/*:{INCOMING}/heads/*",
          f"refs/tags/*:{INCOMING}/tags/*",
          f"{WIP_REF}:{INCOMING}/wip")
-    _reconstruct(repo, meta, mirror_branches=mirror_branches)
+
+    backup = raw_backup
+    saved_ignored = 0
+    if not created:
+        backup = _backup_receiver(repo, backup_dir, name)                     # R15
+        saved_ignored = _backup_ignored_collisions(repo, meta["cwork"],       # D3
+                                                   backup_dir, name)
+
+    try:
+        _reconstruct(repo, meta, mirror_branches=mirror_branches)
+    except GitSyncError as e:
+        # R2: refs may have moved before the worktree finished — the repo can be
+        # left partial. Point the operator at the recoverable backup.
+        raise GitSyncError(
+            f"{name}: apply failed mid-reconstruct ({e}); receiver may be partial "
+            f"— restore from {backup or raw_backup or '(no backup: repo was empty)'}"
+        ) from e
 
     return {
         "repo": str(repo),
@@ -326,6 +446,7 @@ def apply_repo(repo: str | Path, bundle_path: str | Path, meta: dict[str, Any], 
         "dirty": meta["dirty"],
         "created": created,
         "backup": backup,
+        "saved_ignored": saved_ignored,
         "applied": True,
     }
 

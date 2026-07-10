@@ -850,11 +850,18 @@ def snapshot_git_profile(prof: Profile, bundle_dir: str | Path, log) -> dict[str
         log(f"  {prof.name}: no git repos found under {prof.paths}")
         return out
     for r in repos:
+        busy = grs.repo_busy(r["path"])
+        if busy:
+            out["repos"].append({"name": r["name"], "rel": r["rel"], "skipped": busy})
+            log(f"  {prof.name}: SKIP {r['rel']} — {busy}")
+            continue
         meta = grs.snapshot_repo(r["path"], bundle_dir, name=r["name"], rel=r["rel"])
         out["repos"].append({"name": r["name"], "rel": r["rel"], "branch": meta["branch"],
                              "dirty": meta["dirty"], "bytes": meta["bytes"]})
         log(f"  {prof.name}: snapshot {r['rel']} ({meta['bytes']}B"
             f"{', dirty' if meta['dirty'] else ''})")
+        for w in grs.special_warnings(r["path"]):
+            log(f"  {prof.name}: warn {r['rel']}: {w}")
     return out
 
 
@@ -951,8 +958,17 @@ def cmd_git(args) -> int:
     for meta in metas:
         rel = meta.get("rel") or meta["name"]
         bundle = bundle_dir / f"{meta['name']}.bundle"
+        target = home / rel
+        # Never mutate a receiver repo that has a git operation in flight —
+        # applying would race a running git or clobber a merge/rebase.
+        if grs.is_git_repo(target):
+            busy = grs.repo_busy(target)
+            if busy:
+                print(f"{meta['name']}: SKIP {rel} — receiver {busy}", file=sys.stderr)
+                rc = 1
+                continue
         try:
-            res = grs.apply_repo(home / rel, bundle, meta, backup_dir=backup_dir,
+            res = grs.apply_repo(target, bundle, meta, backup_dir=backup_dir,
                                  mirror_branches=getattr(args, "mirror_branches", False))
         except grs.GitSyncError as e:
             print(f"{meta['name']}: ERROR {e}", file=sys.stderr)

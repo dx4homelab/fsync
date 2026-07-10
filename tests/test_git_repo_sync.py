@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import hashlib
 import os
+import shutil
 import subprocess
 
 import pytest
@@ -318,3 +319,157 @@ def test_load_config_kind_validation(tmp_path, monkeypatch):
     bad.write_text("peer:\n  host: h\nprofiles:\n  x:\n    kind: bogus\n    paths: [a]\n")
     with pytest.raises(HomesyncError):
         load_config(str(bad))
+
+
+# --------------------------------------------------------------------------- #
+# P5.3 hardening: adversarial edge cases + safety guards                       #
+# --------------------------------------------------------------------------- #
+
+def test_untracked_collision_and_dir_file_flip(tmp_path):
+    """A receiver untracked file colliding with an incoming tracked path, and a
+    dir<->file type flip, must both resolve to the producer's state (R15 makes
+    the clobber safe; `read-tree --reset -u` forces it)."""
+    prod = tmp_path / "p"; make_base_repo(prod)
+    (prod / "collide.txt").write_text("PRODUCER\n"); git(prod, "add", "collide.txt")
+    target = status(prod)
+    bundles = tmp_path / "bundles"
+    meta = grs.snapshot_repo(prod, bundles, name="repo")
+
+    recv = tmp_path / "r"; clone(prod, recv)
+    (recv / "collide.txt").write_text("RECEIVER-UNTRACKED\n")   # collides w/ producer tracked
+    shutil.rmtree(recv / "sub"); (recv / "sub").write_text("was-a-dir\n")   # dir -> file
+
+    grs.apply_repo(recv, meta["bundle"], meta, backup_dir=tmp_path / "bk")
+    assert status(recv) == target
+    assert (recv / "collide.txt").read_text() == "PRODUCER\n"
+    assert (recv / "sub" / "c.txt").read_text() == "nested\n"   # dir restored
+
+
+def test_symlink_and_exec_bit_fidelity(tmp_path):
+    prod = tmp_path / "p"; make_base_repo(prod)
+    (prod / "run.sh").write_text("#!/bin/sh\necho hi\n"); os.chmod(prod / "run.sh", 0o755)
+    (prod / "link").symlink_to("a.txt")
+    git(prod, "add", "-A"); git(prod, "commit", "-qm", "c2")
+    (prod / "u.sh").write_text("#!/bin/sh\n"); os.chmod(prod / "u.sh", 0o755)   # untracked exec
+    (prod / "ulink").symlink_to("b.txt")                                        # untracked symlink
+    bundles = tmp_path / "bundles"
+    meta = grs.snapshot_repo(prod, bundles, name="repo")
+
+    recv = tmp_path / "r"; clone(prod, recv)
+    grs.apply_repo(recv, meta["bundle"], meta, backup_dir=tmp_path / "bk")
+    assert status(recv) == status(prod)
+    assert os.access(recv / "run.sh", os.X_OK)
+    assert os.access(recv / "u.sh", os.X_OK)
+    assert os.path.islink(recv / "link") and os.readlink(recv / "link") == "a.txt"
+    assert os.path.islink(recv / "ulink") and os.readlink(recv / "ulink") == "b.txt"
+
+
+def test_slash_branch_and_mirror_prune(tmp_path):
+    prod = tmp_path / "p"; make_base_repo(prod)
+    git(prod, "checkout", "-q", "-b", "feature/x")
+    (prod / "b.txt").write_text("on-feature\n")               # dirty on a slashed branch
+    bundles = tmp_path / "bundles"
+    meta = grs.snapshot_repo(prod, bundles, name="repo")
+    assert meta["branch"] == "feature/x"
+
+    recv = tmp_path / "r"; clone(prod, recv)
+    git(recv, "branch", "local/only")
+    grs.apply_repo(recv, meta["bundle"], meta, backup_dir=tmp_path / "bk",
+                   mirror_branches=True)
+    assert git(recv, "symbolic-ref", "--short", "HEAD") == "feature/x"
+    names = set(git(recv, "for-each-ref", "--format=%(refname:short)", "refs/heads/").split())
+    assert "feature/x" in names and "local/only" not in names
+    assert status(recv) == status(prod)
+
+
+def test_repo_busy_detection(tmp_path):
+    repo = tmp_path / "r"; make_base_repo(repo)
+    assert grs.repo_busy(repo) is None
+    lock = repo / ".git" / "index.lock"; lock.write_text("")
+    assert grs.repo_busy(repo) and "index.lock" in grs.repo_busy(repo)
+    lock.unlink()
+    (repo / ".git" / "MERGE_HEAD").write_text("deadbeef\n")
+    assert "merge" in grs.repo_busy(repo)
+
+
+def test_apply_refuses_busy_receiver(tmp_path, monkeypatch):
+    monkeypatch.setenv("HOME", str(tmp_path))
+    from fsync.cli import main
+
+    repo = tmp_path / "workspaces" / "primary" / "app"
+    make_base_repo(repo); make_mixed_state(repo)
+    cfg = _write_git_config(tmp_path)
+    assert main(["git", "snapshot", "--config", str(cfg)]) == 0
+
+    before = status(repo)
+    (repo / ".git" / "index.lock").write_text("")               # receiver "busy"
+    rc = main(["git", "apply", "--config", str(cfg)])
+    (repo / ".git" / "index.lock").unlink()
+    assert rc == 1
+    assert status(repo) == before                               # untouched
+
+
+def test_special_warnings(tmp_path):
+    repo = tmp_path / "r"; make_base_repo(repo)
+    assert grs.special_warnings(repo) == []
+    (repo / ".gitmodules").write_text('[submodule "x"]\n\tpath = x\n')
+    (repo / ".gitattributes").write_text("*.bin filter=lfs diff=lfs merge=lfs\n")
+    w = grs.special_warnings(repo)
+    assert any("submodule" in x for x in w)
+    assert any("LFS" in x for x in w)
+
+
+def test_apply_into_populated_non_git_dir_is_backed_up(tmp_path):
+    """D1 (data-loss): a populated NON-git dir must be preserved before the
+    init-from-bundle path's clean would wipe it."""
+    prod = tmp_path / "p"; make_base_repo(prod); make_mixed_state(prod)
+    bundles = tmp_path / "bundles"
+    meta = grs.snapshot_repo(prod, bundles, name="repo")
+
+    recv = tmp_path / "recv"; recv.mkdir()
+    (recv / "precious.txt").write_text("DO NOT LOSE\n")
+    (recv / "nested").mkdir(); (recv / "nested" / "k.txt").write_text("keep\n")
+
+    res = grs.apply_repo(recv, meta["bundle"], meta, backup_dir=tmp_path / "bk")
+    assert res["created"] is True
+    assert res["backup"] and res["backup"].endswith(".tar.gz")
+    assert status(recv) == status(prod)             # producer state applied
+    assert not (recv / "precious.txt").exists()     # overwritten...
+    import tarfile                                   # ...but recoverable from the tar
+    with tarfile.open(res["backup"]) as tf:
+        names = tf.getnames()
+    assert any(n.endswith("precious.txt") for n in names)
+    assert any(n.endswith("nested/k.txt") for n in names)
+
+
+def test_apply_ignored_collision_is_recoverable(tmp_path):
+    """D3 (data-loss): a receiver git-ignored file at a path the producer now
+    TRACKS is overwritten, but must be saved to the backup first."""
+    prod = tmp_path / "p"; make_base_repo(prod)
+    recv = tmp_path / "r"; clone(prod, recv)                 # receiver at c1
+    (recv / ".gitignore").write_text("config.local\n")
+    (recv / "config.local").write_text("RECEIVER-SECRET\n")  # ignored, untracked
+
+    # producer now tracks config.local
+    (prod / "config.local").write_text("PRODUCER-CONFIG\n")
+    git(prod, "add", "config.local"); git(prod, "commit", "-qm", "c2")
+    bundles = tmp_path / "bundles"
+    meta = grs.snapshot_repo(prod, bundles, name="repo")
+
+    res = grs.apply_repo(recv, meta["bundle"], meta, backup_dir=tmp_path / "bk")
+    assert res["saved_ignored"] == 1
+    assert (recv / "config.local").read_text() == "PRODUCER-CONFIG\n"   # producer wins (R13)
+    saved = tmp_path / "bk" / "repo.ignored" / "config.local"
+    assert saved.read_text() == "RECEIVER-SECRET\n"                     # recoverable (R15)
+
+
+def test_tags_are_reconstructed(tmp_path):
+    """F3: tags travel and are recreated on the receiver."""
+    prod = tmp_path / "p"; make_base_repo(prod)
+    git(prod, "tag", "v1.0")
+    bundles = tmp_path / "bundles"
+    meta = grs.snapshot_repo(prod, bundles, name="repo")
+
+    recv = tmp_path / "fresh"                                # init-from-bundle
+    grs.apply_repo(recv, meta["bundle"], meta, backup_dir=tmp_path / "bk")
+    assert "v1.0" in git(recv, "tag").split()
