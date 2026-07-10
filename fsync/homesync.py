@@ -944,6 +944,14 @@ def _discover_git_repos(prof: Profile) -> list[dict]:
     return out
 
 
+def git_profile_snapshots(prof: Profile) -> bool:
+    """A git profile produces bundles only on the pushing side (push/both). A
+    pull-only box is a receiver and must not create competing snapshots (they'd
+    race the producer's under newest-wins). Manual `fsync git snapshot` ignores
+    this — it's explicit — the gate is only for the automated `sync run`."""
+    return prof.kind == "git" and prof.direction in ("push", "both")
+
+
 def snapshot_git_profile(prof: Profile, bundle_dir: str | Path, log) -> dict[str, Any]:
     """Producer side: capture every repo in the profile into ``bundle_dir``."""
     bundle_dir = Path(bundle_dir).expanduser()
@@ -1357,11 +1365,20 @@ def _cmd_run(args) -> int:
     for prof in selected:
         try:
             if prof.kind == "git":
-                # Producer-side snapshot only: writes/refreshes local bundles
-                # (safe + idempotent). Bundles travel via a files-profile that
-                # carries the bundle dir; `fsync git apply` restores on demand.
-                report["profiles"][prof.name] = snapshot_git_profile(
-                    prof, DEFAULT_GIT_BUNDLE_DIR, log)
+                # A git profile snapshots ONLY on the producing side (push/both).
+                # A pull-only box is a receiver: snapshotting there would create
+                # competing bundles that could beat the producer's under
+                # newest-wins and make apply a no-op. Bundles arrive via the
+                # files-profile that carries the bundle dir; restore with
+                # `fsync git apply`.
+                if git_profile_snapshots(prof):
+                    report["profiles"][prof.name] = snapshot_git_profile(
+                        prof, DEFAULT_GIT_BUNDLE_DIR, log)
+                else:
+                    log(f"  {prof.name}: pull-only (receiver) — not snapshotting; "
+                        f"bundles arrive via file-sync, apply with `fsync git apply`")
+                    report["profiles"][prof.name] = {"kind": "git", "snapshotted": False,
+                                                     "reason": "pull-only receiver"}
             else:
                 report["profiles"][prof.name] = run_profile(
                     peer, prof, run_dir=run_dir, run_id=run_id,

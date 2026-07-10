@@ -523,6 +523,17 @@ def test_restore_backup_tar_mode(tmp_path):
     assert not (recv / ".git").exists()                         # back to a plain dir
 
 
+def test_git_profile_snapshots_only_on_producer():
+    """A pull-only (receiver) git profile must NOT snapshot in `sync run` — else
+    it races the producer's bundles under newest-wins."""
+    from fsync.homesync import Profile, git_profile_snapshots
+    mk = lambda kind, direction: Profile(name="r", paths=["p"], kind=kind, direction=direction)
+    assert git_profile_snapshots(mk("git", "push")) is True
+    assert git_profile_snapshots(mk("git", "both")) is True
+    assert git_profile_snapshots(mk("git", "pull")) is False    # receiver
+    assert git_profile_snapshots(mk("files", "push")) is False  # not a git profile
+
+
 def test_prune_backup_runs(tmp_path):
     root = tmp_path / "backups"; root.mkdir()
     for ts in ("20260101-000001-git", "20260101-000002-git", "20260101-000003-git"):
