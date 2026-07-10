@@ -370,6 +370,31 @@ def _resolve_config(cfg_path: Path, yaml) -> dict:
     return _deep_merge(merged, {k: v for k, v in main.items() if k != "include"})
 
 
+def _match_host(hosts: dict, hostname: str) -> str | None:
+    """Match a hostname to a hosts: key — exact, else the label before the first
+    dot (so 'fury4dx' matches gethostname 'fury4dx.lan')."""
+    if hostname in hosts:
+        return hostname
+    short = hostname.split(".")[0]
+    return short if short in hosts else None
+
+
+def _select_host_config(data: dict, hostname: str) -> dict:
+    """Collapse a multi-host config (P6: top-level `hosts:` + `shared:`) to this
+    box's active single-host config. `hosts[H]` (peer, direction, ssh) overlays
+    `shared`; `requires` carries from the top. Unknown host is a clear error."""
+    hosts = data.get("hosts") or {}
+    key = _match_host(hosts, hostname)
+    if not key:
+        raise HomesyncError(
+            f"host '{hostname}' is not in the config hosts {sorted(hosts)} — "
+            f"add a hosts: entry (see docs/meta-deploy.md)")
+    merged = _deep_merge(data.get("shared") or {}, hosts[key] or {})
+    if data.get("requires"):
+        merged["requires"] = data["requires"]
+    return merged
+
+
 def load_config(path: str | None) -> tuple[Peer, dict[str, Profile], dict[str, Any]]:
     """Parse sync-profiles.yaml into (peer, profiles, defaults)."""
     try:
@@ -381,6 +406,9 @@ def load_config(path: str | None) -> tuple[Peer, dict[str, Profile], dict[str, A
     if not cfg_path.exists():
         raise HomesyncError(f"no profiles config at {cfg_path} — run `fsync sync init` first")
     data = _resolve_config(cfg_path, yaml)
+    # P6 multi-host: a config with a top-level `hosts:` self-selects by hostname.
+    if "hosts" in data:
+        data = _select_host_config(data, socket.gethostname())
 
     # meta-sync compatibility gate: refuse config that needs capabilities this
     # build lacks, rather than misbehaving (config may reach a box before code).
@@ -1251,6 +1279,139 @@ def cmd_meta(args) -> int:
         return _meta_status(config_path)
     print("usage: fsync meta {version|check|status} [--config PATH]", file=sys.stderr)
     return 2
+
+
+# --------------------------------------------------------------------------- #
+# Meta-deploy (P6): build the fsync pyz and push it + the multi-host config to  #
+# remotes over ssh. Build is a minis-only (source-of-truth) operation; the pyz  #
+# runs headless on remotes from a bare python3. Docs: docs/meta-deploy.md.      #
+# --------------------------------------------------------------------------- #
+
+def _rsync_push(src: str, target: str, dst_rel: str) -> None:
+    """rsync a local file to target:$HOME/<dst_rel> over the trusted ssh."""
+    from .meta_deploy import DeployError
+    proc = subprocess.run(
+        ["rsync", "-a", "-e", "ssh " + " ".join(SSH_OPTS), src, f"{target}:{dst_rel}"],
+        capture_output=True, text=True, timeout=300)
+    if proc.returncode != 0:
+        raise DeployError(f"rsync to {target}:{dst_rel} failed: {proc.stderr.strip()}")
+
+
+def _deploy_to(target: str, pyz: str, cfg: str) -> dict:
+    """Atomic install of the pyz + config on one remote (R24): back up current,
+    push to temp, chmod+mv into place, verify with `fsync meta version`."""
+    from . import meta_deploy as md
+    binp, cfgp = md.REMOTE_BIN_REL, md.REMOTE_CONFIG_REL
+    _ssh_to(target, "mkdir -p ~/.local/bin ~/.config/fsync ~/.fsync/deploy", timeout=30)
+    _ssh_to(target, f"cp -f ~/{binp} ~/{binp}.bak 2>/dev/null; "
+                    f"cp -f ~/{cfgp} ~/{cfgp}.bak 2>/dev/null; true", timeout=30)
+    _rsync_push(pyz, target, f"{binp}.tmp")
+    _rsync_push(cfg, target, f"{cfgp}.tmp")
+    inst = _ssh_to(target, f"chmod +x ~/{binp}.tmp && mv ~/{binp}.tmp ~/{binp} && "
+                           f"mv ~/{cfgp}.tmp ~/{cfgp}", timeout=30)
+    if inst.returncode != 0:
+        raise md.DeployError(f"{target}: install failed: {inst.stderr.strip()}")
+    ver = _ssh_to(target, f"~/{binp} meta version", timeout=30)
+    return {"target": target, "verify_rc": ver.returncode, "verify": ver.stdout.strip()}
+
+
+def cmd_deploy(args) -> int:
+    """`fsync deploy build|push|status` — build the pyz, push it + the multi-host
+    config to remotes over ssh."""
+    def log(msg: str) -> None:
+        print(msg, file=sys.stderr)
+    from . import meta_deploy as md
+
+    action = getattr(args, "deploy_cmd", None)
+    if action not in ("build", "push", "status"):
+        print("usage: fsync deploy {build|push|status} [--config PATH]", file=sys.stderr)
+        return 2
+
+    if action == "build":
+        try:
+            res = md.build_pyz(getattr(args, "out", None) or md.DEFAULT_PYZ)
+        except md.DeployError as e:
+            print(f"error: {e}", file=sys.stderr)
+            return 1
+        print(f"built {res['path']} ({res['bytes']} bytes, {len(res['modules'])} core modules)")
+        return 0
+
+    # push / status resolve remotes from the multi-host config
+    config_path = getattr(args, "config", None)
+    cfg_file = Path(config_path or DEFAULT_CONFIG).expanduser()
+    try:
+        raw = _resolve_raw(config_path)
+    except HomesyncError as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 2
+    if "hosts" not in raw:
+        print(f"{cfg_file}: not a multi-host config (no hosts:) — deploy needs one "
+              f"(see docs/meta-deploy.md)", file=sys.stderr)
+        return 2
+    try:
+        targets = md.remote_targets(raw, socket.gethostname())
+    except md.DeployError as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 2
+    only = getattr(args, "host", None)
+    if only:
+        targets = [(hk, t) for hk, t in targets if hk == only]
+        if not targets:
+            print(f"unknown or self host: {only}", file=sys.stderr)
+            return 2
+    if not targets:
+        print("no remote hosts to deploy to (only self in config)", file=sys.stderr)
+        return 0
+
+    if action == "status":
+        rc = 0
+        for hk, tgt in targets:
+            p = _ssh_to(tgt, f"~/{md.REMOTE_BIN_REL} meta version 2>/dev/null || "
+                             f"fsync meta version 2>/dev/null", timeout=30)
+            if p.returncode == 0 and '"fsync_version"' in p.stdout:
+                try:
+                    m = json.loads(p.stdout)
+                    print(f"{hk} ({tgt}): fsync {m.get('fsync_version')} "
+                          f"features={','.join(m.get('features', []))}")
+                except ValueError:
+                    print(f"{hk} ({tgt}): unparseable meta output", file=sys.stderr)
+                    rc = 1
+            else:
+                print(f"{hk} ({tgt}): unreachable or no deployed fsync", file=sys.stderr)
+                rc = 1
+        return rc
+
+    # push
+    if not cfg_file.exists():
+        print(f"config not found: {cfg_file}", file=sys.stderr)
+        return 2
+    dry = getattr(args, "dry_run", False)
+    pyz = None
+    if not dry:
+        try:
+            pyz = md.build_pyz(getattr(args, "out", None) or md.DEFAULT_PYZ)["path"]
+        except md.DeployError as e:
+            print(f"error: build failed: {e}", file=sys.stderr)
+            return 1
+    rc = 0
+    for hk, tgt in targets:
+        if dry:
+            print(f"[dry-run] {hk} ({tgt}): push pyz -> ~/{md.REMOTE_BIN_REL}, "
+                  f"{cfg_file.name} -> ~/{md.REMOTE_CONFIG_REL}")
+            continue
+        log(f"deploying to {hk} ({tgt}) ...")
+        try:
+            res = _deploy_to(tgt, pyz, str(cfg_file))
+        except md.DeployError as e:
+            print(f"{hk}: ERROR {e}", file=sys.stderr)
+            rc = 1
+            continue
+        ok = res["verify_rc"] == 0 and "fsync_version" in res["verify"]
+        print(f"{hk} ({tgt}): {'OK (verified)' if ok else 'INSTALLED but verify FAILED'}")
+        if not ok:
+            rc = 1
+            log(f"  verify output: {res['verify'][:200]}")
+    return rc
 
 
 def _cmd_init(args) -> int:

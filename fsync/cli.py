@@ -762,6 +762,23 @@ def build_parser() -> argparse.ArgumentParser:
         mp.add_argument("--config", help="Profiles YAML (default: ~/.config/fsync/sync-profiles.yaml)")
         mp.add_argument("--verbose", action="count", default=0, help="Increase verbosity")
 
+    # deploy: build the fsync pyz + push it and the multi-host config to remotes
+    p_deploy = sub.add_parser("deploy", help="Build the fsync pyz and push it + config to remotes over ssh (docs/meta-deploy.md)")
+    deploy_sub = p_deploy.add_subparsers(dest="deploy_cmd")
+    p_db = deploy_sub.add_parser("build", help="Build the core fsync .pyz locally")
+    p_db.add_argument("--out", help="Output path (default: ~/.fsync/deploy/fsync.pyz)")
+    p_db.add_argument("--verbose", action="count", default=0)
+    p_dp = deploy_sub.add_parser("push", help="Build + push the pyz + config to remote host(s)")
+    p_dp.add_argument("--config", help="Multi-host config YAML (default: ~/.config/fsync/sync-profiles.yaml)")
+    p_dp.add_argument("--host", help="Limit to a single remote host key")
+    p_dp.add_argument("--out", help="Built pyz path (default: ~/.fsync/deploy/fsync.pyz)")
+    p_dp.add_argument("--dry-run", action="store_true", help="Print the deploy plan, change nothing")
+    p_dp.add_argument("--verbose", action="count", default=0)
+    p_ds = deploy_sub.add_parser("status", help="Report each remote's deployed fsync version")
+    p_ds.add_argument("--config", help="Multi-host config YAML (default: ~/.config/fsync/sync-profiles.yaml)")
+    p_ds.add_argument("--host", help="Limit to a single remote host key")
+    p_ds.add_argument("--verbose", action="count", default=0)
+
     # tui: thin client of fsyncd — plan -> one confirmation -> backend run
     p_tui = sub.add_parser("tui", help="Terminal UI for sync (thin client of fsyncd)")
     p_tui.add_argument("--profile", action="append", default=None,
@@ -843,6 +860,10 @@ def main(argv: list[str] | None = None) -> int:
         from .homesync import cmd_meta
 
         return cmd_meta(args)
+    if args.cmd == "deploy":
+        from .homesync import cmd_deploy
+
+        return cmd_deploy(args)
     if args.cmd == "tui":
         try:
             from .tui import run_tui
