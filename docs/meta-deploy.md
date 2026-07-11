@@ -27,7 +27,9 @@ P6 replaces dual-hosting with **build-and-push deployment**:
   `sync-plan`) + a vendored pure-Python **PyYAML**. It runs on any box with a
   bare `python3` — no venv, no pip, no repo. The UI surfaces (`tui`/`web`/`gtk`/
   `daemon`, which need native deps — pydantic-core, PyGObject, textual) are **not
-  in the pyz**; they stay a pip/editable install on boxes you sit at.
+  in the pyz**; they stay a pip/editable install on boxes you sit at. (Since
+  2026-07-11 fsyncd itself runs from a standalone wheel-installed venv on every
+  box, delivered by `fsync deploy daemon` below — no source checkout needed.)
 - **R21 — Hostname-selected multi-host config.** One config file describes all
   hosts; each box self-selects its `peer`/`direction` by hostname. Box-local
   identity is data, not per-box files.
@@ -131,6 +133,21 @@ is one executable file (`chmod +x fsync.pyz; ./fsync.pyz meta version`).
 - **`fsync deploy status [--config F]`** — for each remote, `ssh fsync meta
   version`; report deployed version + features + whether it matches local and
   self-selected the right host.
+- **`fsync deploy daemon [--config F] [--host N | --local] [--dry-run]`**
+  (added 2026-07-11, when fury's source checkout was retired per R26) — the
+  daemon's own delivery, since the pyz deliberately omits fsyncd's native deps:
+  build a fresh wheelhouse (`pip wheel` of the source checkout + every dep →
+  `~/.fsync/deploy/wheelhouse`), then on this box and each remote: mirror the
+  wheelhouse over rsync, build a venv at `~/.fsync/daemon-venv.new`, verify the
+  daemon import chain offline, swap it into `~/.fsync/daemon-venv` (previous
+  venv → `.bak`), re-run `daemon install` from the new venv (the unit's
+  ExecStart is re-rendered from its sys.executable) and restart. If the daemon
+  doesn't come back up, the `.bak` venv is restored — same path, so the unit
+  needs no change — and restarted. A moved venv keeps working for
+  `bin/python3 -m ...` (pyvenv.cfg resolves relative to the invoked
+  interpreter); only console-script shebangs go stale, and nothing uses them.
+  Assumes one python version across the fleet (native wheels: pydantic-core,
+  pyyaml).
 
 **Remote target** = `hosts[R].ssh`; for a 2-box config it falls back to
 `hosts[self].peer` (self's peer *is* the remote). **Auth/transport** = the

@@ -296,3 +296,111 @@ def test_deploy_build_and_dry_run_via_main(tmp_path, monkeypatch):
         "  boxB: {ssh: dev@b.lan, peer: {host: a.lan, user: dev}, defaults: {direction: pull}}\n"
         "shared:\n  profiles:\n    repos: {kind: git, paths: [p]}\n")
     assert main(["deploy", "push", "--config", str(cfg), "--dry-run", "--out", str(out)]) == 0
+
+
+# --------------------------------------------------------------------------- #
+# deploy daemon: wheelhouse + standalone fsyncd venv refresh                  #
+# --------------------------------------------------------------------------- #
+
+def test_build_wheelhouse_refuses_from_pyz(tmp_path, monkeypatch):
+    import fsync.meta_deploy as md
+    monkeypatch.setattr(md, "_pkg_dir", lambda: tmp_path / "zip-member" / "fsync")
+    with pytest.raises(md.DeployError, match="source"):
+        md.build_wheelhouse(tmp_path / "wh")
+
+
+def _wire_daemon(monkeypatch, ssh_out="daemon-deploy: ok", rc=0):
+    import fsync.homesync as hs
+    calls = {"ssh": [], "rsync": []}
+
+    def fake_ssh(target, cmd, **kw):
+        calls["ssh"].append((target, cmd))
+        return CompletedProcess([], rc, stdout=ssh_out, stderr="")
+
+    def fake_rsync_dir(src, target, dst):
+        calls["rsync"].append((src, target, dst))
+
+    monkeypatch.setattr(hs, "_ssh_to", fake_ssh)
+    monkeypatch.setattr(hs, "_rsync_dir_push", fake_rsync_dir)
+    return hs, calls
+
+
+def test_daemon_deploy_remote_ships_wheelhouse_then_swaps(monkeypatch):
+    hs, calls = _wire_daemon(monkeypatch)
+    res = hs._daemon_deploy_to("dev@b.lan", "/x/wheelhouse")
+    assert res["ok"] and not res["rolled_back"]
+    assert calls["rsync"] == [("/x/wheelhouse", "dev@b.lan", ".fsync/deploy/wheelhouse")]
+    script = calls["ssh"][-1][1]
+    # build-at-.new before swap, .bak rollback, unit reinstall from the new venv
+    assert '"$V.new"' in script and '"$V.bak"' in script
+    assert "daemon install" in script and "systemctl --user restart" in script
+
+
+def test_daemon_deploy_remote_rollback_reported(monkeypatch):
+    hs, _ = _wire_daemon(monkeypatch, ssh_out="daemon-deploy: rolled-back", rc=1)
+    res = hs._daemon_deploy_to("dev@b.lan", "/x/wh")
+    assert not res["ok"] and res["rolled_back"]
+
+
+def test_daemon_deploy_local_runs_bash_no_ship(monkeypatch):
+    import fsync.homesync as hs
+    seen = {}
+
+    def fake_run(argv, **kw):
+        seen["argv"] = argv
+        return CompletedProcess(argv, 0, stdout="daemon-deploy: ok", stderr="")
+
+    monkeypatch.setattr(hs.subprocess, "run", fake_run)
+    res = hs._daemon_deploy_to(None, "/x/wh")
+    assert res["ok"] and seen["argv"][0] == "bash"
+
+
+def _daemon_hosts_cfg(tmp_path, extra=""):
+    cfg = tmp_path / "hosts.yaml"
+    cfg.write_text(
+        "requires: [git-sync]\n"
+        "hosts:\n"
+        "  boxA: {ssh: dev@a.lan, peer: {host: b.lan, user: dev}, defaults: {direction: push}}\n"
+        "  boxB: {ssh: dev@b.lan, peer: {host: a.lan, user: dev}, defaults: {direction: pull}}\n"
+        + extra
+        + "shared:\n  profiles:\n    repos: {kind: git, paths: [p]}\n")
+    return cfg
+
+
+def test_deploy_daemon_dry_run_lists_local_and_remotes(tmp_path, monkeypatch, capsys):
+    from fsync.cli import main
+    monkeypatch.setattr(socket, "gethostname", lambda: "boxA")
+    cfg = _daemon_hosts_cfg(tmp_path)
+    assert main(["deploy", "daemon", "--config", str(cfg), "--dry-run"]) == 0
+    out = capsys.readouterr().out
+    assert "local (this box)" in out and "boxB (dev@b.lan)" in out
+
+
+def test_deploy_daemon_local_only_skips_config(tmp_path, monkeypatch, capsys):
+    from fsync.cli import main
+    assert main(["deploy", "daemon", "--local", "--dry-run"]) == 0
+    out = capsys.readouterr().out
+    assert "local (this box)" in out and "boxB" not in out
+
+
+def test_deploy_daemon_continues_after_one_host_fails(tmp_path, monkeypatch, capsys):
+    from fsync.cli import main
+    import fsync.homesync as hs
+    import fsync.meta_deploy as md
+    monkeypatch.setattr(socket, "gethostname", lambda: "boxA")
+    cfg = _daemon_hosts_cfg(
+        tmp_path, "  boxC: {ssh: dev@c.lan, peer: {host: a.lan, user: dev}}\n")
+    monkeypatch.setattr(md, "build_wheelhouse",
+                        lambda out_dir=None: {"path": "/x/wh", "wheels": ["fsync-0.2.0-py3-none-any.whl"]})
+    attempted = []
+
+    def fake_deploy(target, wh):
+        attempted.append(target)
+        if target == "dev@b.lan":
+            raise md.DeployError("boom")
+        return {"ok": True, "rolled_back": False, "detail": ""}
+
+    monkeypatch.setattr(hs, "_daemon_deploy_to", fake_deploy)
+    assert main(["deploy", "daemon", "--config", str(cfg)]) == 1
+    # local + both remotes attempted despite boxB failing
+    assert attempted == [None, "dev@b.lan", "dev@c.lan"]

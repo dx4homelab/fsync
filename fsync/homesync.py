@@ -1363,17 +1363,151 @@ def _deploy_to(target: str, pyz: str, cfg: str) -> dict:
             "verify": ver.stdout.strip(), "rolled_back": rolled_back}
 
 
+def _rsync_dir_push(src_dir: str, target: str, dst_rel: str) -> None:
+    """rsync a local directory as an exact mirror to target:$HOME/<dst_rel>/."""
+    from .meta_deploy import DeployError
+    proc = subprocess.run(
+        ["rsync", "-a", "--delete", "-e", "ssh " + " ".join(SSH_OPTS),
+         str(src_dir).rstrip("/") + "/", f"{target}:{dst_rel}/"],
+        capture_output=True, text=True, timeout=600)
+    if proc.returncode != 0:
+        raise DeployError(f"rsync to {target}:{dst_rel} failed: {proc.stderr.strip()}")
+
+
+def _daemon_deploy_script() -> str:
+    """POSIX script that refreshes one box's fsyncd venv from its wheelhouse.
+
+    Build at <venv>.new and verify the daemon import chain BEFORE touching the
+    live venv; then swap (previous venv -> .bak) — a moved venv keeps working
+    for `bin/python3 -m ...` because pyvenv.cfg is found relative to the
+    invoked interpreter path (only console-script shebangs go stale, and
+    nothing uses them). `daemon install` run from the new venv re-renders the
+    unit's ExecStart from sys.executable. If the daemon doesn't come back up,
+    restore .bak (same path, so the unit needs no change) and restart."""
+    from . import meta_deploy as md
+    return f'''set -e
+V="$HOME/{md.DAEMON_VENV_REL}"
+WH="$HOME/{md.WHEELHOUSE_REL}"
+rm -rf "$V.new"
+if ! (python3 -m venv "$V.new" \\
+      && "$V.new/bin/python3" -m pip install --quiet --no-index --find-links "$WH" fsync \\
+      && "$V.new/bin/python3" -c "import fsync.daemon"); then
+  rm -rf "$V.new"; echo "daemon-deploy: build-failed"; exit 1
+fi
+rm -rf "$V.bak"
+if [ -d "$V" ]; then mv "$V" "$V.bak"; fi
+mv "$V.new" "$V"
+if "$V/bin/python3" -m fsync.cli daemon install >/dev/null \\
+   && systemctl --user restart fsync-daemon.service \\
+   && sleep 2 && systemctl --user is-active --quiet fsync-daemon.service; then
+  echo "daemon-deploy: ok"
+else
+  rm -rf "$V.failed"; mv "$V" "$V.failed" 2>/dev/null || true
+  if [ -d "$V.bak" ]; then mv "$V.bak" "$V"; systemctl --user restart fsync-daemon.service || true; fi
+  echo "daemon-deploy: rolled-back"; exit 1
+fi
+'''
+
+
+def _daemon_deploy_to(target: str | None, wheelhouse: str) -> dict:
+    """Refresh one box's fsyncd venv from the wheelhouse (target None = this
+    box: same script via local bash, no ship). Remotes get the wheelhouse
+    mirrored first so the venv install is fully offline."""
+    from . import meta_deploy as md
+    script = _daemon_deploy_script()
+    if target is None:
+        proc = subprocess.run(["bash", "-c", script],
+                              capture_output=True, text=True, timeout=600)
+    else:
+        _ssh_to(target, f"mkdir -p ~/{md.WHEELHOUSE_REL}", timeout=30)
+        _rsync_dir_push(wheelhouse, target, md.WHEELHOUSE_REL)
+        proc = _ssh_to(target, script, timeout=600)
+    ok = "daemon-deploy: ok" in proc.stdout
+    return {"ok": ok,
+            "rolled_back": "daemon-deploy: rolled-back" in proc.stdout,
+            "detail": ("venv build/import failed (live venv untouched)"
+                       if "daemon-deploy: build-failed" in proc.stdout
+                       else "" if ok else f"rc={proc.returncode} {proc.stderr.strip()[:200]}")}
+
+
+def _deploy_daemon(args) -> int:
+    """`fsync deploy daemon` — rebuild the wheelhouse from source, then refresh
+    the standalone fsyncd venv on this box + every remote (or --local / --host
+    subset), reinstall units, restart daemons. Per-box failures roll back to
+    the previous venv and don't strand the rest of the fleet."""
+    from . import meta_deploy as md
+    dry = getattr(args, "dry_run", False)
+    local_only = getattr(args, "local", False)
+    only = getattr(args, "host", None)
+    remotes: list[tuple[str, str]] = []
+    if not local_only:
+        config_path = getattr(args, "config", None)
+        cfg_file = Path(config_path or DEFAULT_CONFIG).expanduser()
+        try:
+            raw = _resolve_raw(config_path)
+        except HomesyncError as e:
+            print(f"error: {e}", file=sys.stderr)
+            return 2
+        if "hosts" not in raw:
+            print(f"{cfg_file}: not a multi-host config (no hosts:) — needed to "
+                  f"find remotes (or use --local)", file=sys.stderr)
+            return 2
+        try:
+            remotes = md.remote_targets(raw, socket.gethostname())
+        except md.DeployError as e:
+            print(f"error: {e}", file=sys.stderr)
+            return 2
+        if only:
+            remotes = [(hk, t) for hk, t in remotes if hk == only]
+            if not remotes:
+                print(f"unknown or self host: {only}", file=sys.stderr)
+                return 2
+    # --host targets just that remote; otherwise this box is refreshed too
+    plan: list[tuple[str, str | None]] = ([] if only else [("local", None)]) + remotes
+    if dry:
+        for hk, tgt in plan:
+            where = "this box" if tgt is None else tgt
+            print(f"[dry-run] {hk} ({where}): wheelhouse -> ~/{md.WHEELHOUSE_REL}, "
+                  f"rebuild ~/{md.DAEMON_VENV_REL}, reinstall unit, restart fsyncd")
+        return 0
+    try:
+        wh = md.build_wheelhouse()
+    except md.DeployError as e:
+        print(f"error: wheelhouse build failed: {e}", file=sys.stderr)
+        return 1
+    print(f"wheelhouse: {wh['path']} ({len(wh['wheels'])} wheels)", file=sys.stderr)
+    rc = 0
+    for hk, tgt in plan:
+        try:
+            res = _daemon_deploy_to(tgt, wh["path"])
+        except (md.DeployError, subprocess.SubprocessError, OSError) as e:
+            print(f"{hk}: ERROR {e}", file=sys.stderr)
+            rc = 1
+            continue
+        if res["ok"]:
+            print(f"{hk}: OK (fsyncd active on the refreshed venv)")
+        else:
+            rc = 1
+            print(f"{hk}: FAILED — "
+                  + ("rolled back to the previous venv" if res["rolled_back"]
+                     else res["detail"]), file=sys.stderr)
+    return rc
+
+
 def cmd_deploy(args) -> int:
-    """`fsync deploy build|push|status` — build the pyz, push it + the multi-host
-    config to remotes over ssh."""
+    """`fsync deploy build|push|status|daemon` — build the pyz, push it + the
+    multi-host config to remotes over ssh, or refresh the fsyncd venvs."""
     def log(msg: str) -> None:
         print(msg, file=sys.stderr)
     from . import meta_deploy as md
 
     action = getattr(args, "deploy_cmd", None)
-    if action not in ("build", "push", "status"):
-        print("usage: fsync deploy {build|push|status} [--config PATH]", file=sys.stderr)
+    if action not in ("build", "push", "status", "daemon"):
+        print("usage: fsync deploy {build|push|status|daemon} [--config PATH]", file=sys.stderr)
         return 2
+
+    if action == "daemon":
+        return _deploy_daemon(args)
 
     if action == "build":
         try:

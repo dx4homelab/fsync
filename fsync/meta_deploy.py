@@ -12,6 +12,8 @@ from __future__ import annotations
 
 import os
 import shutil
+import subprocess
+import sys
 import tempfile
 import zipapp
 from pathlib import Path
@@ -28,6 +30,8 @@ CORE_MODULES = [
 DEFAULT_PYZ = "~/.fsync/deploy/fsync.pyz"
 REMOTE_BIN_REL = ".local/bin/fsync"                 # relative to remote $HOME
 REMOTE_CONFIG_REL = ".config/fsync/sync-profiles.yaml"  # the pyz's default read path
+WHEELHOUSE_REL = ".fsync/deploy/wheelhouse"         # fsync wheel + all deps, per box
+DAEMON_VENV_REL = ".fsync/daemon-venv"              # standalone fsyncd venv, per box
 
 
 class DeployError(RuntimeError):
@@ -75,6 +79,32 @@ def build_pyz(out_path: str | Path = DEFAULT_PYZ, *, modules: list[str] | None =
         os.chmod(tmp, 0o755)
         os.replace(tmp, out)
     return {"path": str(out), "bytes": out.stat().st_size, "modules": included}
+
+
+def build_wheelhouse(out_dir: str | Path | None = None) -> dict:
+    """pip-wheel the source checkout + every dependency into a wheelhouse dir
+    (cleared first, so retired deps don't linger). Source-of-truth operation
+    like build_pyz: the fsyncd venvs on every box install offline from this.
+    Native wheels (pydantic-core, pyyaml) are fetched for THIS interpreter —
+    the fleet shares one python version, which `deploy daemon` relies on."""
+    pkg = _pkg_dir()
+    repo = pkg.parent
+    if not pkg.is_dir() or not (repo / "pyproject.toml").exists():
+        raise DeployError("wheelhouse build must run from the source checkout, "
+                          "not the pyz — build on the source box")
+    out = Path(os.path.expanduser(str(out_dir or "~/" + WHEELHOUSE_REL)))
+    if out.exists():
+        shutil.rmtree(out)
+    out.mkdir(parents=True)
+    proc = subprocess.run(
+        [sys.executable, "-m", "pip", "wheel", str(repo), "-w", str(out), "--quiet"],
+        capture_output=True, text=True, timeout=900)
+    if proc.returncode != 0:
+        raise DeployError(f"pip wheel failed: {proc.stderr.strip()[-400:]}")
+    wheels = sorted(p.name for p in out.glob("*.whl"))
+    if not any(w.startswith("fsync-") for w in wheels):
+        raise DeployError("wheelhouse built but contains no fsync wheel")
+    return {"path": str(out), "wheels": wheels}
 
 
 # --------------------------------------------------------------------------- #

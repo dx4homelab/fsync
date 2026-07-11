@@ -778,6 +778,13 @@ def build_parser() -> argparse.ArgumentParser:
     p_ds.add_argument("--config", help="Multi-host config YAML (default: ~/.config/fsync/sync-profiles.yaml)")
     p_ds.add_argument("--host", help="Limit to a single remote host key")
     p_ds.add_argument("--verbose", action="count", default=0)
+    p_dd = deploy_sub.add_parser("daemon", help="Refresh the standalone fsyncd venv(s) from a fresh wheelhouse and restart the daemons")
+    p_dd.add_argument("--config", help="Multi-host config YAML (default: ~/.config/fsync/sync-profiles.yaml)")
+    _dd_scope = p_dd.add_mutually_exclusive_group()
+    _dd_scope.add_argument("--host", help="Limit to a single remote host key (skips this box)")
+    _dd_scope.add_argument("--local", action="store_true", help="Only this box (no config needed)")
+    p_dd.add_argument("--dry-run", action="store_true", help="Print the plan, change nothing")
+    p_dd.add_argument("--verbose", action="count", default=0)
 
     # tui: thin client of fsyncd — plan -> one confirmation -> backend run
     p_tui = sub.add_parser("tui", help="Terminal UI for sync (thin client of fsyncd)")
