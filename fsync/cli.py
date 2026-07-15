@@ -815,6 +815,29 @@ def build_parser() -> argparse.ArgumentParser:
     p_web.add_argument("--no-browser", action="store_true", help="Do not open a browser")
     p_web.add_argument("--verbose", action="count", default=0, help="Increase verbosity")
 
+    # vm: clone a libvirt/virt-manager VM from a remote host to this box
+    p_vm = sub.add_parser("vm", help="Clone a libvirt VM from a remote host (disks + UEFI nvram over ssh)")
+    vm_sub = p_vm.add_subparsers(dest="vm_cmd")
+    p_vm_clone = vm_sub.add_parser("clone", help="Pull a remote VM here: disks + nvram, regen UUID/MAC, define locally")
+    p_vm_clone.add_argument("--from", dest="src_host", required=True, metavar="HOST",
+                            help="Source host/IP running libvirt")
+    p_vm_clone.add_argument("--vm", required=True, help="Source VM (domain) name on the remote host")
+    p_vm_clone.add_argument("--name", help="Name for the local clone (default: <vm>-clone)")
+    p_vm_clone.add_argument("--user", default=None, help="SSH user on the source host (default: vm.user in config, else $USER)")
+    p_vm_clone.add_argument("--pool", default=None, help="Local storage pool for the disk (default: vmstore if defined, else images)")
+    p_vm_clone.add_argument("--target-dir", default=None, help="Explicit disk directory (overrides --pool)")
+    p_vm_clone.add_argument("--nvram-dir", default=None, help="Local UEFI nvram dir (default: /var/lib/libvirt/qemu/nvram)")
+    p_vm_clone.add_argument("--stage-dir", default=None, help="Staging dir for the transfer (default: a temp dir under $HOME)")
+    p_vm_clone.add_argument("--connect", default="qemu:///system", help="Local libvirt URI (default: qemu:///system)")
+    p_vm_clone.add_argument("--network", default=None, metavar="SPEC",
+                            help="Remap the NIC: 'default', 'network:NAME', or 'bridge:NAME' (default: preserve source)")
+    p_vm_clone.add_argument("--compress", action="store_true", help="Compress the cloned qcow2 (for space-tight pools)")
+    p_vm_clone.add_argument("--force", action="store_true", help="Clone even if the source is running (disk may be inconsistent)")
+    p_vm_clone.add_argument("--boot-test", action="store_true", help="Start the clone briefly to verify it boots, then force off")
+    p_vm_clone.add_argument("--dry-run", action="store_true", help="Print the plan; transfer nothing, define nothing")
+    p_vm_clone.add_argument("--config", help="Profiles YAML for vm.* defaults (default: ~/.config/fsync/sync-profiles.yaml)")
+    p_vm_clone.add_argument("--verbose", action="count", default=0, help="Increase verbosity (rsync progress)")
+
     # daemon: the operational backend (REST over TLS/mTLS + scheduler)
     p_dmn = sub.add_parser("daemon", help="fsyncd backend: REST API over TLS/mTLS, absorbs run scheduling")
     p_dmn.add_argument("action", choices=("run", "install", "remove", "status", "trust", "cert"),
@@ -889,6 +912,10 @@ def main(argv: list[str] | None = None) -> int:
             print(f"fsync web requires fastapi + uvicorn: {e}", file=sys.stderr)
             return 2
         return run_web(args)
+    if args.cmd == "vm":
+        from .vmclone import cmd_vm
+
+        return cmd_vm(args)
     if args.cmd == "daemon":
         from .daemon import cmd_daemon
 
