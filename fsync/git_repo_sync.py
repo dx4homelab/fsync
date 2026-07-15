@@ -101,6 +101,14 @@ def _has_head(repo: str | Path) -> bool:
     return _git(repo, "rev-parse", "--verify", "-q", "HEAD", check=False).returncode == 0
 
 
+def has_commits(repo: str | Path) -> bool:
+    """True when the repo has a real HEAD to capture. False for an unborn HEAD
+    (freshly ``git init``'d, or a HEAD pointing at a nonexistent branch): there
+    is nothing to snapshot, so callers should skip rather than treat it as a
+    failure."""
+    return _has_head(repo)
+
+
 def repo_busy(repo: str | Path) -> str | None:
     """A short reason string when the repo has an operation in flight — so we
     must neither snapshot nor mutate it — else None. Guards against racing a

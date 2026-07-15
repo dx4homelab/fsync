@@ -534,6 +534,34 @@ def test_git_profile_snapshots_only_on_producer():
     assert git_profile_snapshots(mk("files", "push")) is False  # not a git profile
 
 
+def test_snapshot_profile_isolates_unborn_repo(tmp_path, monkeypatch):
+    """A repo with an unborn HEAD (git init, no commit — or a HEAD pointing at a
+    nonexistent branch) must be a benign SKIP, not abort the whole profile: every
+    healthy repo in the profile still has to be captured. Regresses the live bug
+    where one unborn repo silently dropped every repo discovered after it and
+    fired a spurious 'sync FAILED' notification each run."""
+    monkeypatch.setenv("HOME", str(tmp_path))
+    from fsync.homesync import Profile, snapshot_git_profile
+
+    ws = tmp_path / "workspaces" / "proj"
+    make_base_repo(ws / "aaa_healthy")
+    unborn = ws / "mmm_unborn"; unborn.mkdir(parents=True)
+    git(unborn, "init", "-q", "-b", "main")                     # init, but never commit
+    make_base_repo(ws / "zzz_healthy")                          # discovered AFTER the unborn one
+
+    prof = Profile(name="repos", paths=["workspaces/proj"], kind="git", direction="push")
+    logs: list[str] = []
+    out = snapshot_git_profile(prof, tmp_path / "bundles", logs.append)  # must NOT raise
+
+    by_name = {r["name"]: r for r in out["repos"]}
+    assert by_name["aaa_healthy"].get("bytes")                  # both healthy repos captured
+    assert by_name["zzz_healthy"].get("bytes")                  # ...incl. the one after the unborn
+    assert "unborn" in by_name["mmm_unborn"].get("skipped", "")  # unborn is a skip, not an error
+    assert "error" not in by_name["mmm_unborn"]
+    assert (tmp_path / "bundles" / "aaa_healthy.bundle").exists()
+    assert (tmp_path / "bundles" / "zzz_healthy.bundle").exists()
+
+
 def test_prune_backup_runs(tmp_path):
     root = tmp_path / "backups"; root.mkdir()
     for ts in ("20260101-000001-git", "20260101-000002-git", "20260101-000003-git"):

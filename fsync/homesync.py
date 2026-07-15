@@ -1013,19 +1013,39 @@ def snapshot_git_profile(prof: Profile, bundle_dir: str | Path, log) -> dict[str
     if not repos:
         log(f"  {prof.name}: no git repos found under {prof.paths}")
         return out
+    # Per-repo isolation: one repo that can't be captured (busy, unborn, or a
+    # genuine git error) must NOT abort the loop — every other repo in the
+    # profile still needs to be backed up. Real failures are collected and
+    # re-raised once at the end so the run still reports rc!=0 (and notifies),
+    # but an unborn/empty repo is a benign skip, not a failure to alarm on.
+    failures: list[str] = []
     for r in repos:
         busy = grs.repo_busy(r["path"])
         if busy:
             out["repos"].append({"name": r["name"], "rel": r["rel"], "skipped": busy})
             log(f"  {prof.name}: SKIP {r['rel']} — {busy}")
             continue
-        meta = grs.snapshot_repo(r["path"], bundle_dir, name=r["name"], rel=r["rel"])
+        if not grs.has_commits(r["path"]):
+            reason = "no commits yet (unborn HEAD) — nothing to capture"
+            out["repos"].append({"name": r["name"], "rel": r["rel"], "skipped": reason})
+            log(f"  {prof.name}: SKIP {r['rel']} — {reason}")
+            continue
+        try:
+            meta = grs.snapshot_repo(r["path"], bundle_dir, name=r["name"], rel=r["rel"])
+        except grs.GitSyncError as e:
+            out["repos"].append({"name": r["name"], "rel": r["rel"], "error": str(e)})
+            failures.append(f"{r['rel']}: {e}")
+            log(f"  {prof.name}: ERROR {e}")
+            continue
         out["repos"].append({"name": r["name"], "rel": r["rel"], "branch": meta["branch"],
                              "dirty": meta["dirty"], "bytes": meta["bytes"]})
         log(f"  {prof.name}: snapshot {r['rel']} ({meta['bytes']}B"
             f"{', dirty' if meta['dirty'] else ''})")
         for w in grs.special_warnings(r["path"]):
             log(f"  {prof.name}: warn {r['rel']}: {w}")
+    if failures:
+        raise grs.GitSyncError(f"{len(failures)} repo(s) failed to snapshot: "
+                               + "; ".join(failures))
     return out
 
 
