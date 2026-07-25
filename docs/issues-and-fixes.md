@@ -18,8 +18,8 @@ fury4dx is a deployed receiver. Make changes on minis, commit + push, then
 ## ISSUE-001 — Cross-box "ghost": a file tracked on one branch reappears *untracked* on the peer
 
 - **Status:** incident **RESOLVED** 2026-07-25 (both boxes aligned to `main @ 965a7e4`).
-  fsync product fix: **A + B IMPLEMENTED in 0.4.0**; **C (C-b) IMPLEMENTED in 0.5.0**, config-gated
-  (`apply: auto`), default `on-demand` so it is inert until the `repos` profile opts in.
+  fsync product fix: **A + B in 0.4.0**; **C (C-b) in 0.5.0**, and **ACTIVATED 2026-07-25** — the
+  `repos` profile is now `apply: auto` on both boxes (dry-run verified safe). Fully closed.
 - **Where seen:** repo `dashboard-refactor-v4` (under `workspaces/primary`), file
   `modules/vendor/dream4devops-0.8.0-py3-none-any.whl`.
 
@@ -68,8 +68,13 @@ Aligned minis to `main` (`git switch main` + fast-forward). Both boxes now on `m
   or a not-busy + clean + same-branch repo; else skips with a reason. Every real apply backs the
   receiver up first (R15); `--dry-run` mutates nothing. **Inert until opted in** — the code ships in
   0.5.0 but changes nothing until the `repos` profile sets `apply: auto`.
-  **To activate:** add `apply: auto` to the `repos` profile in `sync-profiles.yaml`, deploy config,
-  validate with `fsync sync run --profile repos --profile git-bundles --dry-run`.
+  **ACTIVATED 2026-07-25:** `repos` profile set to `apply: auto`, deployed to both boxes. Dry-run on
+  fury confirmed safe: file profiles now exclude 13 (homelab) + 15 (primary) repo trees, and
+  auto-apply = 0 applied / 27 skipped / 0 errors — every repo either "up to date" (no churn) or
+  protected as "receiver has local changes" (guard refuses to clobber). NOTE: several fury repos are
+  legitimately dirty (e.g. dashboard-refactor-v4 = active work) and stay frozen until committed/
+  reverted on fury — auto-apply resumes once clean. Fix A's report surfaces any leftover untracked
+  ghosts to clean up per-repo.
 
 ### Prevention
 Keep a given repo on the **same branch** across both boxes. Do fsync/repo edits on the minis master.
