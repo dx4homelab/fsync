@@ -66,3 +66,52 @@ Aligned minis to `main` (`git switch main` + fast-forward). Both boxes now on `m
 ### Prevention
 Keep a given repo on the **same branch** across both boxes. Do fsync/repo edits on the minis master.
 A narrow `exclude *.whl` would only mask this one symptom — not a real fix.
+
+### Durable fix (C) — research notes (2026-07-25, first pass)
+
+**Scope of the double-coverage (measured).** All **26** repos owned by the `repos` git profile are
+*also* carried by the file profiles (`homelab` 12 + `primary` 14). So every one can ghost under
+branch divergence — this is systemic, not specific to dashboard-refactor-v4.
+
+**Goal.** Stop double-covering: let each git-profile repo travel **only** by its bundle, and have the
+file profiles skip it. That removes the ghost transport at the source.
+
+**Hard constraint (found during research).** Do **not** skip *all* git worktrees in file sync: the
+**fsync repo itself is deliberately excluded from the git profile** and relies on the `homelab` FILE
+profile to reach fury (that is how this very doc gets there). C must skip only **git-profile-owned**
+repos, and keep file-syncing the fsync repo, SVN working copies (e.g. `dashboard4trunk`), and plain dirs.
+
+**Mechanism (feasible with existing machinery).** `fileindex.matches_exclude` already supports
+path-form patterns (`repo/*` matches a whole subtree). So at run/config time: discover repos for
+every `kind: git` profile in the config, and for each file profile inject an exclude for each such
+repo's path **relative to that file profile's root** (e.g. `primary` → `dashboard-refactor-v4/*`,
+`afsas/git4afsas/*`). Surgical; leaves fsync/SVN/plain untouched. Hook point: augment file
+`Profile.exclude` in `load_config` (computed from *all* `kind: git` profiles, not just the ones
+selected for a given run).
+
+**The crux — the apply story.** With repos removed from file sync, fury updates them only via
+`fsync git apply`, which is **manual today (R17)**. Options:
+- **C-a — manual apply, staleness made visible.** File profiles skip repos; the sync report lists
+  repos with unapplied bundles. Lowest risk; fury repos can lag until the user applies.
+- **C-b — guarded auto-apply in the sync run (realizes R17's reserved "auto" mode).** After bundles
+  arrive, auto-apply on the receiver **only when safe**: repo not busy (`repo_busy`), receiver clean
+  (no local edits), and no branch divergence (Fix B). Otherwise skip + report. R15 backs up
+  regardless. Fits the minis=master / fury=receiver model (fury repos are read-mostly).
+- **C-c — separate scheduled apply** (daemon), same guards, decoupled from file sync.
+
+**Recommendation (first pass): C-b + the exclude injection**, behind a per-git-profile config flag
+`apply: on-demand | auto` (default `on-demand` to preserve v1 until proven). This removes the ghost
+transport *and* keeps fury current, while Fix B's guard + R15 backup + clean/busy checks honor R17's
+safety intent.
+
+**Migration note.** Repo files already on fury (from prior additive file sync) stay put when excluded
+(no-delete). The first guarded `apply` per repo reconciles the tree exactly (`read-tree --reset` +
+`clean`), so strays are cleaned then — no separate cleanup needed.
+
+**Open decisions (need user input before building):**
+1. Auto-apply (C-b) or keep manual (C-a)? — the R17 v1→v2 call.
+2. If auto-apply: confirm the safe policy = only when receiver repo is clean, not busy, same branch; else skip + report.
+3. Config surface: per-`repos`-profile `apply:` flag, default `on-demand`.
+
+**Next steps (not yet done):** prototype the exclude injection + a `sync run` report line for
+skipped/unapplied repos; then, if C-b chosen, the guarded auto-apply path with tests.
