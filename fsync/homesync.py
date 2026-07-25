@@ -341,6 +341,12 @@ class Profile:
     # bundles instead of additive rsync (docs/git-repo-sync.md).
     kind: str = "files"
     mirror_branches: bool = False
+    # ISSUE-001 fix C: kind:git receiver behaviour. "on-demand" (default, R17 v1)
+    # = apply manually with `fsync git apply`, and file profiles keep carrying the
+    # repos (double-coverage). "auto" = the durable fix: file profiles SKIP these
+    # repos, and the receiver auto-applies bundles in the run, guarded (clean +
+    # same-branch + not-busy; else skip). Realizes R17's reserved guarded mode.
+    apply: str = "on-demand"
 
 
 def _deep_merge(base: dict, override: dict) -> dict:
@@ -452,6 +458,9 @@ def load_config(path: str | None) -> tuple[Peer, dict[str, Profile], dict[str, A
         kind = raw.get("kind", "files")
         if kind not in ("files", "git"):
             raise HomesyncError(f"{cfg_path}: profile '{name}': kind must be 'files' or 'git', got {kind!r}")
+        apply_mode = raw.get("apply", defaults.get("apply", "on-demand"))
+        if apply_mode not in ("on-demand", "auto"):
+            raise HomesyncError(f"{cfg_path}: profile '{name}': apply must be 'on-demand' or 'auto', got {apply_mode!r}")
         profiles[name] = Profile(
             name=name,
             paths=[str(p) for p in paths],
@@ -464,6 +473,7 @@ def load_config(path: str | None) -> tuple[Peer, dict[str, Profile], dict[str, A
             merge_jsonl=[str(p) for p in raw.get("merge_jsonl", defaults.get("merge_jsonl", []))],
             kind=kind,
             mirror_branches=bool(raw.get("mirror_branches", False)),
+            apply=apply_mode,
         )
     if not profiles:
         raise HomesyncError(f"{cfg_path}: no profiles defined")
@@ -1055,6 +1065,111 @@ def git_profile_snapshots(prof: Profile) -> bool:
     race the producer's under newest-wins). Manual `fsync git snapshot` ignores
     this — it's explicit — the gate is only for the automated `sync run`."""
     return prof.kind == "git" and prof.direction in ("push", "both")
+
+
+def auto_apply_git_repos(prof: Profile) -> bool:
+    """Receiver-side auto-apply runs only for a pull-only kind:git profile set to
+    apply:auto (the durable ISSUE-001 fix C). The producer never auto-applies."""
+    return (prof.kind == "git" and prof.apply == "auto"
+            and not git_profile_snapshots(prof))
+
+
+def git_repo_excludes_for_file_profiles(profiles: dict[str, Profile]) -> dict[str, list[str]]:
+    """Fix C: repos owned by an apply:auto kind:git profile must not be
+    double-carried by file profiles (that additive, branch-unaware copy is the
+    ISSUE-001 ghost transport). Returns {file_profile: [subtree exclude patterns]}
+    — each pattern is the repo path RELATIVE TO that file profile's indexed root,
+    so only the git-owned subtree is skipped; the fsync repo, SVN checkouts, and
+    plain dirs are left alone. Empty (a no-op with zero fs cost) when no git
+    profile is apply:auto — so the default behaviour is unchanged."""
+    auto_rels: list[str] = []
+    for p in profiles.values():
+        if p.kind == "git" and p.apply == "auto":
+            auto_rels.extend(r["rel"] for r in _discover_git_repos(p))
+    out: dict[str, list[str]] = {}
+    if not auto_rels:
+        return out
+    for name, p in profiles.items():
+        if p.kind != "files":
+            continue
+        pats: list[str] = []
+        for base in p.paths:
+            for rel in auto_rels:
+                if rel == base:
+                    pats.append("*")
+                elif rel.startswith(base + "/"):
+                    pats.append(rel[len(base) + 1:] + "/*")
+        if pats:
+            out[name] = sorted(set(pats))
+    return out
+
+
+def _auto_apply_decision(target: Path, meta: dict[str, Any]) -> tuple[bool, str]:
+    """Guard for receiver auto-apply — apply only when it cannot lose work: a
+    fresh (absent) repo, or one that is not busy, clean, and already on the
+    producer's branch. Any other state skips (the repo simply stays as-is, since
+    a prior file sync already left content there) and is reported with a reason."""
+    if not grs.is_git_repo(target):
+        return True, "new"
+    busy = grs.repo_busy(target)
+    if busy:
+        return False, f"receiver {busy}"
+    if grs.is_dirty(target):
+        return False, "receiver has local changes"
+    div = grs.check_branch_divergence(target, meta)
+    if div:
+        return False, (f"branch divergence (receiver {div['receiver_branch'] or 'DETACHED'}, "
+                       f"producer {div['producer_branch'] or 'DETACHED'})")
+    return True, "clean"
+
+
+def auto_apply_git_profile(prof: Profile, bundle_dir: str | Path, *,
+                           run_id: str, dry_run: bool, log) -> dict[str, Any]:
+    """Receiver side (apply:auto): apply each staged bundle whose repo belongs to
+    this profile, guarded by ``_auto_apply_decision``. Every real apply backs the
+    receiver up first (R15). Bundles are matched to the profile by their meta
+    ``rel`` falling under the profile's paths."""
+    bundle_dir = Path(bundle_dir).expanduser()
+    home = _home()
+    backup_dir = Path(DEFAULT_GIT_BACKUP_ROOT).expanduser() / f"{run_id}-autoapply"
+    out: dict[str, Any] = {"kind": "git", "apply": "auto",
+                           "applied": [], "skipped": [], "errors": []}
+    if not bundle_dir.is_dir():
+        return out
+    for meta_path in sorted(bundle_dir.glob("*.meta.json")):
+        try:
+            meta = json.loads(meta_path.read_text())
+        except (OSError, ValueError):
+            continue
+        rel = meta.get("rel")
+        if not rel or not any(rel == b or rel.startswith(b + "/") for b in prof.paths):
+            continue
+        name = meta.get("name") or Path(rel).name
+        bundle = bundle_dir / f"{name}.bundle"
+        target = home / rel
+        if not bundle.exists():
+            out["skipped"].append({"repo": name, "reason": "no bundle"})
+            continue
+        ok, reason = _auto_apply_decision(target, meta)
+        head = (meta.get("head") or "")[:9]
+        if not ok:
+            out["skipped"].append({"repo": name, "reason": reason})
+            log(f"  {prof.name}/{name}: auto-apply skipped ({reason})")
+            continue
+        if dry_run:
+            out["applied"].append({"repo": name, "dry_run": True})
+            log(f"  {prof.name}/{name}: would auto-apply {meta.get('branch') or 'DETACHED'}@{head}")
+            continue
+        try:
+            res = grs.apply_repo(target, bundle, meta, backup_dir=backup_dir)
+            out["applied"].append({"repo": name, "head": meta.get("head"),
+                                   "backup": res.get("backup")})
+            log(f"  {prof.name}/{name}: auto-applied {meta.get('branch') or 'DETACHED'}@{head}"
+                + (f" (backup {res['backup']})" if res.get("backup") else ""))
+        except grs.GitSyncError as e:
+            out["errors"].append(f"{name}: {e}")
+            log(f"  {prof.name}/{name}: auto-apply ERROR {e}")
+    return out
 
 
 def snapshot_git_profile(prof: Profile, bundle_dir: str | Path, log) -> dict[str, Any]:
@@ -1743,6 +1858,18 @@ def _cmd_run(args) -> int:
               f"available: {', '.join(profiles)}", file=sys.stderr)
         return 2
 
+    # Fix C: when a kind:git profile is apply:auto, stop the file profiles from
+    # double-carrying its repos (ISSUE-001 ghost transport). Computed from ALL
+    # config profiles so the exclusion holds even in a partial run.
+    _extra_excludes = git_repo_excludes_for_file_profiles(profiles)
+    if _extra_excludes:
+        from dataclasses import replace
+        selected = [replace(p, exclude=list(p.exclude) + _extra_excludes[p.name])
+                    if p.name in _extra_excludes else p for p in selected]
+        for _n, _pats in _extra_excludes.items():
+            log(f"note: {_n}: {len(_pats)} git-profile repo tree(s) excluded from file "
+                f"sync (apply:auto)")
+
     # R6: away-tolerant — a missing peer is a clean no-op, not an error.
     if not peer_reachable(peer):
         if getattr(args, "plan_only", False):
@@ -1808,6 +1935,7 @@ def _cmd_run(args) -> int:
         print(f"error: {e}", file=sys.stderr)
         return 1
 
+    auto_apply_later: list[Profile] = []
     for prof in selected:
         try:
             if prof.kind == "git":
@@ -1816,10 +1944,18 @@ def _cmd_run(args) -> int:
                 # competing bundles that could beat the producer's under
                 # newest-wins and make apply a no-op. Bundles arrive via the
                 # files-profile that carries the bundle dir; restore with
-                # `fsync git apply`.
+                # `fsync git apply` (or auto-apply, guarded, when apply:auto).
                 if git_profile_snapshots(prof):
                     report["profiles"][prof.name] = snapshot_git_profile(
                         prof, DEFAULT_GIT_BUNDLE_DIR, log)
+                elif auto_apply_git_repos(prof):
+                    # Defer to a post-pass so the git-bundles file profile (which
+                    # carries fresh bundles) has already run this cycle.
+                    auto_apply_later.append(prof)
+                    report["profiles"][prof.name] = {"kind": "git", "apply": "auto",
+                                                     "pending": True}
+                    log(f"  {prof.name}: pull-only receiver, apply:auto — "
+                        f"auto-apply after bundle sync")
                 else:
                     log(f"  {prof.name}: pull-only (receiver) — not snapshotting; "
                         f"bundles arrive via file-sync, apply with `fsync git apply`")
@@ -1837,6 +1973,24 @@ def _cmd_run(args) -> int:
             progress.error(f"{prof.name}: {e}")
             progress.profile_done(prof.name, status="error")
             log(f"  {prof.name}: ERROR {e}")
+            rc = 1
+
+    # Fix C post-pass: guarded receiver auto-apply, now that fresh bundles have
+    # arrived via the git-bundles file profile this cycle.
+    for prof in auto_apply_later:
+        try:
+            res = auto_apply_git_profile(prof, DEFAULT_GIT_BUNDLE_DIR,
+                                         run_id=run_id, dry_run=args.dry_run, log=log)
+            report["profiles"][prof.name] = res
+            log(f"  {prof.name}: auto-apply — {len(res['applied'])} applied, "
+                f"{len(res['skipped'])} skipped, {len(res['errors'])} error(s)")
+            if res["errors"]:
+                report["errors"].extend(f"{prof.name}: {e}" for e in res["errors"])
+                rc = 1
+        except (HomesyncError, grs.GitSyncError) as e:
+            report["profiles"][prof.name] = {"kind": "git", "apply": "auto", "status": "error"}
+            report["errors"].append(f"{prof.name}: auto-apply: {e}")
+            log(f"  {prof.name}: auto-apply ERROR {e}")
             rc = 1
 
     report["finished"] = time.strftime("%Y-%m-%dT%H:%M:%S%z")

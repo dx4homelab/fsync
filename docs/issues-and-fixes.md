@@ -18,7 +18,8 @@ fury4dx is a deployed receiver. Make changes on minis, commit + push, then
 ## ISSUE-001 — Cross-box "ghost": a file tracked on one branch reappears *untracked* on the peer
 
 - **Status:** incident **RESOLVED** 2026-07-25 (both boxes aligned to `main @ 965a7e4`).
-  fsync product fix: **A + B IMPLEMENTED in 0.4.0**; **C planned** (durable fix, under research).
+  fsync product fix: **A + B IMPLEMENTED in 0.4.0**; **C (C-b) IMPLEMENTED in 0.5.0**, config-gated
+  (`apply: auto`), default `on-demand` so it is inert until the `repos` profile opts in.
 - **Where seen:** repo `dashboard-refactor-v4` (under `workspaces/primary`), file
   `modules/vendor/dream4devops-0.8.0-py3-none-any.whl`.
 
@@ -59,9 +60,16 @@ Aligned minis to `main` (`git switch main` + fast-forward). Both boxes now on `m
 - **B. `kind:git` apply branch-divergence guard — DONE (0.4.0).** `git_repo_sync.check_branch_divergence`
   compares the receiver's checked-out branch to the producer's; `fsync git apply` now SKIPS a
   divergent repo with a clear message unless `--force` is given (receiver is still backed up first).
-- **C. (future, behavioral) File profiles skip git worktrees** owned by a `kind:git` profile, so a
-  repo travels only by bundle. Needs an apply story (auto-apply or explicit step) so fury's repos
-  don't go stale. **Under research** — see the research notes appended below when ready.
+- **C. File profiles skip git worktrees + guarded receiver auto-apply — DONE (0.5.0, C-b).**
+  A `kind:git` profile gains `apply: on-demand | auto` (default `on-demand`). With `apply: auto`:
+  (1) `git_repo_excludes_for_file_profiles` injects per-repo subtree excludes so file profiles no
+  longer double-carry those repos; (2) the receiver auto-applies bundles in a post-pass of
+  `sync run` via `auto_apply_git_profile`, guarded by `_auto_apply_decision` — applies only a new,
+  or a not-busy + clean + same-branch repo; else skips with a reason. Every real apply backs the
+  receiver up first (R15); `--dry-run` mutates nothing. **Inert until opted in** — the code ships in
+  0.5.0 but changes nothing until the `repos` profile sets `apply: auto`.
+  **To activate:** add `apply: auto` to the `repos` profile in `sync-profiles.yaml`, deploy config,
+  validate with `fsync sync run --profile repos --profile git-bundles --dry-run`.
 
 ### Prevention
 Keep a given repo on the **same branch** across both boxes. Do fsync/repo edits on the minis master.
@@ -108,10 +116,11 @@ safety intent.
 (no-delete). The first guarded `apply` per repo reconciles the tree exactly (`read-tree --reset` +
 `clean`), so strays are cleaned then — no separate cleanup needed.
 
-**Open decisions (need user input before building):**
-1. Auto-apply (C-b) or keep manual (C-a)? — the R17 v1→v2 call.
-2. If auto-apply: confirm the safe policy = only when receiver repo is clean, not busy, same branch; else skip + report.
-3. Config surface: per-`repos`-profile `apply:` flag, default `on-demand`.
+**Decisions (resolved 2026-07-25):** C-b chosen. Safe policy = apply only when the receiver repo is
+new, or not-busy + clean + same-branch; else skip + report. Config surface = per-`kind:git`-profile
+`apply: on-demand | auto`, default `on-demand`.
 
-**Next steps (not yet done):** prototype the exclude injection + a `sync run` report line for
-skipped/unapplied repos; then, if C-b chosen, the guarded auto-apply path with tests.
+**Status:** implemented in 0.5.0 (see the Fix/C bullet above), tests in
+`tests/test_issue001_autoapply.py`. **Remaining = the config flip:** set `apply: auto` on the `repos`
+profile once validated with a `--dry-run`; this is a live behavioural change (fury's repos start
+auto-applying) so do it deliberately, not by default.

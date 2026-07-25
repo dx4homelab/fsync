@@ -462,6 +462,14 @@ def apply_repo(repo: str | Path, bundle_path: str | Path, meta: dict[str, Any], 
     }
 
 
+def is_dirty(repo: str | Path) -> bool:
+    """True if the working tree has any uncommitted change (tracked or untracked).
+    Used by the guarded auto-apply to refuse clobbering a receiver the user may
+    be editing (honors R17's intent)."""
+    r = _git(repo, "status", "--porcelain", check=False)
+    return bool((r.stdout or "").strip())
+
+
 def check_branch_divergence(repo: str | Path, meta: dict[str, Any]) -> dict[str, Any] | None:
     """Return divergence info when the receiver is on a DIFFERENT branch than the
     producer, else None (ISSUE-001 guard, fix B).
