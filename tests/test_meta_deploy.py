@@ -12,6 +12,33 @@ from pathlib import Path
 import pytest
 
 
+import re
+
+from fsync.meta_deploy import CORE_MODULES
+
+
+def test_dispatchable_command_modules_ship_in_pyz():
+    """Guard the P8 regression: every internal module reached by a lazy
+    `from .X import` in the CLI dispatch must be bundled in the pyz (CORE_MODULES)
+    unless it's a deliberately-excluded UI/server module — otherwise the deployed
+    pyz version bumps but the command ModuleNotFoundErrors on the remote."""
+    pkg = Path(__file__).resolve().parent.parent / "fsync"
+    # UI/server modules pull native deps and are intentionally left out of the pyz.
+    excluded = {"tui", "web", "views", "gtk_app", "client", "daemon"}
+    referenced: set[str] = set()
+    for src in ("cli.py", "homesync.py"):
+        text = (pkg / src).read_text()
+        for mod in re.findall(r"from \.([a-z_]+) import", text):
+            if (pkg / f"{mod}.py").exists():
+                referenced.add(mod)
+    missing = {m for m in referenced
+               if m not in excluded and f"{m}.py" not in CORE_MODULES}
+    assert not missing, f"command modules missing from the pyz CORE_MODULES: {sorted(missing)}"
+    # the two P7/P8 command modules specifically must be present
+    assert "foldersync.py" in CORE_MODULES
+    assert "vmclone.py" in CORE_MODULES
+
+
 # --------------------------------------------------------------------------- #
 # multi-host config resolution                                                #
 # --------------------------------------------------------------------------- #

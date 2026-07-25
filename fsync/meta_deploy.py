@@ -24,7 +24,8 @@ from pathlib import Path
 # `index --store-db` / `agent` if its deps happen to be present.
 CORE_MODULES = [
     "__init__.py", "cli.py", "fileindex.py", "homesync.py", "git_repo_sync.py",
-    "meta_deploy.py", "db.py", "catalog_client.py", "eventbus.py", "agent.py",
+    "meta_deploy.py", "foldersync.py", "vmclone.py",
+    "db.py", "catalog_client.py", "eventbus.py", "agent.py",
 ]
 
 DEFAULT_PYZ = "~/.fsync/deploy/fsync.pyz"

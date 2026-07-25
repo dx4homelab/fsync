@@ -724,6 +724,19 @@ def build_parser() -> argparse.ArgumentParser:
                               help="Run cadence as a systemd time span (default: 1h)")
     p_sync_timer.add_argument("--verbose", action="count", default=0, help="Increase verbosity")
 
+    p_sync_folder = sync_sub.add_parser(
+        "folder", help="Ad-hoc reconcile of ONE folder with the peer, VCS-aware "
+                       "(SVN-first recommendation with [y/N] steps; git -> bundles; plain -> newest-wins)")
+    p_sync_folder.add_argument("path", help="Folder to reconcile (must be under $HOME; same rel path on both boxes)")
+    p_sync_folder.add_argument("--dry-run", action="store_true",
+                               help="Print the recommendation/plan only; run nothing")
+    p_sync_folder.add_argument("--yes", action="store_true",
+                               help="Auto-approve the safe Tier-1 steps (never commit or manual steps)")
+    p_sync_folder.add_argument("--direction", choices=("both", "push", "pull"), default=None,
+                               help="Plain (non-VCS) folders only: sync direction (default: both)")
+    p_sync_folder.add_argument("--config", help="Profiles YAML (default: ~/.config/fsync/sync-profiles.yaml)")
+    p_sync_folder.add_argument("--verbose", action="count", default=0, help="Increase verbosity")
+
     # git: full-fidelity git-repo sync via bundles (docs/git-repo-sync.md)
     p_git = sub.add_parser("git", help="Full-fidelity git-repo sync: snapshot/apply exact working state via bundles")
     git_sub = p_git.add_subparsers(dest="git_cmd")

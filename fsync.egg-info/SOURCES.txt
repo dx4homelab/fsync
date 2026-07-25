@@ -11,10 +11,14 @@ fsync/daemon.py
 fsync/db.py
 fsync/eventbus.py
 fsync/fileindex.py
+fsync/foldersync.py
+fsync/git_repo_sync.py
 fsync/gtk_app.py
 fsync/homesync.py
+fsync/meta_deploy.py
 fsync/tui.py
 fsync/views.py
+fsync/vmclone.py
 fsync/web.py
 fsync.egg-info/PKG-INFO
 fsync.egg-info/SOURCES.txt
@@ -24,6 +28,11 @@ fsync.egg-info/requires.txt
 fsync.egg-info/top_level.txt
 tests/test_cli_and_options.py
 tests/test_fileindex.py
+tests/test_foldersync.py
+tests/test_git_repo_sync.py
 tests/test_homesync_p1.py
+tests/test_meta_deploy.py
+tests/test_meta_sync.py
 tests/test_p4_2_views_web.py
 tests/test_sync_plan.py
+tests/test_vmclone.py

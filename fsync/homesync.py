@@ -1887,5 +1887,8 @@ def cmd_sync(args) -> int:
         return _cmd_run(args)
     if getattr(args, "sync_cmd", None) == "timer":
         return _cmd_timer(args)
-    print("usage: fsync sync {run|init|timer} ...", file=sys.stderr)
+    if getattr(args, "sync_cmd", None) == "folder":
+        from .foldersync import cmd_sync_folder
+        return cmd_sync_folder(args)
+    print("usage: fsync sync {run|init|timer|folder} ...", file=sys.stderr)
     return 2
