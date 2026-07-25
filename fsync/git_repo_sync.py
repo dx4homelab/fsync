@@ -462,6 +462,69 @@ def apply_repo(repo: str | Path, bundle_path: str | Path, meta: dict[str, Any], 
     }
 
 
+def check_branch_divergence(repo: str | Path, meta: dict[str, Any]) -> dict[str, Any] | None:
+    """Return divergence info when the receiver is on a DIFFERENT branch than the
+    producer, else None (ISSUE-001 guard, fix B).
+
+    A producer-tracked file that the receiver's branch doesn't track lands
+    untracked after apply — and, more surprisingly, apply silently moves the
+    receiver onto the producer's branch (``_reconstruct`` sets HEAD to it). So a
+    branch mismatch is exactly the condition worth stopping on. New/absent repos,
+    or a receiver already on the producer's branch, are not divergence.
+    """
+    repo = Path(repo)
+    if not is_git_repo(repo) or not _has_head(repo):
+        return None  # first sync / unborn -> nothing to diverge from
+    recv_branch = _git(repo, "symbolic-ref", "-q", "--short", "HEAD",
+                       check=False).stdout.strip() or None
+    prod_branch = meta.get("branch")
+    if recv_branch == prod_branch:
+        return None
+    return {
+        "receiver_branch": recv_branch,
+        "producer_branch": prod_branch,
+        "receiver_head": _out(repo, "rev-parse", "HEAD"),
+        "producer_head": meta.get("head"),
+    }
+
+
+# Fix A (ISSUE-001): after a FILE profile transfers into a tree that contains git
+# repos, files tracked on the producer's branch but not the receiver's arrive as
+# untracked "ghosts". This probe reports exactly those — the transferred paths
+# that git reports as untracked (``??``) on the receiving side. Runs on whichever
+# box received the leg (local via subprocess, peer via ssh); args are the root and
+# the transferred rel-paths, output is one ghost rel-path per line.
+GHOST_PROBE = r'''
+import os, subprocess, sys
+from collections import defaultdict
+root = sys.argv[1]
+paths = sys.argv[2:]
+groups, tl_cache = defaultdict(list), {}
+def toplevel(d):
+    if d not in tl_cache:
+        r = subprocess.run(["git", "-C", d, "rev-parse", "--show-toplevel"],
+                           capture_output=True, text=True)
+        tl_cache[d] = r.stdout.strip() if r.returncode == 0 else None
+    return tl_cache[d]
+for p in paths:
+    ap = os.path.join(root, p)
+    tl = toplevel(os.path.dirname(ap))
+    if tl:
+        groups[tl].append(ap)
+out = set()
+for tl, aps in groups.items():
+    rels = [os.path.relpath(ap, tl) for ap in aps]
+    r = subprocess.run(["git", "-C", tl, "status", "--porcelain",
+                        "--untracked-files=all", "-z", "--"] + rels,
+                       capture_output=True, text=True)
+    for e in r.stdout.split("\x00"):
+        if e.startswith("?? "):
+            out.add(os.path.relpath(os.path.join(tl, e[3:]), root))
+for g in sorted(out):
+    print(g)
+'''
+
+
 def preview_apply(repo: str | Path, meta: dict[str, Any]) -> dict[str, Any]:
     """Non-mutating: what an apply would change. Compares the receiver's current
     HEAD/dirty against the incoming bundle's."""

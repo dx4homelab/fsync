@@ -18,7 +18,7 @@ fury4dx is a deployed receiver. Make changes on minis, commit + push, then
 ## ISSUE-001 — Cross-box "ghost": a file tracked on one branch reappears *untracked* on the peer
 
 - **Status:** incident **RESOLVED** 2026-07-25 (both boxes aligned to `main @ 965a7e4`).
-  fsync product fix: **PLANNED — not yet implemented.**
+  fsync product fix: **A + B IMPLEMENTED in 0.4.0**; **C planned** (durable fix, under research).
 - **Where seen:** repo `dashboard-refactor-v4` (under `workspaces/primary`), file
   `modules/vendor/dream4devops-0.8.0-py3-none-any.whl`.
 
@@ -50,17 +50,18 @@ deletion — a "ghost" that would not stay gone.
 Aligned minis to `main` (`git switch main` + fast-forward). Both boxes now on `main @ 965a7e4`,
 0.8.0 gone both sides, 0.9.0 present, `git status` clean on both. Verified.
 
-### Fix (fsync product change) — planned
-- **A. File-sync untracked-introduction report (primary fix).** After a file profile transfers into
-  a directory that is a git worktree, run `git status --porcelain` and warn in the run report about
-  files that landed **untracked** on the receiver. Surfaces this ghost regardless of transport.
-  Detection only — no behavior change.
-- **B. `kind:git` apply branch-divergence guard.** Before `fsync git apply`, if the receiver's
-  checked-out branch/HEAD differs from the producer's, warn (and require `--force`), because apply
-  silently switches the receiver onto the producer's branch. Guards a real (separate) footgun.
+### Fix (fsync product change)
+- **A. File-sync untracked-introduction report — DONE (0.4.0).** After a file leg transfers into a
+  git worktree, a probe (`git_repo_sync.GHOST_PROBE`, run per receiving side via
+  `homesync._scan_untracked_introductions`) reports transferred paths that git shows as `??`
+  untracked on the receiver. Surfaced in the run report (`untracked_introductions`) and a `!` log
+  warning. Detection only — no behavior change; best-effort (never fails a run).
+- **B. `kind:git` apply branch-divergence guard — DONE (0.4.0).** `git_repo_sync.check_branch_divergence`
+  compares the receiver's checked-out branch to the producer's; `fsync git apply` now SKIPS a
+  divergent repo with a clear message unless `--force` is given (receiver is still backed up first).
 - **C. (future, behavioral) File profiles skip git worktrees** owned by a `kind:git` profile, so a
   repo travels only by bundle. Needs an apply story (auto-apply or explicit step) so fury's repos
-  don't go stale; design separately.
+  don't go stale. **Under research** — see the research notes appended below when ready.
 
 ### Prevention
 Keep a given repo on the **same branch** across both boxes. Do fsync/repo edits on the minis master.

@@ -757,6 +757,9 @@ def build_parser() -> argparse.ArgumentParser:
         if _name == "apply":
             gp.add_argument("--mirror-branches", action="store_true",
                             help="Prune local branches the producer no longer has (safe: receiver is backed up)")
+            gp.add_argument("--force", action="store_true",
+                            help="Apply even when the receiver is on a different branch than the producer "
+                                 "(branch-divergence guard, ISSUE-001)")
             gp.add_argument("--keep", type=int, default=10,
                             help="Keep only the newest N pre-apply backup runs (default 10; 0 = keep all)")
         if _name in ("apply", "restore"):

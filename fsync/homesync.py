@@ -816,6 +816,36 @@ def build_run_preview(
     return out
 
 
+MAX_GHOST_SCAN = 2000  # cap probe args to bound command length + latency
+
+
+def _scan_untracked_introductions(root: str, rel_paths: list[str], *,
+                                  peer: Peer | None) -> tuple[list[str], bool]:
+    """Fix A (ISSUE-001): after a file leg, report which transferred paths landed
+    UNTRACKED in a git worktree on the receiving side — the cross-branch ghost
+    signature. Runs the probe on the peer (ssh) or locally. Best-effort: any
+    failure returns no ghosts rather than breaking the run. Returns
+    (ghost_rel_paths, truncated)."""
+    paths = [p for p in rel_paths if p]
+    if not paths:
+        return [], False
+    truncated = len(paths) > MAX_GHOST_SCAN
+    paths = paths[:MAX_GHOST_SCAN]
+    try:
+        if peer is not None:
+            cmd = ("python3 -c " + shlex.quote(grs.GHOST_PROBE) + " "
+                   + shlex.quote(root) + " "
+                   + " ".join(shlex.quote(p) for p in paths))
+            proc = _ssh(peer, cmd, timeout=180)
+        else:
+            proc = subprocess.run(["python3", "-c", grs.GHOST_PROBE, root, *paths],
+                                  capture_output=True, text=True, timeout=180)
+    except (subprocess.SubprocessError, OSError):
+        return [], truncated
+    ghosts = [ln for ln in (proc.stdout or "").splitlines() if ln.strip()]
+    return ghosts, truncated
+
+
 def run_profile(
     peer: Peer,
     prof: Profile,
@@ -925,6 +955,20 @@ def run_profile(
             if progress else None,
         )
 
+        # Fix A (ISSUE-001): flag transferred files that landed untracked on the
+        # receiver (cross-branch ghosts). a_paths went to the peer; b_paths came
+        # here. Detection only — never fails the run.
+        ghosts_peer = ghosts_local = []
+        ghosts_truncated = False
+        if not dry_run:
+            if a_paths:
+                ghosts_peer, tp = _scan_untracked_introductions(remote_root, a_paths, peer=peer)
+                ghosts_truncated = ghosts_truncated or tp
+            if b_paths:
+                ghosts_local, tl = _scan_untracked_introductions(str(local_root), b_paths, peer=None)
+                ghosts_truncated = ghosts_truncated or tl
+        ghost_total = len(ghosts_peer) + len(ghosts_local)
+
         conflicts = [
             {"path": a.get("path"),
              "a": {"mtime": a.get("mtime"), "hash": a.get("hash"), "size": a.get("size")},
@@ -947,10 +991,19 @@ def run_profile(
             "renames_pending": len(plan["renames"]),
             "renames_demoted": len(plan["renames_suppressed"]),
             "identical": plan["noop"],
+            "untracked_introductions": {
+                "on_peer": ghosts_peer, "on_local": ghosts_local,
+                "count": ghost_total, "truncated": ghosts_truncated,
+            },
             "seconds": round(time.time() - started, 2),
         }
         if progress:
             progress.path_done(prof.name, rel, result["paths"][rel])
+        if ghost_total:
+            sample = (ghosts_peer + ghosts_local)[:5]
+            log(f"  ! {prof.name}/{rel}: {ghost_total} transferred file(s) UNTRACKED on the "
+                f"receiver — possible cross-branch ghost (ISSUE-001): "
+                + ", ".join(sample) + (" ..." if ghost_total > 5 else ""))
         log(
             f"  {prof.name}/{rel}: A->B {len(a_paths)}"
             + (f" ({over_ab} overwrite->backup)" if over_ab else "")
@@ -1197,6 +1250,23 @@ def cmd_git(args) -> int:
                 print(f"{meta['name']}: SKIP {rel} — receiver {busy}", file=sys.stderr)
                 rc = 1
                 continue
+            # Fix B (ISSUE-001): refuse to apply across a branch mismatch unless
+            # forced — apply would silently switch the receiver's branch and can
+            # leave producer-tracked files untracked here.
+            div = grs.check_branch_divergence(target, meta)
+            if div and not getattr(args, "force", False):
+                print(f"{meta['name']}: SKIP {rel} — branch divergence: receiver on "
+                      f"{div['receiver_branch'] or 'DETACHED'}, producer on "
+                      f"{div['producer_branch'] or 'DETACHED'}. Applying would switch this "
+                      f"repo's branch and can leave producer-tracked files untracked. "
+                      f"Re-run with --force to proceed (receiver is backed up first).",
+                      file=sys.stderr)
+                rc = 1
+                continue
+            if div:
+                log(f"{meta['name']}: WARNING branch divergence — receiver "
+                    f"{div['receiver_branch'] or 'DETACHED'}, producer "
+                    f"{div['producer_branch'] or 'DETACHED'} — proceeding under --force")
         try:
             res = grs.apply_repo(target, bundle, meta, backup_dir=backup_dir,
                                  mirror_branches=getattr(args, "mirror_branches", False))

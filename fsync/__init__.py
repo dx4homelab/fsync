@@ -7,7 +7,7 @@ __all__ = ["fileindex"]
 # Bump FEATURES when adding a capability a config can depend on; the config's
 # `requires:` list is checked against this set at load time (see homesync.load_config)
 # so a box never acts on config its code doesn't yet understand (the skew window).
-__version__ = "0.3.0"
+__version__ = "0.4.0"
 FEATURES = frozenset({
     "home-sync",   # P1-P4: profile-driven file sync
     "git-sync",    # P5: full-fidelity git working-tree sync (kind: git)
