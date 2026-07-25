@@ -1120,6 +1120,13 @@ def _auto_apply_decision(target: Path, meta: dict[str, Any]) -> tuple[bool, str]
     if div:
         return False, (f"branch divergence (receiver {div['receiver_branch'] or 'DETACHED'}, "
                        f"producer {div['producer_branch'] or 'DETACHED'})")
+    # Already at the producer's exact state — skip so we don't re-apply (and R15
+    # back up) all repos every run when nothing changed. A dirty producer
+    # (meta.dirty) means the worktree differs from HEAD, so still apply.
+    hp = grs._git(target, "rev-parse", "HEAD", check=False)
+    recv_head = hp.stdout.strip() if hp.returncode == 0 else None
+    if recv_head and recv_head == meta.get("head") and not meta.get("dirty"):
+        return False, "up to date"
     return True, "clean"
 
 

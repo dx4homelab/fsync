@@ -78,12 +78,20 @@ def test_decision_new_repo_applies(tmp_path):
     assert ok and reason == "new"
 
 
-def test_decision_clean_same_branch_applies(tmp_path):
+def test_decision_clean_same_branch_producer_ahead_applies(tmp_path):
+    # clean receiver, same branch, but producer at a different head -> apply
+    repo = _init_repo(tmp_path / "r", branch="main")
+    ok, reason = _auto_apply_decision(repo, {"branch": "main", "head": "0" * 40, "dirty": False})
+    assert ok and reason == "clean"
+
+
+def test_decision_up_to_date_skips(tmp_path):
+    # clean receiver already at producer HEAD, producer not dirty -> no re-apply
     repo = _init_repo(tmp_path / "r", branch="main")
     head = subprocess.run(["git", "-C", str(repo), "rev-parse", "HEAD"],
                           capture_output=True, text=True).stdout.strip()
-    ok, reason = _auto_apply_decision(repo, {"branch": "main", "head": head})
-    assert ok and reason == "clean"
+    ok, reason = _auto_apply_decision(repo, {"branch": "main", "head": head, "dirty": False})
+    assert not ok and reason == "up to date"
 
 
 def test_decision_dirty_skips(tmp_path):
@@ -139,6 +147,20 @@ def test_autoapply_skips_dirty_receiver(tmp_path, monkeypatch):
     res = auto_apply_git_profile(prof, bundle_dir, run_id="t2", dry_run=False, log=lambda *a: None)
     assert res["applied"] == []
     assert any("local changes" in s["reason"] for s in res["skipped"])
+
+
+def test_autoapply_skips_when_up_to_date(tmp_path, monkeypatch):
+    bundle_dir, rel, name = _bundle_producer(tmp_path)
+    recv_home = tmp_path / "recv"
+    monkeypatch.setattr(hs, "_home", lambda: recv_home)
+    monkeypatch.setattr(hs, "DEFAULT_GIT_BACKUP_ROOT", str(tmp_path / "backups"))
+    prof = Profile(name="repos", paths=["workspaces/primary"], kind="git",
+                   apply="auto", direction="pull")
+    auto_apply_git_profile(prof, bundle_dir, run_id="t1", dry_run=False, log=lambda *a: None)
+    # second run: receiver already at producer HEAD, clean -> no re-apply, no churn
+    res = auto_apply_git_profile(prof, bundle_dir, run_id="t2", dry_run=False, log=lambda *a: None)
+    assert res["applied"] == []
+    assert any(s["reason"] == "up to date" for s in res["skipped"])
 
 
 def test_autoapply_dry_run_mutates_nothing(tmp_path, monkeypatch):
