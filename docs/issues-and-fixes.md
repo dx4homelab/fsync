@@ -294,6 +294,88 @@ rather than a reason to stop.
 
 ---
 
+## ISSUE-007 — Deletions never propagate: a file removed on one box lives on the other forever, unreported
+
+- **Status:** OPEN — incident resolved by hand 2026-07-28. Same reconciliation as ISSUE-002..006.
+- **Where seen:** `workspaces/primary/asap/trunk` — 13 files, stranded on fury4dx for **14 days**.
+
+### Symptom
+On **2026-07-14** twelve stale pre-reorg `trunk/assets/*.json` and a duplicate
+`trunk/android/app/src/main/kotlin/com/example/flutterasap/MainActivity.kt` were moved out of the
+working copy into `asap/scratchpad/trunk-stale-2026-07-14/`. That cleanup was performed on
+**minis4dx**. On **2026-07-28** all thirteen were still sitting in fury4dx's `trunk/`, byte-identical
+to the quarantined copies, while minis' `trunk/` had been clean the whole time.
+
+Nothing ever reported this. The `primary` profile logged `status: ok` on every run for two weeks.
+The files are untracked in SVN, so no SCM surfaced them either. They were found only by an explicit
+`rsync -c` sweep, and identified as junk only because a human remembered the 2026-07-14 cleanup.
+
+### Root cause (verified against code, 2026-07-28)
+Deletions are **structurally impossible** in a profile run — not merely disabled:
+
+1. `Profile` (`fsync/homesync.py:330-349`) has **no `mirror` field**. It carries `direction`,
+   `conflict`, `kind`, `mirror_branches` (a git concern) — nothing that selects a mirror mode.
+2. `build_sync_plan` (`fsync/fileindex.py:610`) only ever populates `a_delete` / `b_delete` under
+   `mirror='a-to-b'` or `'b-to-a'` (`:696-707`). The profile path always reaches the
+   **union** branch (`:708`), where both delete lists are returned empty (`:733-734`).
+3. `fsync/homesync.py` never passes `--delete` to rsync for a profile leg, and never reads
+   `a_delete`/`b_delete`. (The two `--delete` hits at `:562` and `:1582` are the deploy/venv
+   mirroring helpers, not profile sync.)
+
+So every profile leg is purely additive, in both one-way and `direction: both` modes.
+
+**The deeper reason the safe default is safe:** a run compares two *live* trees with no memory of
+the previous run. Given "path exists on A, absent on B", **"B deleted it" and "A created it" are
+indistinguishable**. fsync always resolves that ambiguity as *created* — which is correct, and is
+precisely the guard that keeps the ISSUE-001 ghost incident from being a data-loss incident instead.
+The defect is not the choice; it is that the discarded interpretation is never even **reported**, so
+a real deletion silently degrades into permanent divergence.
+
+**No baseline is retained.** A run directory holds only `progress.json`, `report.json` and
+`git-bundles/` — no index snapshot. Yet the machinery already exists: `fsync index --output` writes
+JSON/JSONL and `compare` consumes it (`fileindex.load_index_file`, `iter_index_records`;
+`cli.py` even has `--store-db`). Persisting one index per profile path per run is wiring, not new
+capability.
+
+### Resolution (the incident)
+Removed the 13 files from fury by hand
+(`asap/scratchpad/fsync-recon/80-remove-ghosts.sh`), gated by a pre-flight that refused to delete
+anything unless it was untracked **and** had a byte-identical copy in the 2026-07-14 quarantine dir
+(which still exists on both boxes). Both boxes now agree.
+
+Two traps that pre-flight caught, worth recording:
+- `trunk/android/app/src/main/kotlin/**com**` is a **versioned (empty) SVN directory** — a leftover
+  of the `net.afsas.asap` package rename. Only `com/example` and below was untracked. Deleting
+  `com/` would have left the working copy with a `!` missing entry.
+- **Plain `svn status` prints nothing for ignored paths**, so an ignored file is indistinguishable
+  from a versioned-and-clean one. `svn info` is the authoritative test — it errors for anything not
+  under version control.
+
+### Fix (proposed, 0.6.0)
+- **A. Persist a per-run index** per profile path (`~/.local/state/fsync/runs/<id>/index-<profile>.jsonl`,
+  or a rolling `last-index` per profile). Reuses `index --output` / `load_index_file` as-is.
+- **B. Detect and REPORT, do not delete.** With a baseline, "present in baseline **and** still on A
+  **and** now gone from B" is an unambiguous deletion on B. Surface it as `deleted_on_peer` in the
+  report and raise `status: attention` (see ISSUE-003). Report-only is exactly how ISSUE-001 fix A
+  shipped `untracked_introductions` — the established pattern here, and it alone would have surfaced
+  these 13 files on **2026-07-15**.
+- **C. Only then, optional propagation** behind an explicit per-profile `propagate_deletes: true`
+  (default off), backing up every removed file to `backup_root` first, as the transfer legs already do.
+- **D. Absent or stale baseline must mean "do nothing".** No baseline (first run, upgrade, cleared
+  state) or one older than N days ⇒ report only, never delete. The failure mode to design against is
+  a missing baseline being read as "everything was deleted".
+- **E. Order matters: land ISSUE-005 first.** While `.dart_tool`, `.flutter-sdk`, `build/`, `bin/`
+  and `*.class` are still in scope, ~99% of candidate paths are regenerable artifacts that appear and
+  vanish per build. Delete-propagation over that set would be both deafening and dangerous.
+
+### Prevention
+An additive-only sync is a reasonable default, but "additive" silently means **divergence is
+permanent and unbounded**: every deletion either happens twice by hand or never happens at all.
+Detection is cheap and carries no risk — the ambiguity fsync cannot resolve is still worth showing
+the human who can.
+
+---
+
 ## ISSUE-001 — Cross-box "ghost": a file tracked on one branch reappears *untracked* on the peer
 
 - **Status:** incident **RESOLVED** 2026-07-25 (both boxes aligned to `main @ 965a7e4`).
