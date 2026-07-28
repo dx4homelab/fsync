@@ -15,6 +15,285 @@ fury4dx is a deployed receiver. Make changes on minis, commit + push, then
 
 ---
 
+## ISSUE-002 — Detected "renames" are dropped from profile-driven syncs entirely: never copied, never renamed, still `status: ok`
+
+- **Status:** OPEN — **product bug, verified in code.** Incident resolved by hand 2026-07-28.
+- **Where seen:** `workspaces/primary/asap/scratchpad/collision-check/`, `primary` profile.
+  `renames_pending: 5` in **every** run from 2026-07-13 to 2026-07-28.
+
+### Symptom
+Five files existed only on fury (dated 07-12) and five only on minis (dated 07-13). Neither set
+ever crossed, for fifteen days, while the profile reported `conflicts: 0`, `identical: 170551`,
+`status: ok`. The only trace was `renames_pending: 5`, which never changed and never escalated.
+
+The files are the S3 **collision-check fixtures** — each body reads
+`{"submissionType":"hazard","bogus_field_2":"payload number 2 — must not be overwritten"}`.
+fsync declined to copy them at all.
+
+### Root cause (verified against code, 2026-07-28)
+`build_sync_plan` (`fsync/fileindex.py:610-739`) classifies a pair as a rename when the same
+content hash appears under two different paths and that hash occurs **exactly twice** overall
+(`:678-685`). Our five pairs satisfy this precisely: `sha256sum` over the ten files yields **five
+distinct hashes, each appearing exactly once per box**.
+
+Pairs that fail the uniqueness or `rename_min_size` guard land in `suppressed` and are correctly
+**demoted to plain copies** — `a_to_b.extend(a for a, _ in suppressed)` (`:712-713`). Pairs that
+*pass* land in `renames` (`:685`) and are returned at `:736`.
+
+**Nothing in the profile-driven path ever consumes `plan["renames"]`.** It is not added to
+`a_to_b`, `b_to_a`, `a_delete` or `b_delete` in any branch — mirror or union. Its only reader in
+`fsync/homesync.py` is line **1001**, `"renames_pending": len(plan["renames"])`, which merely
+counts it. There is no `os.rename`, `shutil.move` or `mv` anywhere in `fsync/`. The sole real
+consumer is `fsync/cli.py:533-551`, which writes a `plan.renames.sh` for the **manual**
+`sync-plan` workflow — a path the scheduler never takes.
+
+So a pair classified as a rename is silently **excluded from the plan**. "Pending" is not a queue;
+nothing will ever drain it.
+
+### The classification is also wrong here
+A rename is a *within-box, across-time* event. What fsync sees is a *cross-box, same-instant*
+comparison, where "same content under a different name" is equally well explained by two
+independent runs of a tool that emits timestamped filenames — which is exactly what happened. With
+no history, fsync cannot tell the two apart, and it currently resolves the ambiguity by doing
+nothing, which is the one option that can lose data.
+
+### Resolution (the incident)
+Copied both sets explicitly in both directions; each box now holds all ten files.
+
+### Fix (proposed, 0.6.0)
+- **A. Make `renames` fall through to `suppressed` behaviour in the union (non-mirror) branch.**
+  One line beside `:712-713`; both sides then receive the other's path, content already identical.
+  Cheap (the bytes exist locally, so rsync's delta transfer is near-free) and cannot lose data.
+- **B. Only honour renames where a rename is *provable*** — i.e. under `mirror`, where one side is
+  authoritative and the counterpart's disappearance is real evidence. Even there, emit the
+  rename plan rather than dropping it.
+- **C. Fail loudly on a leak.** Assert that every input item lands in exactly one output bucket;
+  `renames_pending > 0` must force `status: attention`, never `ok`. A silently unconsumed bucket is
+  how this survived fifteen days.
+- **D. Age out pending renames.** If a pair is still pending after N runs, demote it to a plain copy
+  and log the demotion.
+
+### Prevention
+`renames_demoted` was 0 and `renames_pending` was 5 in every single report — a stuck non-zero
+counter next to a green status. Any counter that means "work not done" should be wired to status.
+
+---
+
+## ISSUE-003 — One-way profiles report `status: ok` while silently stranding content-differing files
+
+- **Status:** OPEN — incident resolved by hand 2026-07-28; product change proposed.
+- **Where seen:** `primary` profile (`direction: pull` on fury4dx), every run for ~2 weeks.
+
+### Symptom
+Every scheduled run reported the `primary` profile as healthy:
+
+```
+primary: status=ok  identical=170551  conflicts=0  files_transferred=0
+         skipped_by_direction=1052    renames_pending=5
+```
+
+Behind that green line, **45 content-differing files of genuine fury-authored work** had never
+reached minis — among them the 2026-07-27 IL2 validation report, `validate-traceid-sim.sh`, six
+`*.valid-may.json` e2e fixtures, a new JUnit test, nine OPS incident documents, and the newest
+`DASHBOARD-CONTRACT.md`. Some had been stranded since 2026-07-12.
+
+### Root cause
+1. `fsync/homesync.py:876` initialises `result = {..., "status": "ok"}` and only downgrades it on
+   an error. Stranding is not an error, so the status never moves.
+2. `fsync/homesync.py:940-945` computes `skipped_by_direction` as a bare `len(...)` of the paths
+   dropped by the direction policy. It is reported (`:999`) and appended to the log line (`:1025`)
+   but never influences status, and the paths themselves are never listed.
+3. The headline number the UI shows is `identical` (`fsync/views.py:97,110,127,155`). At 170,551
+   it dwarfs 1,052 skipped and 5 pending by two orders of magnitude, so the row reads as healthy
+   at a glance.
+
+The one-way policy itself is correct and was adopted deliberately (ISSUE-001, and the
+2026-07-11 stale-mirror-ghosts incident). The defect is that it is **silent**: "I chose not to
+copy this" and "there is nothing to copy" are rendered identically.
+
+### Resolution (the incident)
+Compared both boxes with `rsync -ain -u` per direction, then re-checked every candidate with
+`rsync -c` to separate mtime drift from real content drift (of 514 "real source" pull candidates,
+**509 were mtime-only**). The 45 genuinely-stranded files were pushed explicitly. The profile's
+direction was **not** flipped — that would reintroduce ISSUE-001.
+
+### Fix (proposed, 0.6.0)
+- **A. Distinguish skipped-and-identical from skipped-and-diverging.** `skipped_by_direction`
+  currently counts paths the direction dropped, whether or not they differ in content. Split it
+  into `skipped_identical` and **`stranded`** (skipped *and* content-differing). Only the second
+  is interesting — and it is the only one worth hashing for.
+- **B. Escalate on `stranded > 0`** to `status: attention` (a third state beside `ok`/`error`),
+  and list the top N stranded paths in the report. A profile that has withheld the same 45 files
+  for two weeks must not render green.
+- **C. Name the remedy.** `fsync sync folder <path>` already exists and is exactly the right tool —
+  VCS-aware, SVN-first, `[y/N]` steps. Nothing in a scheduled run ever points at it. When a
+  profile reports `stranded`, print the exact command.
+- **D. Rank the report by actionability.** Lead with transferred / stranded / pending / conflicts;
+  demote `identical` to a trailing column. Today the largest number is the least informative one.
+
+### Prevention
+A one-way policy is a decision to *withhold* data. Withholding must be visible, or it becomes
+indistinguishable from having nothing to send.
+
+---
+
+## ISSUE-004 — SVN working copies are file-synced although `.git` is excluded; fsync has no SVN awareness
+
+- **Status:** OPEN — worked around by hand 2026-07-28; product change proposed.
+- **Where seen:** `workspaces/primary/asap` (`trunk`, `branches/*`, `asap_e2e`,
+  `modsec-container-trunk`, `owasp-coraza-proxy` — 5 SVN working copies, one of them dual-tracked
+  with git).
+
+### Symptom
+- `.svn` internals were **699 of 959** push-side candidates and **551 of 5,263** pull-side.
+- fury carried a `branches/.svn` container checkout (r2547) that minis did not have at all,
+  manufacturing permanent phantom divergence under `branches/`.
+- `owasp-coraza-proxy` sat at **r2486 on fury and r2726 on minis** for days. fury's copy showed
+  **16 modified files**, of which **15 were byte-identical to minis' clean r2726 checkout** — the
+  work was already committed upstream; the "modifications" were an artifact of a stale WC base.
+  No amount of file-syncing could fix that, and file-syncing `.svn` across boxes risks pasting one
+  box's WC metadata (absolute paths, pristine bases, `wc.db`) onto another's tree.
+
+### Root cause
+`primary`'s exclude list carries `.git` with the comment *"repos' git state travels via the
+kind:git 'repos' profile; file-syncing .git caused phantom deletions"* — the exact hazard applies
+to `.svn`, but `.svn` was never added, and there is no `kind: svn` counterpart to `kind: git`
+(`fsync/homesync.py` handles `kind == "git"` only). So SVN trees fall through to the plain file
+engine, which is both unsafe for `.svn` and useless for the thing that actually matters — the
+working copy's revision.
+
+### Resolution (the incident)
+Resolved through SVN, not fsync: `svn cleanup && svn update` on fury took the coraza WC r2486 →
+r2731; 15 of the 16 "modifications" merged away as `G` (already upstream), leaving exactly the one
+genuinely-uncommitted file. minis was updated to r2731 the same way. Both boxes now report
+identical revisions across all five checkouts.
+
+### Fix (proposed, 0.6.0)
+- **A. Exclude `.svn` from file profiles**, for the same reason `.git` is excluded. Do this first;
+  it is one line and removes the metadata-pasting hazard.
+- **B. Add `kind: svn`**, mirroring `kind: git`: snapshot = `svn info` (URL + revision) plus
+  `svn status`/`svn diff` for uncommitted work; apply = `svn update`, then re-apply the diff.
+  Uncommitted changes travel as a patch; committed history travels via the server, which is where
+  it already is.
+- **C. Minimum viable version — a revision-parity advisory.** Even without `kind: svn`, comparing
+  `svn info --show-item revision` per checkout across boxes and reporting
+  *"asap/owasp-coraza-proxy: fury r2486, minis r2726 — run `svn update`, do not file-sync"*
+  would have surfaced this on day one. It is a few lines and needs no transport.
+
+### Prevention
+Both boxes now reach the SVN server over the Staging VPN, so the server is the correct transport
+for versioned content. fsync should carry only what SCM does not: untracked and uncommitted files.
+
+---
+
+## ISSUE-005 — Generated build artifacts are ~99% of the diff, hiding the 1% that matters
+
+- **Status:** OPEN — config change proposed, not yet applied.
+- **Where seen:** `workspaces/primary/asap` (Flutter + Gradle/Eclipse Java), 2026-07-28.
+
+### Symptom
+A full content comparison of one project folder produced 5,263 differing files one way and 959
+the other. After filtering generated output, the real divergence was **5 files** and **45 files**
+respectively — a signal-to-noise ratio of about **1%**. The `primary` profile leg takes ~39s
+per run, most of it hashing artifacts that should never have been candidates.
+
+### Root cause
+`primary` / `homelab` exclude `.git`, `.venv*`, `node_modules`, `__pycache__`, `*.pyc`,
+`.pytest_cache`, `backups`, `mtab`, `.metadata/*` — a list grown incident-by-incident. It has no
+entry for the toolchains actually in these trees:
+
+| kind | paths seen | count |
+|---|---|---|
+| Flutter/Dart | `.dart_tool/`, `.flutter-sdk/bin/cache/`, `build/` | ~4,700 |
+| Gradle | `.gradle/`, `**/build/`, `*.lock`, `gc.properties`, `last-build.bin` | ~700 |
+| Eclipse/JDT | `.settings/`, `.classpath`, `.factorypath`, `.project`, `bin/main/**/*.class` | ~120 |
+
+These are machine-local, regenerable, and churn on every build, so they diverge permanently and
+by design. `.flutter-sdk/bin/cache/` is a vendored SDK — a *downloaded toolchain*, not project content.
+
+### Fix (proposed, 0.6.0)
+- **A. Extend the excludes now** (config-only, no code): add `.dart_tool`, `.flutter-sdk`,
+  `.gradle`, `.settings`, `.classpath`, `.factorypath`, `.project`, `build`, `bin`,
+  `.pub-cache`, `.cxx`, `.idea`, `*.class`, `*.stamp`, `*.dill` to `primary` and `homelab`.
+- **B. Ship `preset:` exclude bundles** so this list stops being hand-maintained:
+  `preset: [flutter, gradle, eclipse, node, python]` expanding to curated sets fsync owns and
+  updates. Profiles then declare intent, not trivia.
+- **C. Report artifact share.** If >50% of a leg's candidates match a known-artifact preset that
+  the profile has *not* enabled, log a one-line hint naming the preset. The waste is invisible today.
+
+### Prevention
+An exclude list that only grows by incident will always lag the toolchain. Presets make the common
+case correct by default.
+
+---
+
+## ISSUE-006 — `kind:git` is producer→receiver only, so receiver-authored commits have no path home; persistent skips never escalate
+
+- **Status:** OPEN — worked around by hand 2026-07-28.
+- **Where seen:** `repos` profile, `asap__owasp-coraza-proxy`.
+
+### Symptom
+Every run skipped the repo with `reason: "receiver has local changes"`. In fact fury (the
+*receiver*) held a legitimate commit that minis did not — `458660f`, a documentation correction on
+top of minis' `aef11ce`, on both `main` and `waf-validation-930120-fix`. The guard was right to
+refuse, but the commit had no route to minis regardless: `repos` inherits the host default
+`direction: pull`, so fury is receive-only and never snapshots.
+
+Nine repos were skipped in the same run (`receiver has local changes` ×6, `branch divergence` ×1).
+None of it escalates: the `repos` profile carries no `status` at all in the report.
+
+### Root cause
+`_auto_apply_decision` (`fsync/homesync.py`, returning e.g. `(False, "receiver has local changes")`
+at `:1118` and `(False, "up to date")` at `:1129`) correctly refuses unsafe applies, but a refusal
+is terminal — there is no retry, no escalation, and no notion of the receiver having something to
+send. The one-way rule was adopted to stop file-level deletes and renames resurrecting from a
+stale peer (ISSUE-001), but **git does not have that hazard**: a fast-forward is provably
+non-destructive and trivially checkable with `git merge-base --is-ancestor`.
+
+### Resolution (the incident)
+By hand: `git bundle create --all` on fury, `scp` to minis, `git fetch <bundle>
+'refs/heads/*:refs/remotes/fury/*'`, verified both branches fast-forwardable, then
+`git merge --ff-only` and `git branch -f main`. Both boxes now at `458660f`.
+
+### Fix (proposed, 0.6.0)
+- **A. Allow `direction: both` for `kind: git`,** applying **fast-forward-only** in the
+  receiver→producer direction. Refuse anything non-ff and report it. This would have carried
+  `458660f` automatically, with no possibility of clobbering.
+- **B. Escalate sticky skips.** If the same repo is skipped for the same reason for N consecutive
+  runs, raise it to `status: attention` and say which side is ahead — "receiver has local changes"
+  read identically on day 1 and day 15.
+- **C. Give the `repos` profile a `status` field.** It currently reports `applied`/`skipped` lists
+  and no status, so it cannot surface in a summary view at all.
+
+### Prevention
+One-way is the right default for *files*, where deletes and renames are ambiguous. For git it is
+too strict: ff-only exchange is safe in both directions and is what the two boxes actually need.
+
+
+### Sub-finding — auto-apply can *regress* a receiver that is ahead (no ancestry check)
+
+`_auto_apply_decision` (`fsync/homesync.py:1107-1130`) refuses on busy / dirty / branch-divergent
+receivers, and skips when `recv_head == meta["head"]` ("up to date"). Every other case falls
+through to `return True, "clean"`. There is **no check that the producer is actually ahead** —
+`meta["head"]` is applied whenever it merely *differs* from the receiver's HEAD.
+
+So a producer whose bundle is stale relative to the receiver will **move the receiver backwards**.
+This was live during this reconciliation: fury sat at `458660f` while the staged bundle advertised
+`aef11ce` (its parent). The only thing standing between fury and a silent one-commit regression was
+an untracked `logs/` directory making `is_dirty` (`git_repo_sync.py:465-470`, which counts
+untracked files) return true — the same condition reported for weeks as the benign-sounding
+`receiver has local changes`. Delete that stray directory and the next run rolls fury back.
+
+**Closed for now** by re-running `fsync git snapshot` on minis so the bundle advertises `458660f`.
+
+**Fix:** before applying, require `git merge-base --is-ancestor <recv_head> <meta.head>`; if the
+receiver is ahead, skip with `receiver is ahead of producer` and raise `status: attention`. This is
+one call and turns an accidental save into a guarantee. It also composes with fix **A** above:
+once `kind:git` may flow both ways ff-only, "receiver is ahead" becomes the trigger to send it home
+rather than a reason to stop.
+
+---
+
 ## ISSUE-001 — Cross-box "ghost": a file tracked on one branch reappears *untracked* on the peer
 
 - **Status:** incident **RESOLVED** 2026-07-25 (both boxes aligned to `main @ 965a7e4`).
