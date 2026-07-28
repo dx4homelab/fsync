@@ -43,6 +43,7 @@ STATE_ROOT = "~/.local/state/fsync"
 ENGINE_DIR = ".local/lib/fsync-engine"  # relative to the peer's $HOME
 DEFAULT_GIT_BUNDLE_DIR = "~/.fsync/git-bundles"  # P5: kind=git bundles land here
 DEFAULT_GIT_BACKUP_ROOT = "~/.fsync/backups"     # pre-apply receiver backups
+STRANDED_SAMPLE = 20  # ISSUE-003: how many withheld paths to name in the report
 
 # StrictHostKeyChecking=accept-new (not =yes): the SYNC channel is ssh, which
 # verifies host keys against known_hosts. Off-LAN, a new address (the peer's
@@ -753,7 +754,11 @@ def _plan_path(peer: Peer, prof: Profile, rel: str, n_workers: int):
     idx_a = local_index(local_root, recursive=prof.recursive, exclude=prof.exclude, workers=n_workers)
     idx_b = remote_index(peer, remote_root, recursive=prof.recursive, exclude=prof.exclude, workers=n_workers)
     report = compare_file_lists(idx_a, idx_b, match_on="path")
-    plan = build_sync_plan(report, conflict=prof.conflict, rename_min_size=prof.rename_min_size)
+    # allow_renames=False (ISSUE-002): a scheduled run has nobody to act on a
+    # rename proposal, and pairs left in plan["renames"] are in no transfer list —
+    # they would be silently dropped. Demote them to plain copies instead.
+    plan = build_sync_plan(report, conflict=prof.conflict, rename_min_size=prof.rename_min_size,
+                           allow_renames=False)
     changed = {pair[0].get("path") for pair in report["name_matches_diff_hash"]}
     return local_root, remote_root, plan, changed
 
@@ -937,13 +942,18 @@ def run_profile(
         # Direction filters ROUTING, it never overrides newest-wins: in push
         # mode a file the peer has newer is skipped (reported), not clobbered
         # with our older copy. One-way here is still additive — no deletes.
-        skipped_by_direction = 0
+        #
+        # ISSUE-003: keep the PATHS, not just a count. Every path dropped here is
+        # in the plan precisely because it diverges — byte-identical files never
+        # leave plan["noop"] — so a one-way profile withholding them is real,
+        # unreported divergence, not a no-op. "I chose not to copy this" and
+        # "there was nothing to copy" must not render identically.
+        stranded: list[str] = []
         if prof.direction == "push":
-            skipped_by_direction = len(b_paths)
-            b_paths = []
+            stranded, b_paths = b_paths, []
         elif prof.direction == "pull":
-            skipped_by_direction = len(a_paths)
-            a_paths = []
+            stranded, a_paths = a_paths, []
+        skipped_by_direction = len(stranded)
 
         over_ab = sum(1 for p in a_paths if p in changed_paths)
         over_ba = sum(1 for p in b_paths if p in changed_paths)
@@ -997,6 +1007,8 @@ def run_profile(
             "merged": merged_files,
             "would_merge": would_merge,
             "skipped_by_direction": skipped_by_direction,
+            "stranded": stranded[:STRANDED_SAMPLE],
+            "stranded_truncated": skipped_by_direction > STRANDED_SAMPLE,
             "conflicts": len(conflicts),
             "renames_pending": len(plan["renames"]),
             "renames_demoted": len(plan["renames_suppressed"]),
@@ -1014,6 +1026,22 @@ def run_profile(
             log(f"  ! {prof.name}/{rel}: {ghost_total} transferred file(s) UNTRACKED on the "
                 f"receiver — possible cross-branch ghost (ISSUE-001): "
                 + ", ".join(sample) + (" ..." if ghost_total > 5 else ""))
+        # ISSUE-003 / ISSUE-002: withheld or unactioned divergence must never
+        # render green. "ok" has to mean "the two sides agree", not "the run
+        # finished without raising".
+        if stranded or plan["renames"]:
+            result["status"] = "attention"
+        if stranded:
+            shown = stranded[:5]
+            log(f"  ! {prof.name}/{rel}: {skipped_by_direction} file(s) STRANDED by "
+                f"direction:{prof.direction} — they differ from the peer and were withheld, "
+                f"not synced: " + ", ".join(shown)
+                + (" ..." if skipped_by_direction > 5 else "")
+                + f" | reconcile with: fsync sync folder {rel}")
+        if plan["renames"]:
+            log(f"  ! {prof.name}/{rel}: {len(plan['renames'])} rename pair(s) UNACTIONED "
+                f"(ISSUE-002) — neither copied nor renamed; this caller should pass "
+                f"allow_renames=False")
         log(
             f"  {prof.name}/{rel}: A->B {len(a_paths)}"
             + (f" ({over_ab} overwrite->backup)" if over_ab else "")
@@ -1022,8 +1050,9 @@ def run_profile(
             + f", conflicts {len(conflicts)}, identical {plan['noop']}"
             + (f", merged {len(merged_files)}" if merged_files else "")
             + (f", would merge {len(would_merge)}" if would_merge else "")
-            + (f", {prof.direction}-only ({skipped_by_direction} skipped)"
-               if prof.direction != "both" else "")
+            + (f", {prof.direction}-only ({skipped_by_direction} STRANDED)"
+               if prof.direction != "both" and skipped_by_direction else
+               (f", {prof.direction}-only" if prof.direction != "both" else ""))
             + f" [{result['paths'][rel]['seconds']}s]"
         )
     return result

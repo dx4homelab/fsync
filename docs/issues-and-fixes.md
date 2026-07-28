@@ -17,7 +17,8 @@ fury4dx is a deployed receiver. Make changes on minis, commit + push, then
 
 ## ISSUE-002 — Detected "renames" are dropped from profile-driven syncs entirely: never copied, never renamed, still `status: ok`
 
-- **Status:** OPEN — **product bug, verified in code.** Incident resolved by hand 2026-07-28.
+- **Status:** **FIXED in 0.6.0** (2026-07-28) — fixes **A + C** below. Was: product bug, verified
+  in code; incident resolved by hand the same day.
 - **Where seen:** `workspaces/primary/asap/scratchpad/collision-check/`, `primary` profile.
   `renames_pending: 5` in **every** run from 2026-07-13 to 2026-07-28.
 
@@ -60,18 +61,45 @@ nothing, which is the one option that can lose data.
 ### Resolution (the incident)
 Copied both sets explicitly in both directions; each box now holds all ten files.
 
-### Fix (proposed, 0.6.0)
-- **A. Make `renames` fall through to `suppressed` behaviour in the union (non-mirror) branch.**
-  One line beside `:712-713`; both sides then receive the other's path, content already identical.
-  Cheap (the bytes exist locally, so rsync's delta transfer is near-free) and cannot lose data.
-- **B. Only honour renames where a rename is *provable*** — i.e. under `mirror`, where one side is
-  authoritative and the counterpart's disappearance is real evidence. Even there, emit the
-  rename plan rather than dropping it.
-- **C. Fail loudly on a leak.** Assert that every input item lands in exactly one output bucket;
-  `renames_pending > 0` must force `status: attention`, never `ok`. A silently unconsumed bucket is
-  how this survived fifteen days.
-- **D. Age out pending renames.** If a pair is still pending after N runs, demote it to a plain copy
-  and log the demotion.
+### Fix
+- **A. Demote rename pairs for callers that cannot act on them — DONE (0.6.0).**
+  `build_sync_plan` gains `allow_renames: bool = True`; with `False` every pair goes to
+  `renames_suppressed`, so the content travels as ordinary copies. `_plan_path`
+  (`homesync.py`) passes `allow_renames=False`, because a scheduled run has nobody to act on a
+  proposal. The default is unchanged, so `sync-plan` still renders `plan.renames.sh` for a human —
+  the interactive case where a rename *is* actionable. Chosen over demoting unconditionally in the
+  union branch so the CLI's reviewed-rename feature survives.
+- **B. Only honour renames where a rename is *provable* — PARTIAL.** Renames now reach only two
+  callers: `mirror` mode (one side authoritative) and interactive `sync-plan`. Not enforced
+  structurally — a future unattended caller could still omit `allow_renames=False`, which is what
+  **C** guards.
+- **C. Never report a leak as green — DONE (0.6.0).** `renames_pending > 0` now forces
+  `status: attention` and logs `! … rename pair(s) UNACTIONED … this caller should pass
+  allow_renames=False`. In practice profile runs can no longer produce a pending rename; this is the
+  backstop for the case that let the bug live fifteen days.
+- **D. Age out pending renames — NOT DONE, and no longer needed** for profile runs (they cannot
+  accumulate pending renames now). Still worth having if another unattended caller appears.
+
+### Verification (2026-07-28)
+Unit: `test_rename_proposal_reaches_neither_side` pins the defect shape (a surviving pair is in
+`a_to_b`, `b_to_a`, `a_delete` and `b_delete` — *none* of them);
+`test_allow_renames_false_demotes_every_pair_to_copies` and
+`test_allow_renames_false_still_converges_under_mirror` pin the fix;
+`test_scheduled_plan_demands_rename_demotion` pins the caller. Full suite: 204 passed, 1 skipped.
+
+End-to-end, real two-box dry run over a fixture reproducing the collision-check pathology (5 files
+per box, each with a byte-identical twin under a different name, 91 bytes so the
+`rename_min_size: 64` floor does not pre-empt the rename classification):
+
+| | A→B planned | B→A planned | renames_pending | status |
+|---|---|---|---|---|
+| HEAD (pre-fix) | **0** | **0** | **5** | `ok` |
+| 0.6.0 | 5 | 5 | 0 | `ok` |
+
+*Method note:* on minis `~/.local/bin/fsync` is a symlink into the checkout's `.venv`, so it always
+runs the working tree — a "before" run must use a pristine `git archive HEAD` export **executed from
+that export's own directory** (`python -m` puts CWD at `sys.path[0]`, which beats `PYTHONPATH`).
+A first attempt missed both of these and produced a false "no bug" reading.
 
 ### Prevention
 `renames_demoted` was 0 and `renames_pending` was 5 in every single report — a stuck non-zero
@@ -81,7 +109,8 @@ counter next to a green status. Any counter that means "work not done" should be
 
 ## ISSUE-003 — One-way profiles report `status: ok` while silently stranding content-differing files
 
-- **Status:** OPEN — incident resolved by hand 2026-07-28; product change proposed.
+- **Status:** **FIXED in 0.6.0** (2026-07-28) — fixes **B + C** below; **A withdrawn** (wrong
+  premise, see below), **D not done**. Incident resolved by hand the same day.
 - **Where seen:** `primary` profile (`direction: pull` on fury4dx), every run for ~2 weeks.
 
 ### Symptom
@@ -117,19 +146,41 @@ Compared both boxes with `rsync -ain -u` per direction, then re-checked every ca
 **509 were mtime-only**). The 45 genuinely-stranded files were pushed explicitly. The profile's
 direction was **not** flipped — that would reintroduce ISSUE-001.
 
-### Fix (proposed, 0.6.0)
-- **A. Distinguish skipped-and-identical from skipped-and-diverging.** `skipped_by_direction`
-  currently counts paths the direction dropped, whether or not they differ in content. Split it
-  into `skipped_identical` and **`stranded`** (skipped *and* content-differing). Only the second
-  is interesting — and it is the only one worth hashing for.
-- **B. Escalate on `stranded > 0`** to `status: attention` (a third state beside `ok`/`error`),
-  and list the top N stranded paths in the report. A profile that has withheld the same 45 files
-  for two weeks must not render green.
-- **C. Name the remedy.** `fsync sync folder <path>` already exists and is exactly the right tool —
-  VCS-aware, SVN-first, `[y/N]` steps. Nothing in a scheduled run ever points at it. When a
-  profile reports `stranded`, print the exact command.
-- **D. Rank the report by actionability.** Lead with transferred / stranded / pending / conflicts;
-  demote `identical` to a trailing column. Today the largest number is the least informative one.
+### Fix
+- **A. Split `skipped_by_direction` into identical vs diverging — WITHDRAWN, the premise was
+  wrong.** The plan never contains byte-identical files: `compare_file_lists` routes those to
+  `exact_matches`, which becomes `plan["noop"]`. Everything in `a_to_b`/`b_to_a` is there *because*
+  it diverges, so `skipped_by_direction` was **already** exactly the stranded count — no split, and
+  no extra hashing, was needed. The real gap was only that the **paths were discarded** (`a_paths =
+  []`) and the count never reached `status`.
+- **B. Keep the paths and escalate — DONE (0.6.0).** The withheld paths are captured before the
+  list is cleared and reported as `stranded` (sampled to `STRANDED_SAMPLE = 20`, with
+  `stranded_truncated`). `stranded` or `renames_pending` sets `status: attention`, a third state
+  beside `ok`/`error`.
+- **C. Name the remedy — DONE (0.6.0).** The run now logs
+  `! <profile>/<path>: N file(s) STRANDED by direction:<dir> — they differ from the peer and were
+  withheld, not synced: … | reconcile with: fsync sync folder <path>`, and the summary line says
+  `<dir>-only (N STRANDED)` rather than the neutral `(N skipped)`.
+- **D. Rank the report by actionability — NOT DONE.** Also partly misdiagnosed: `views.py` never
+  rendered `skipped_by_direction`, `renames_pending` or `untracked_introductions` at all — those
+  screens are the *plan preview*, not the run report, and the run report is JSON plus the log
+  lines fixed in **C**. Surfacing `stranded` in the TUI remains open.
+
+### Verification (2026-07-28)
+Unit: `test_one_way_profile_names_stranded_paths_and_escalates` (25 withheld paths → sampled to 20,
+`stranded_truncated`, `status == "attention"`, log names the remedy) and
+`test_two_way_profile_with_nothing_withheld_stays_ok` as the negative control.
+
+End-to-end, real two-box dry run, `direction: push` with 5 divergent files on the receiving side:
+
+| | skipped_by_direction | stranded | status |
+|---|---|---|---|
+| HEAD (pre-fix) | **0** | field absent | `ok` |
+| 0.6.0 | 5 | 5 paths named | **`attention`** |
+
+The pre-fix `0` is not a typo, and it shows how the two defects compounded: ISSUE-002 had already
+removed those files from the transfer lists, so the direction filter had nothing left to count.
+Neither mechanism saw them — a silent double miss.
 
 ### Prevention
 A one-way policy is a decision to *withhold* data. Withholding must be visible, or it becomes

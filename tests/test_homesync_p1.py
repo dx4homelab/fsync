@@ -187,6 +187,41 @@ def test_suppressed_rename_under_mirror_copies_and_deletes():
     assert [i["path"] for i in plan["b_delete"]] == ["b/g"]
 
 
+def test_rename_proposal_reaches_neither_side():
+    """A surviving rename pair is a PROPOSAL: it is in no transfer list at all.
+
+    This is the shape of ISSUE-002 — harmless for `sync-plan` (which renders
+    plan.renames.sh for a human), fatal for anyone who cannot act on it.
+    """
+    rep = {"exact_matches": [], "name_matches_diff_hash": [], "only_in_a": [], "only_in_b": [],
+           "hash_matches_diff_name": [(_item("a/x.bin", h="dup"), _item("b/y.bin", h="dup"))]}
+    plan = build_sync_plan(rep, rename_min_size=64)
+    assert len(plan["renames"]) == 1
+    assert plan["a_to_b"] == [] and plan["b_to_a"] == []
+    assert plan["a_delete"] == [] and plan["b_delete"] == []
+
+
+def test_allow_renames_false_demotes_every_pair_to_copies():
+    """ISSUE-002 fix: unattended callers demote, so the content actually crosses."""
+    rep = {"exact_matches": [], "name_matches_diff_hash": [], "only_in_a": [], "only_in_b": [],
+           "hash_matches_diff_name": [(_item("a/x.bin", h="dup"), _item("b/y.bin", h="dup"))]}
+    plan = build_sync_plan(rep, rename_min_size=64, allow_renames=False)
+    assert plan["renames"] == []
+    assert len(plan["renames_suppressed"]) == 1
+    assert [i["path"] for i in plan["a_to_b"]] == ["a/x.bin"]
+    assert [i["path"] for i in plan["b_to_a"]] == ["b/y.bin"]
+
+
+def test_allow_renames_false_still_converges_under_mirror():
+    """Demotion must not break mirror convergence: copy the winner, delete the loser."""
+    rep = {"exact_matches": [], "name_matches_diff_hash": [], "only_in_a": [], "only_in_b": [],
+           "hash_matches_diff_name": [(_item("a/f", h="u"), _item("b/g", h="u"))]}
+    plan = build_sync_plan(rep, mirror="a-to-b", rename_min_size=0, allow_renames=False)
+    assert plan["renames"] == []
+    assert [i["path"] for i in plan["a_to_b"]] == ["a/f"]
+    assert [i["path"] for i in plan["b_delete"]] == ["b/g"]
+
+
 # --------------------------------------------------------------------------- #
 # profiles config                                                             #
 # --------------------------------------------------------------------------- #
@@ -655,6 +690,91 @@ def test_real_run_performs_merge_jsonl(tmp_path, monkeypatch):
     assert path["merged"] == ["history.jsonl"]
     assert path["would_merge"] == []
     assert path["conflicts"] == 0
+
+
+# --------------------------------------------------------------------------- #
+# ISSUE-002 / ISSUE-003: withheld work must be named, and must not render green #
+# --------------------------------------------------------------------------- #
+
+def test_scheduled_plan_demands_rename_demotion(tmp_path, monkeypatch):
+    """ISSUE-002 regression: the scheduled path must never ask for proposals."""
+    from fsync import homesync as hs
+
+    seen = {}
+
+    def _spy(report, **kw):
+        seen.update(kw)
+        return {"a_to_b": [], "b_to_a": [], "a_delete": [], "b_delete": [],
+                "conflicts": [], "renames": [], "renames_suppressed": [], "noop": 0}
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setattr(hs, "peer_home", lambda p: "/remote")
+    monkeypatch.setattr(hs, "local_index", lambda *a, **k: [])
+    monkeypatch.setattr(hs, "remote_index", lambda *a, **k: [])
+    monkeypatch.setattr(hs, "compare_file_lists",
+                        lambda *a, **k: {"name_matches_diff_hash": []})
+    monkeypatch.setattr(hs, "build_sync_plan", _spy)
+
+    prof = hs.Profile(name="primary", paths=["w"], direction="pull")
+    peer = hs.Peer(host="peer.lan", user="dev", home="/remote")
+    hs._plan_path(peer, prof, "w", 1)
+
+    assert seen.get("allow_renames") is False
+
+
+def _stranded_run(tmp_path, monkeypatch, *, direction, n_only_local):
+    """run_profile over a plan whose a_to_b holds `n_only_local` divergent files."""
+    from fsync import homesync as hs
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    root = tmp_path / "home" / "w"
+    root.mkdir(parents=True)
+
+    plan = {"a_to_b": [{"path": f"only-here-{i}.txt"} for i in range(n_only_local)],
+            "b_to_a": [], "a_delete": [], "b_delete": [],
+            "conflicts": [], "renames": [], "renames_suppressed": [], "noop": 7}
+
+    prof = hs.Profile(name="primary", paths=["w"], direction=direction)
+    peer = hs.Peer(host="peer.lan", user="dev", home="/remote")
+    monkeypatch.setattr(hs, "peer_home", lambda p: "/remote")
+    monkeypatch.setattr(hs, "_plan_path",
+                        lambda pe, pr, rel, n: (root, "/remote/w", plan, set()))
+    monkeypatch.setattr(hs, "run_rsync_leg", lambda *a, **k: {"files": 0, "bytes": 0})
+
+    lines: list[str] = []
+    result = hs.run_profile(peer, prof, run_dir=tmp_path / "run", run_id="R",
+                            dry_run=True, workers=1, log=lines.append)
+    return result, result["paths"]["w"], lines
+
+
+def test_one_way_profile_names_stranded_paths_and_escalates(tmp_path, monkeypatch):
+    """ISSUE-003: direction:pull withholds divergent local files.
+
+    They are in the plan precisely because they diverge, so withholding them is
+    real divergence — it must be named, and must not report status: ok.
+    """
+    from fsync import homesync as hs
+
+    result, d, lines = _stranded_run(tmp_path, monkeypatch, direction="pull", n_only_local=25)
+
+    assert d["skipped_by_direction"] == 25
+    assert d["stranded"][:2] == ["only-here-0.txt", "only-here-1.txt"]
+    assert len(d["stranded"]) == hs.STRANDED_SAMPLE      # sampled, not unbounded
+    assert d["stranded_truncated"] is True
+    assert result["status"] == "attention"               # the whole point
+    assert any("STRANDED" in m for m in lines)
+    assert any("fsync sync folder w" in m for m in lines)   # names the remedy
+
+
+def test_two_way_profile_with_nothing_withheld_stays_ok(tmp_path, monkeypatch):
+    """Negative control: escalation must not fire when nothing is withheld."""
+    result, d, lines = _stranded_run(tmp_path, monkeypatch, direction="both", n_only_local=3)
+
+    assert d["skipped_by_direction"] == 0
+    assert d["stranded"] == []
+    assert d["stranded_truncated"] is False
+    assert result["status"] == "ok"
+    assert not any("STRANDED" in m for m in lines)
 
 
 def test_compare_scales_linearly():

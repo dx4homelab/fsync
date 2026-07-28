@@ -612,6 +612,7 @@ def build_sync_plan(
     conflict: str = "review",
     mirror: str | None = None,
     rename_min_size: int = 0,
+    allow_renames: bool = True,
 ) -> Dict[str, Any]:
     """Project a :func:`compare_file_lists` report onto a directional sync plan.
 
@@ -647,6 +648,15 @@ def build_sync_plan(
     ``rename_min_size`` > 0, pairs below that size — are demoted to plain
     copies (or copy+delete under mirror) and reported in
     ``renames_suppressed``.
+
+    ``allow_renames=False`` demotes **every** pair to ``renames_suppressed``, so
+    ``renames`` comes back empty and the content travels as ordinary copies
+    (ISSUE-002). Unattended callers must set this: a rename is a *within-box,
+    across-time* event, but a sync compares two boxes at one instant, where "same
+    content under a different name" is equally well explained by two independent
+    writers — and honouring the rename reading would silently drop the file from
+    the transfer lists. Interactive callers (``sync-plan``) keep the default and
+    let a human decide from the generated ``plan.renames.sh``.
     """
     if conflict not in CONFLICT_POLICIES:
         raise ValueError(f"conflict must be one of {CONFLICT_POLICIES}")
@@ -679,7 +689,7 @@ def build_sync_plan(
             h = a.get("hash")
             size = a.get("size")
             too_small = size is not None and size < rename_min_size
-            if h is None or occurrences[h] > 2 or too_small:
+            if not allow_renames or h is None or occurrences[h] > 2 or too_small:
                 suppressed.append((a, b))
             else:
                 renames.append((a, b))
@@ -693,6 +703,13 @@ def build_sync_plan(
     # Demoted rename pairs travel as ordinary content: under mirror the winning
     # side's path is copied and the loser's old name deleted; under union both
     # sides simply receive the other's path (content already identical).
+    #
+    # NOTE (ISSUE-002): pairs left in ``renames`` are deliberately absent from
+    # every list below — they are a *proposal* for a caller that can act on it
+    # (``sync-plan`` renders plan.renames.sh), not scheduled work. Any caller that
+    # cannot act on the proposal MUST pass ``allow_renames=False``, or the pair is
+    # silently dropped: not copied, not renamed, and invisible in the transfer
+    # counts. That is exactly how ten files sat unsynced for fifteen days.
     if mirror == "a-to-b":
         a_to_b.extend(only_in_a)
         a_to_b.extend(a for a, _ in changed)  # A wins every conflict
