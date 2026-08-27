@@ -396,10 +396,13 @@ def _reconstruct(repo: str | Path, meta: dict[str, Any], *, mirror_branches: boo
 
 
 def apply_repo(repo: str | Path, bundle_path: str | Path, meta: dict[str, Any], *,
-               backup_dir: str | Path, mirror_branches: bool = False) -> dict[str, Any]:
+               backup_dir: str | Path, mirror_branches: bool = False,
+               force: bool = False) -> dict[str, Any]:
     """Reconstruct ``meta``'s exact working state into ``repo`` from
     ``bundle_path``. Backs the receiver up first (R15). Creates the repo from the
-    bundle when it does not exist yet (first sync).
+    bundle when it does not exist yet (first sync). Refuses to move a receiver
+    backwards — receiver HEAD not contained in the incoming head — unless
+    ``force`` (ISSUE-006 sub-finding).
     """
     repo = Path(repo)
     bundle_path = Path(bundle_path)
@@ -431,6 +434,25 @@ def apply_repo(repo: str | Path, bundle_path: str | Path, meta: dict[str, Any], 
          f"refs/heads/*:{INCOMING}/heads/*",
          f"refs/tags/*:{INCOMING}/tags/*",
          f"{WIP_REF}:{INCOMING}/wip")
+
+    # ISSUE-006 sub-finding: never move a receiver BACKWARDS. Post-fetch the
+    # incoming head object is present, so ancestry is decidable everywhere the
+    # pre-fetch heuristic (check_receiver_ahead) is blind: a receiver HEAD not
+    # reachable from the incoming head has commits the apply would drop off the
+    # branch. The R15 backup would still hold them, but a silent rollback is
+    # exactly the regression this guard exists to stop.
+    if not created and not force and _has_head(repo):
+        recv_head = _out(repo, "rev-parse", "HEAD")
+        if recv_head != meta["head"]:
+            anc = _git(repo, "merge-base", "--is-ancestor", recv_head, meta["head"],
+                       check=False)
+            if anc.returncode != 0:
+                raise GitSyncError(
+                    f"{name}: receiver has commits the incoming bundle lacks "
+                    f"(receiver HEAD {recv_head[:9]} is not an ancestor of incoming "
+                    f"{meta['head'][:9]}) — refusing to roll back; re-snapshot the "
+                    f"producer, or re-run with --force"
+                )
 
     backup = raw_backup
     saved_ignored = 0
@@ -496,6 +518,31 @@ def check_branch_divergence(repo: str | Path, meta: dict[str, Any]) -> dict[str,
     }
 
 
+def check_receiver_ahead(repo: str | Path, meta: dict[str, Any]) -> dict[str, Any] | None:
+    """Return rollback info when the incoming head is a strict ANCESTOR of the
+    receiver's HEAD — the receiver holds commits the bundle predates, so applying
+    would move the branch backwards (ISSUE-006 sub-finding).
+
+    Pre-fetch heuristic: ancestry is only decidable when the receiver already has
+    the incoming head object, which is exactly the stale-bundle case. An unknown
+    incoming head (receiver behind, or true divergence) returns None here; the
+    authoritative post-fetch check lives in ``apply_repo``.
+    """
+    repo = Path(repo)
+    if not is_git_repo(repo) or not _has_head(repo):
+        return None  # first sync / unborn -> nothing to roll back
+    inc_head = meta.get("head")
+    if not inc_head:
+        return None
+    recv_head = _out(repo, "rev-parse", "HEAD")
+    if recv_head == inc_head:
+        return None  # equal heads are the up-to-date/dirty-producer path
+    r = _git(repo, "merge-base", "--is-ancestor", inc_head, recv_head, check=False)
+    if r.returncode != 0:
+        return None  # not an ancestor, or object unknown here
+    return {"receiver_head": recv_head, "incoming_head": inc_head}
+
+
 # Fix A (ISSUE-001): after a FILE profile transfers into a tree that contains git
 # repos, files tracked on the producer's branch but not the receiver's arrive as
 # untracked "ghosts". This probe reports exactly those — the transferred paths
@@ -551,6 +598,7 @@ def preview_apply(repo: str | Path, meta: dict[str, Any]) -> dict[str, Any]:
         "incoming_head": meta["head"],
         "incoming_branch": meta["branch"],
         "incoming_dirty": meta["dirty"],
+        "receiver_ahead": bool(check_receiver_ahead(repo, meta)) if exists else False,
         "would_change": (not exists) or local_head != meta["head"] or bool(local_dirty)
                         or meta["dirty"],
     }

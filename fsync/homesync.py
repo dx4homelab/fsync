@@ -1149,6 +1149,14 @@ def _auto_apply_decision(target: Path, meta: dict[str, Any]) -> tuple[bool, str]
     if div:
         return False, (f"branch divergence (receiver {div['receiver_branch'] or 'DETACHED'}, "
                        f"producer {div['producer_branch'] or 'DETACHED'})")
+    # ISSUE-006 sub-finding: a stale bundle whose head the receiver already
+    # contains would move the branch backwards — the receiver is ahead, not
+    # behind. Skip; the cure is a producer re-snapshot, never a rollback.
+    ahead = grs.check_receiver_ahead(target, meta)
+    if ahead:
+        return False, (f"receiver is ahead of incoming ({ahead['incoming_head'][:9]} is an "
+                       f"ancestor of {ahead['receiver_head'][:9]}) — stale bundle; "
+                       f"re-snapshot the producer")
     # Already at the producer's exact state — skip so we don't re-apply (and R15
     # back up) all repos every run when nothing changed. A dirty producer
     # (meta.dirty) means the worktree differs from HEAD, so still apply.
@@ -1378,7 +1386,8 @@ def cmd_git(args) -> int:
         for meta in metas:
             rel = meta.get("rel") or meta["name"]
             prev = grs.preview_apply(home / rel, meta)
-            flag = "CHANGE" if prev["would_change"] else "up-to-date"
+            flag = ("receiver-ahead (STALE incoming)" if prev.get("receiver_ahead")
+                    else "CHANGE" if prev["would_change"] else "up-to-date")
             newmark = "" if prev["exists"] else "  (new: absent locally)"
             print(f"{meta['name']}: {rel} [{flag}] incoming "
                   f"{meta['branch'] or 'DETACHED'}@{meta['head'][:9]}"
@@ -1418,9 +1427,28 @@ def cmd_git(args) -> int:
                 log(f"{meta['name']}: WARNING branch divergence — receiver "
                     f"{div['receiver_branch'] or 'DETACHED'}, producer "
                     f"{div['producer_branch'] or 'DETACHED'} — proceeding under --force")
+            # ISSUE-006 sub-finding: same refusal shape as divergence — a stale
+            # bundle must not roll the receiver back. (apply_repo re-checks
+            # post-fetch, which also catches heads unknown to this heuristic.)
+            ahead = grs.check_receiver_ahead(target, meta)
+            if ahead and not getattr(args, "force", False):
+                print(f"{meta['name']}: SKIP {rel} — receiver is ahead: incoming "
+                      f"{ahead['incoming_head'][:9]} is an ancestor of receiver "
+                      f"{ahead['receiver_head'][:9]}. Applying would roll receiver "
+                      f"commits off the branch (stale bundle — re-snapshot the "
+                      f"producer). Re-run with --force to proceed (receiver is "
+                      f"backed up first).",
+                      file=sys.stderr)
+                rc = 1
+                continue
+            if ahead:
+                log(f"{meta['name']}: WARNING receiver ahead of incoming "
+                    f"({ahead['incoming_head'][:9]} ancestor of "
+                    f"{ahead['receiver_head'][:9]}) — proceeding under --force")
         try:
             res = grs.apply_repo(target, bundle, meta, backup_dir=backup_dir,
-                                 mirror_branches=getattr(args, "mirror_branches", False))
+                                 mirror_branches=getattr(args, "mirror_branches", False),
+                                 force=getattr(args, "force", False))
         except grs.GitSyncError as e:
             print(f"{meta['name']}: ERROR {e}", file=sys.stderr)
             rc = 1

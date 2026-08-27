@@ -323,6 +323,18 @@ too strict: ff-only exchange is safe in both directions and is what the two boxe
 
 ### Sub-finding — auto-apply can *regress* a receiver that is ahead (no ancestry check)
 
+> **FIXED 2026-08-27** — after the predicted regression happened for real: fury's auto-apply
+> rolled `refactor4homelab` back to `0588039` repeatedly, discarding four receiver-authored
+> commits (recovered from reflog + pre-apply backups). Implemented as a two-layer guard:
+> `check_receiver_ahead()` (`git_repo_sync.py`) skips in `_auto_apply_decision` with
+> `receiver is ahead of incoming … re-snapshot the producer`, and `apply_repo()` re-checks
+> **post-fetch** (`merge-base --is-ancestor <recv_head> <meta.head>`), which also catches
+> same-branch true divergence the pre-fetch heuristic can't see. Manual `git apply` skips
+> with the same message unless `--force` (receiver still backed up first, R15). `git status`
+> flags such repos `[receiver-ahead (STALE incoming)]`. Tests:
+> `tests/test_issue006_receiver_ahead.py`. Fixes A–C above (ff-only return path,
+> sticky-skip escalation, profile status) remain open.
+
 `_auto_apply_decision` (`fsync/homesync.py:1107-1130`) refuses on busy / dirty / branch-divergent
 receivers, and skips when `recv_head == meta["head"]` ("up to date"). Every other case falls
 through to `return True, "clean"`. There is **no check that the producer is actually ahead** —
