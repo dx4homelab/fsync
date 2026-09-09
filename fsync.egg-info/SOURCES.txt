@@ -31,6 +31,8 @@ tests/test_fileindex.py
 tests/test_foldersync.py
 tests/test_git_repo_sync.py
 tests/test_homesync_p1.py
+tests/test_issue001_autoapply.py
+tests/test_issue001_guards.py
 tests/test_meta_deploy.py
 tests/test_meta_sync.py
 tests/test_p4_2_views_web.py

@@ -1,6 +1,6 @@
 Metadata-Version: 2.4
 Name: fsync
-Version: 0.4.0
+Version: 0.5.0
 Summary: Simple file indexing and comparison utilities
 Author-email: dev <dev@example.com>
 Description-Content-Type: text/markdown
