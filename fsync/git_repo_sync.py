@@ -52,6 +52,18 @@ class GitSyncError(RuntimeError):
     """A git-repo-sync operation failed (git error, missing repo, etc.)."""
 
 
+class ReceiverAheadError(GitSyncError):
+    """Post-fetch refusal (ISSUE-006 sub-finding): the receiver's HEAD is not
+    contained in the incoming head, so applying would roll its commits off the
+    branch. Carries both ids so a caller can classify it (auto-apply treats it
+    as a standing, human-resolved condition; manual apply as an error)."""
+
+    def __init__(self, msg: str, *, receiver_head: str, incoming_head: str) -> None:
+        super().__init__(msg)
+        self.receiver_head = receiver_head
+        self.incoming_head = incoming_head
+
+
 # --------------------------------------------------------------------------- #
 # git plumbing                                                                #
 # --------------------------------------------------------------------------- #
@@ -335,6 +347,32 @@ def _backup_ignored_collisions(repo: Path, cwork: str, backup_dir: Path, name: s
     return len(ignored)
 
 
+def _prune_incoming(repo: str | Path) -> int:
+    """Delete every ref under ``INCOMING`` (objects stay). INCOMING is a scratch
+    namespace: nothing may depend on what an earlier apply left there."""
+    n = 0
+    for ref in _out(repo, "for-each-ref", "--format=%(refname)", f"{INCOMING}/").splitlines():
+        if ref:
+            _git(repo, "update-ref", "-d", ref)
+            n += 1
+    return n
+
+
+def _fetch_incoming(repo: str | Path, bundle_path: str | Path) -> None:
+    """Fetch a bundle's branches, tags and WIP ref into ``INCOMING`` — never
+    touching local refs. Prunes the namespace first and uses forced ('+')
+    refspecs (ISSUE-008): a leftover ``incoming/wip`` from an earlier refused
+    apply is not an ancestor of the next snapshot's WIP commit, and with an
+    unforced refspec git rejects that one ref as non-fast-forward and fails the
+    whole fetch — so every later run reported ``git fetch … failed`` instead of
+    the real refusal."""
+    _prune_incoming(repo)
+    _git(repo, "fetch", str(bundle_path),
+         f"+refs/heads/*:{INCOMING}/heads/*",
+         f"+refs/tags/*:{INCOMING}/tags/*",
+         f"+{WIP_REF}:{INCOMING}/wip")
+
+
 def _reconstruct(repo: str | Path, meta: dict[str, Any], *, mirror_branches: bool) -> None:
     """Fetch producer refs from the (already-present) bundle objects and rebuild
     the exact working state described by ``meta``. Assumes objects were fetched
@@ -389,10 +427,7 @@ def _reconstruct(repo: str | Path, meta: dict[str, Any], *, mirror_branches: boo
                 _git(repo, "branch", "-D", bname, check=False)
 
     # Tidy the incoming namespace (objects stay, reachable from refs/heads).
-    for ref in _out(repo, "for-each-ref", "--format=%(refname)",
-                    f"{INCOMING}/").splitlines():
-        if ref:
-            _git(repo, "update-ref", "-d", ref)
+    _prune_incoming(repo)
 
 
 def apply_repo(repo: str | Path, bundle_path: str | Path, meta: dict[str, Any], *,
@@ -430,10 +465,7 @@ def apply_repo(repo: str | Path, bundle_path: str | Path, meta: dict[str, Any], 
 
     # Fetch producer objects first (into INCOMING; never touches local refs) so
     # the backup can inspect the incoming tree for ignored-file collisions.
-    _git(repo, "fetch", str(bundle_path),
-         f"refs/heads/*:{INCOMING}/heads/*",
-         f"refs/tags/*:{INCOMING}/tags/*",
-         f"{WIP_REF}:{INCOMING}/wip")
+    _fetch_incoming(repo, bundle_path)
 
     # ISSUE-006 sub-finding: never move a receiver BACKWARDS. Post-fetch the
     # incoming head object is present, so ancestry is decidable everywhere the
@@ -447,11 +479,13 @@ def apply_repo(repo: str | Path, bundle_path: str | Path, meta: dict[str, Any], 
             anc = _git(repo, "merge-base", "--is-ancestor", recv_head, meta["head"],
                        check=False)
             if anc.returncode != 0:
-                raise GitSyncError(
+                _prune_incoming(repo)  # ISSUE-008: a refusal leaves no scratch refs behind
+                raise ReceiverAheadError(
                     f"{name}: receiver has commits the incoming bundle lacks "
                     f"(receiver HEAD {recv_head[:9]} is not an ancestor of incoming "
                     f"{meta['head'][:9]}) — refusing to roll back; re-snapshot the "
-                    f"producer, or re-run with --force"
+                    f"producer, or re-run with --force",
+                    receiver_head=recv_head, incoming_head=meta["head"],
                 )
 
     backup = raw_backup
@@ -640,10 +674,7 @@ def restore_backup(repo: str | Path, backup_dir: str | Path, name: str) -> dict[
     if not is_git_repo(repo):
         repo.mkdir(parents=True, exist_ok=True)
         _git(repo, "init", "-q")
-    _git(repo, "fetch", str(bundle),
-         f"refs/heads/*:{INCOMING}/heads/*",
-         f"refs/tags/*:{INCOMING}/tags/*",
-         f"{WIP_REF}:{INCOMING}/wip")
+    _fetch_incoming(repo, bundle)
     _reconstruct(repo, meta, mirror_branches=False)
 
     # restore any ignored files apply had copied aside (producer overwrote them)

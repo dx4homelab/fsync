@@ -722,8 +722,9 @@ def test_scheduled_plan_demands_rename_demotion(tmp_path, monkeypatch):
     assert seen.get("allow_renames") is False
 
 
-def _stranded_run(tmp_path, monkeypatch, *, direction, n_only_local):
-    """run_profile over a plan whose a_to_b holds `n_only_local` divergent files."""
+def _stranded_run(tmp_path, monkeypatch, *, direction, n_only_local, changed=None):
+    """run_profile over a plan whose a_to_b holds `n_only_local` divergent files;
+    `changed` names those of them that exist on both sides (local copy newer)."""
     from fsync import homesync as hs
 
     monkeypatch.setenv("HOME", str(tmp_path))
@@ -738,7 +739,7 @@ def _stranded_run(tmp_path, monkeypatch, *, direction, n_only_local):
     peer = hs.Peer(host="peer.lan", user="dev", home="/remote")
     monkeypatch.setattr(hs, "peer_home", lambda p: "/remote")
     monkeypatch.setattr(hs, "_plan_path",
-                        lambda pe, pr, rel, n: (root, "/remote/w", plan, set()))
+                        lambda pe, pr, rel, n: (root, "/remote/w", plan, set(changed or ())))
     monkeypatch.setattr(hs, "run_rsync_leg", lambda *a, **k: {"files": 0, "bytes": 0})
 
     lines: list[str] = []
@@ -862,3 +863,17 @@ def test_peer_line_formats():
     assert div == "peer boxb: sync route down (API up)"
     # ssh up but daemon/API down
     assert views.peer_line({"host": "b", "reachable": True, "api_ok": False}) == "peer b: reachable"
+
+
+def test_stranded_report_separates_only_there_from_newer_there(tmp_path, monkeypatch):
+    # ISSUE-003 follow-up (0.6.1): "they differ from the peer" was wrong for the
+    # common case — a withheld path is usually a file the withheld side ALONE
+    # has (work done there, or deleted here: ISSUE-007), not a newer copy.
+    result, d, lines = _stranded_run(tmp_path, monkeypatch, direction="pull", n_only_local=6,
+                                     changed={"only-here-0.txt", "only-here-1.txt"})
+    assert d["skipped_by_direction"] == 6
+    assert d["stranded_side"] == "local"
+    assert d["stranded_only_on_side"] == 4
+    assert d["stranded_newer_on_side"] == 2
+    assert any("4 exist only on this box, 2 are newer on this box" in m for m in lines)
+    assert result["status"] == "attention"

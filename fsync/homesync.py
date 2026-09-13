@@ -23,6 +23,7 @@ import socket
 import subprocess
 import sys
 import time
+import traceback
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -486,10 +487,19 @@ def load_config(path: str | None) -> tuple[Peer, dict[str, Profile], dict[str, A
 # --------------------------------------------------------------------------- #
 
 def _ssh_to(target: str, command: str, *, timeout: int = 900) -> subprocess.CompletedProcess:
-    return subprocess.run(
-        ["ssh", *SSH_OPTS, target, command],
-        capture_output=True, text=True, timeout=timeout,
-    )
+    """Run one command on ``target``. A hung link surfaces as ``HomesyncError``
+    (ISSUE-009): a peer going to sleep mid-command used to escape as a raw
+    ``subprocess.TimeoutExpired`` and take the whole scheduled run down."""
+    try:
+        return subprocess.run(
+            ["ssh", *SSH_OPTS, target, command],
+            capture_output=True, text=True, timeout=timeout,
+        )
+    except subprocess.TimeoutExpired as e:
+        raise HomesyncError(
+            f"ssh {target}: no reply within {timeout}s (peer asleep or link down?) "
+            f"while running: {command[:80]}{'…' if len(command) > 80 else ''}"
+        ) from e
 
 
 def _ssh(peer: Peer, command: str, *, timeout: int = 900) -> subprocess.CompletedProcess:
@@ -508,7 +518,7 @@ def peer_reachable(peer: Peer) -> bool:
             if _ssh_to(target, "true", timeout=10).returncode == 0:
                 peer._active = addr
                 return True
-        except subprocess.TimeoutExpired:
+        except (subprocess.TimeoutExpired, HomesyncError):
             continue
     return False
 
@@ -528,7 +538,7 @@ def peer_busy(peer: Peer) -> bool:
             timeout=20,
         )
         return probe.returncode != 0
-    except subprocess.TimeoutExpired:
+    except (subprocess.TimeoutExpired, HomesyncError):
         return True
 
 
@@ -855,7 +865,7 @@ def _scan_untracked_introductions(root: str, rel_paths: list[str], *,
         else:
             proc = subprocess.run(["python3", "-c", grs.GHOST_PROBE, root, *paths],
                                   capture_output=True, text=True, timeout=180)
-    except (subprocess.SubprocessError, OSError):
+    except (subprocess.SubprocessError, OSError, HomesyncError):
         return [], truncated
     ghosts = [ln for ln in (proc.stdout or "").splitlines() if ln.strip()]
     return ghosts, truncated
@@ -954,6 +964,15 @@ def run_profile(
         elif prof.direction == "pull":
             stranded, a_paths = a_paths, []
         skipped_by_direction = len(stranded)
+        # A withheld path is one of two very different things: a file the
+        # withheld side ALONE has (work done there, or a file deleted here that
+        # additive sync never removes there — ISSUE-007), or a file both sides
+        # have whose copy there is newer. Only the latter "differs from the
+        # peer"; name them separately so the remedy is obvious.
+        stranded_newer = sum(1 for p in stranded if p in changed_paths)
+        stranded_only = skipped_by_direction - stranded_newer
+        stranded_side = "peer" if prof.direction == "push" else "local"
+        stranded_where = "the peer" if prof.direction == "push" else "this box"
 
         over_ab = sum(1 for p in a_paths if p in changed_paths)
         over_ba = sum(1 for p in b_paths if p in changed_paths)
@@ -1009,6 +1028,9 @@ def run_profile(
             "skipped_by_direction": skipped_by_direction,
             "stranded": stranded[:STRANDED_SAMPLE],
             "stranded_truncated": skipped_by_direction > STRANDED_SAMPLE,
+            "stranded_side": stranded_side,
+            "stranded_only_on_side": stranded_only,
+            "stranded_newer_on_side": stranded_newer,
             "conflicts": len(conflicts),
             "renames_pending": len(plan["renames"]),
             "renames_demoted": len(plan["renames_suppressed"]),
@@ -1034,8 +1056,9 @@ def run_profile(
         if stranded:
             shown = stranded[:5]
             log(f"  ! {prof.name}/{rel}: {skipped_by_direction} file(s) STRANDED by "
-                f"direction:{prof.direction} — they differ from the peer and were withheld, "
-                f"not synced: " + ", ".join(shown)
+                f"direction:{prof.direction} — withheld, not synced: {stranded_only} exist "
+                f"only on {stranded_where}, {stranded_newer} are newer on {stranded_where}: "
+                + ", ".join(shown)
                 + (" ..." if skipped_by_direction > 5 else "")
                 + f" | reconcile with: fsync sync folder {rel}")
         if plan["renames"]:
@@ -1167,19 +1190,77 @@ def _auto_apply_decision(target: Path, meta: dict[str, Any]) -> tuple[bool, str]
     return True, "clean"
 
 
+AUTO_APPLY_STICKY_RUNS = 24        # ISSUE-006 fix B: consecutive skips before escalating
+AUTO_APPLY_REMIND_EVERY = 24 * 7   # ...then repeat the reminder this often
+_STICKY_BENIGN = {"up to date", "no bundle"}   # skip reasons that are not a stuck receiver
+
+
+def _sticky_path() -> Path:
+    return state_root() / "auto-apply-sticky.json"
+
+
+def _load_sticky() -> dict[str, dict[str, Any]]:
+    try:
+        data = json.loads(_sticky_path().read_text())
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def _sticky_key(reason: str) -> str:
+    """The reason modulo commit ids, so a producer that keeps committing does
+    not reset a 'receiver has commits the bundle lacks' streak."""
+    return re.sub(r"\b[0-9a-f]{7,40}\b", "<sha>", reason)
+
+
 def auto_apply_git_profile(prof: Profile, bundle_dir: str | Path, *,
                            run_id: str, dry_run: bool, log) -> dict[str, Any]:
     """Receiver side (apply:auto): apply each staged bundle whose repo belongs to
     this profile, guarded by ``_auto_apply_decision``. Every real apply backs the
     receiver up first (R15). Bundles are matched to the profile by their meta
-    ``rel`` falling under the profile's paths."""
+    ``rel`` falling under the profile's paths.
+
+    ISSUE-006 fixes B + C: a skip that repeats run after run is a receiver whose
+    work is stuck, not a benign state. Streaks persist in
+    ``<state>/auto-apply-sticky.json``; at ``AUTO_APPLY_STICKY_RUNS`` (and every
+    ``AUTO_APPLY_REMIND_EVERY`` after) the repo is named in ``warnings`` — which
+    the run turns into a desktop notification — and the profile carries a
+    ``status``: ``ok`` / ``attention`` (anything skipped for a non-benign
+    reason) / ``error``. A dry run reads the streaks but never advances them."""
     bundle_dir = Path(bundle_dir).expanduser()
     home = _home()
     backup_dir = Path(DEFAULT_GIT_BACKUP_ROOT).expanduser() / f"{run_id}-autoapply"
-    out: dict[str, Any] = {"kind": "git", "apply": "auto",
-                           "applied": [], "skipped": [], "errors": []}
+    out: dict[str, Any] = {"kind": "git", "apply": "auto", "status": "ok",
+                           "applied": [], "skipped": [], "errors": [],
+                           "sticky": [], "warnings": []}
     if not bundle_dir.is_dir():
         return out
+    sticky = _load_sticky()
+    stuck_now: set[str] = set()
+
+    def note_skip(name: str, reason: str) -> str:
+        """Record a non-benign skip's streak; return a suffix for the log line."""
+        key = f"{prof.name}/{name}"
+        stuck_now.add(key)
+        prev = sticky.get(key) or {}
+        same = prev.get("reason_key") == _sticky_key(reason)
+        runs = int(prev.get("runs", 0)) if same else 0
+        first = prev.get("first_run", run_id) if same else run_id
+        if dry_run:
+            return f" [{runs} in a row since {first}]" if runs > 1 else ""
+        runs += 1
+        sticky[key] = {"reason": reason, "reason_key": _sticky_key(reason),
+                       "runs": runs, "first_run": first, "last_run": run_id}
+        if runs >= AUTO_APPLY_STICKY_RUNS:
+            out["sticky"].append({"repo": name, "reason": reason, "runs": runs, "first_run": first})
+        if runs == AUTO_APPLY_STICKY_RUNS or (
+                runs > AUTO_APPLY_STICKY_RUNS
+                and (runs - AUTO_APPLY_STICKY_RUNS) % AUTO_APPLY_REMIND_EVERY == 0):
+            out["warnings"].append(
+                f"{prof.name}/{name}: auto-apply skipped {runs} runs in a row since {first} "
+                f"({reason}) — receiver work is stuck, reconcile by hand (ISSUE-006)")
+        return f" [{runs} in a row since {first}]" if runs > 1 else ""
+
     for meta_path in sorted(bundle_dir.glob("*.meta.json")):
         try:
             meta = json.loads(meta_path.read_text())
@@ -1198,7 +1279,8 @@ def auto_apply_git_profile(prof: Profile, bundle_dir: str | Path, *,
         head = (meta.get("head") or "")[:9]
         if not ok:
             out["skipped"].append({"repo": name, "reason": reason})
-            log(f"  {prof.name}/{name}: auto-apply skipped ({reason})")
+            suffix = "" if reason in _STICKY_BENIGN else note_skip(name, reason)
+            log(f"  {prof.name}/{name}: auto-apply skipped ({reason}){suffix}")
             continue
         if dry_run:
             out["applied"].append({"repo": name, "dry_run": True})
@@ -1210,9 +1292,33 @@ def auto_apply_git_profile(prof: Profile, bundle_dir: str | Path, *,
                                    "backup": res.get("backup")})
             log(f"  {prof.name}/{name}: auto-applied {meta.get('branch') or 'DETACHED'}@{head}"
                 + (f" (backup {res['backup']})" if res.get("backup") else ""))
+        except grs.ReceiverAheadError as e:
+            # Post-fetch divergence guard (ISSUE-006 sub-finding). Same family as
+            # the pre-fetch "receiver is ahead" skip: a standing condition only a
+            # human resolves — so a sticky skip (attention + streak escalation),
+            # not an error that fails, and notifies, every hour until then.
+            reason = (f"receiver has commits the incoming bundle lacks (receiver HEAD "
+                      f"{e.receiver_head[:9]} is not an ancestor of incoming "
+                      f"{e.incoming_head[:9]}) — bring the receiver's commits to the "
+                      f"producer, or `fsync git apply --force` to roll back")
+            out["skipped"].append({"repo": name, "reason": reason})
+            log(f"  {prof.name}/{name}: auto-apply skipped ({reason}){note_skip(name, reason)}")
         except grs.GitSyncError as e:
             out["errors"].append(f"{name}: {e}")
             log(f"  {prof.name}/{name}: auto-apply ERROR {e}")
+
+    if out["errors"]:
+        out["status"] = "error"
+    elif any(s["reason"] not in _STICKY_BENIGN for s in out["skipped"]):
+        out["status"] = "attention"
+    if not dry_run:
+        # A repo applied, up to date, or gone this run ends its streak.
+        for key in [k for k in sticky if k.startswith(prof.name + "/") and k not in stuck_now]:
+            del sticky[key]
+        try:
+            _atomic_write_json(_sticky_path(), sticky)
+        except OSError:
+            pass
     return out
 
 
@@ -1515,8 +1621,12 @@ def _meta_status(config_path: str | None) -> int:
         return 2
     # Probe the peer's INSTALLED fsync (not the pushed engine) so we see its real
     # capability level. An old build lacks `meta` -> reported as needing upgrade.
-    probe = _ssh(peer, "fsync meta version 2>/dev/null || "
-                       "~/.local/bin/fsync meta version 2>/dev/null", timeout=30)
+    try:
+        probe = _ssh(peer, "fsync meta version 2>/dev/null || "
+                           "~/.local/bin/fsync meta version 2>/dev/null", timeout=30)
+    except HomesyncError as e:
+        print(f"peer  : {peer.target} — {e}", file=sys.stderr)
+        return 1
     peer_m = None
     if probe.returncode == 0 and probe.stdout.strip():
         try:
@@ -1749,7 +1859,7 @@ def _deploy_daemon(args) -> int:
     for hk, tgt in plan:
         try:
             res = _daemon_deploy_to(tgt, wh["path"])
-        except (md.DeployError, subprocess.SubprocessError, OSError) as e:
+        except (md.DeployError, HomesyncError, subprocess.SubprocessError, OSError) as e:
             print(f"{hk}: ERROR {e}", file=sys.stderr)
             rc = 1
             continue
@@ -1820,7 +1930,7 @@ def cmd_deploy(args) -> int:
             try:
                 p = _ssh_to(tgt, f"~/{md.REMOTE_BIN_REL} meta version 2>/dev/null || "
                                  f"fsync meta version 2>/dev/null", timeout=30)
-            except (subprocess.SubprocessError, OSError):
+            except (subprocess.SubprocessError, OSError, HomesyncError):
                 print(f"{hk} ({tgt}): unreachable (ssh timed out)", file=sys.stderr)
                 rc = 1
                 continue
@@ -1858,7 +1968,7 @@ def cmd_deploy(args) -> int:
         log(f"deploying to {hk} ({tgt}) ...")
         try:
             res = _deploy_to(tgt, pyz, str(cfg_file))
-        except (md.DeployError, subprocess.SubprocessError, OSError) as e:
+        except (md.DeployError, HomesyncError, subprocess.SubprocessError, OSError) as e:
             # keep going: one slow/failed host must not strand the rest of the
             # fleet un-attempted (a mid-install failure already rolled back)
             print(f"{hk}: ERROR {e}", file=sys.stderr)
@@ -1986,6 +2096,7 @@ def _cmd_run(args) -> int:
         "peer": {"host": peer.host, "user": peer.user},
         "profiles": {},
         "errors": [],
+        "warnings": [],
     }
     log(f"sync run {run_id}{' (DRY RUN)' if args.dry_run else ''} -> {peer.target}")
     progress = ProgressWriter(run_dir, run_id, bool(args.dry_run), [p.name for p in selected])
@@ -2038,6 +2149,18 @@ def _cmd_run(args) -> int:
             progress.profile_done(prof.name, status="error")
             log(f"  {prof.name}: ERROR {e}")
             rc = 1
+        except Exception as e:  # noqa: BLE001 — ISSUE-009: one profile must never take the run down
+            # Anything unexpected (a raw subprocess error, a bug) is confined to
+            # this profile: recorded with its traceback, and the run goes on so
+            # the report is still written and the FAILED notification fires.
+            msg = f"{prof.name}: unexpected {type(e).__name__}: {e}"
+            report["profiles"].setdefault(prof.name, {})["status"] = "error"
+            report["errors"].append(msg)
+            progress.error(msg)
+            progress.profile_done(prof.name, status="error")
+            log(f"  {prof.name}: ERROR {msg}")
+            log(traceback.format_exc().rstrip())
+            rc = 1
 
     # Fix C post-pass: guarded receiver auto-apply, now that fresh bundles have
     # arrived via the git-bundles file profile this cycle.
@@ -2047,7 +2170,10 @@ def _cmd_run(args) -> int:
                                          run_id=run_id, dry_run=args.dry_run, log=log)
             report["profiles"][prof.name] = res
             log(f"  {prof.name}: auto-apply — {len(res['applied'])} applied, "
-                f"{len(res['skipped'])} skipped, {len(res['errors'])} error(s)")
+                f"{len(res['skipped'])} skipped, {len(res['errors'])} error(s)"
+                + (f", {len(res['sticky'])} stuck ≥{AUTO_APPLY_STICKY_RUNS} runs"
+                   if res.get("sticky") else ""))
+            report["warnings"].extend(res.get("warnings") or [])
             if res["errors"]:
                 report["errors"].extend(f"{prof.name}: {e}" for e in res["errors"])
                 rc = 1
@@ -2055,6 +2181,13 @@ def _cmd_run(args) -> int:
             report["profiles"][prof.name] = {"kind": "git", "apply": "auto", "status": "error"}
             report["errors"].append(f"{prof.name}: auto-apply: {e}")
             log(f"  {prof.name}: auto-apply ERROR {e}")
+            rc = 1
+        except Exception as e:  # noqa: BLE001 — ISSUE-009, as above
+            msg = f"{prof.name}: auto-apply: unexpected {type(e).__name__}: {e}"
+            report["profiles"][prof.name] = {"kind": "git", "apply": "auto", "status": "error"}
+            report["errors"].append(msg)
+            log(f"  {prof.name}: ERROR {msg}")
+            log(traceback.format_exc().rstrip())
             rc = 1
 
     report["finished"] = time.strftime("%Y-%m-%dT%H:%M:%S%z")
@@ -2071,9 +2204,11 @@ def _cmd_run(args) -> int:
         # some) — only speak up when files moved or something went wrong.
         if rc != 0:
             _notify("fsync sync FAILED", "; ".join(report["errors"])[:200])
-        elif moved:
-            _notify("fsync sync", f"{moved} file(s) synced with {peer.host}"
-                    + (f", {conflicts} conflict(s) held" if conflicts else ""))
+        elif moved or report["warnings"]:
+            parts = ([f"{moved} file(s) synced with {peer.host}"
+                      + (f", {conflicts} conflict(s) held" if conflicts else "")]
+                     if moved else []) + report["warnings"]
+            _notify("fsync sync" if moved else "fsync sync: attention", "; ".join(parts)[:200])
     return rc
 
 

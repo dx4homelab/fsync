@@ -15,6 +15,97 @@ fury4dx is a deployed receiver. Make changes on minis, commit + push, then
 
 ---
 
+## ISSUE-009 — A hung ssh to the peer aborted the whole scheduled run silently: no report, no notification, `latest` not updated
+
+- **Status:** **FIXED in 0.6.1** (2026-09-13).
+- **Where seen:** minis4dx, run `20260830-230822-688b` (2026-08-30 23:08). Two other report-less
+  runs (fury 2026-08-26 16:14, minis 2026-08-27 06:36) were daemon restarts during deploys — benign.
+
+### Symptom
+The run log ends in a Python traceback — `subprocess.TimeoutExpired: Command '['ssh', …
+'developer@fury4dx.lan', "… python3 -m fsync.cli index /var/home/developer/workspaces/primary …"]'`
+after 900 s. The run directory has no `report.json`, `runs/latest` still points at the previous
+run, and no desktop notification fired: `--notify` is evaluated at the end of `_cmd_run`, which
+was never reached. The failure mode was *silence*.
+
+### Root cause (verified against code, 2026-09-13)
+fury went to sleep while minis was indexing it (fury's own runs stop after 22:15 and resume the
+next morning; NetworkManager shows its WiFi scanning at the time). `_ssh_to`
+(`fsync/homesync.py`) ran `subprocess.run(..., timeout=900)` and let `TimeoutExpired` propagate;
+`_cmd_run`'s per-profile handler only caught `(HomesyncError, grs.GitSyncError)`, so the exception
+unwound the whole run.
+
+### Fix (0.6.1)
+- `_ssh_to` converts a timeout into `HomesyncError("ssh <target>: no reply within Ns (peer asleep
+  or link down?) while running: …")`. `peer_reachable` / `peer_busy` / the ghost probe / `deploy
+  status` treat it as away / busy / unreachable, as they did the raw exception.
+- `_cmd_run` gains an `except Exception` fallback per profile (and per auto-apply post-pass) that
+  records `unexpected <Type>: …` in `errors`, logs the traceback, marks the profile `error`, and
+  goes on — so the report is written, `latest` moves, and the `FAILED` notification fires.
+- Tests: `tests/test_issue009_run_resilience.py`.
+
+### Prevention
+The scheduler notifies only through the runner's own end-of-run path. Anything that can escape a
+profile must be confined to that profile, or the failure mode is silence.
+
+---
+
+## ISSUE-008 — A refused auto-apply leaves `refs/fsync/incoming/*` behind; every later fetch then fails non-fast-forward and hides the real refusal
+
+- **Status:** **FIXED in 0.6.1** (2026-09-13). Regression introduced by the ISSUE-006 sub-finding
+  fix (`2dedaab`, 2026-08-27).
+- **Where seen:** fury4dx, `repos` profile, `asap__owasp-coraza-proxy` — 23 consecutive hourly runs
+  `FAILED` from 2026-09-08 19:27 to 2026-09-13, one desktop notification each.
+
+### Symptom
+```
+repos/asap__owasp-coraza-proxy: auto-apply ERROR git fetch …/asap__owasp-coraza-proxy.bundle
+    refs/heads/*:refs/fsync/incoming/heads/* … failed in …/asap/owasp-coraza-proxy
+ ! [rejected] refs/fsync/wip -> refs/fsync/incoming/wip  (non-fast-forward)
+```
+Two runs earlier (2026-09-08 13:18 and 14:22) the same repo had reported the *real* condition:
+`receiver has commits the incoming bundle lacks (receiver HEAD 1c5664764 is not an ancestor of
+incoming d28361470) — refusing to roll back`. Three commits had been authored **on fury** that
+morning (Staging deployment docs + `.gitignore`) on a base from 2026-07-27; minis then committed
+`9126dc5` at 14:35. From 19:27 on the actionable message was gone and only the fetch error remained.
+
+### Root cause (verified against code, 2026-09-13)
+1. `apply_repo` (`fsync/git_repo_sync.py`) fetched the bundle into the `refs/fsync/incoming/*`
+   scratch namespace with **unforced** refspecs (`refs/heads/*:…`, `refs/tags/*:…`,
+   `refs/fsync/wip:…/wip`).
+2. The ISSUE-006 post-fetch guard raised **after** that fetch and **before** `_reconstruct`'s
+   end-of-apply tidy of the namespace, so a refusal left `incoming/wip` (and `incoming/heads/*`)
+   in place. fury still carried `refs/fsync/incoming/wip 89fd4cd` from the 13:18 attempt.
+3. The WIP ref is a synthetic snapshot commit recreated by every `fsync git snapshot`; consecutive
+   WIP commits are never ancestors of each other. `git fetch` rejected the `wip` update as
+   non-fast-forward, exited 1, and `_git(..., check=True)` turned that into `GitSyncError("git
+   fetch … failed")`. The heads *did* update (`incoming/heads/* = 9126dc5`), which is why the
+   error looked so odd.
+
+### Resolution (the incident)
+Nothing beyond the fix: `_fetch_incoming` prunes the namespace before fetching, so the stale ref on
+fury is cleared by the first 0.6.1 run. The three fury-authored commits still need a human
+(ISSUE-006 A): fetch them from fury and rebase/merge on minis.
+
+### Fix (0.6.1)
+- `_prune_incoming()` + `_fetch_incoming()`: prune `refs/fsync/incoming/*` first, then fetch with
+  forced (`+`) refspecs. Used by `apply_repo` and `restore_backup`; `_reconstruct` tidies through
+  the same helper; the guard prunes before raising.
+- The guard raises `ReceiverAheadError(GitSyncError)` carrying both ids. Manual `fsync git apply`
+  still treats it as an error (unless `--force`); **auto-apply records it as a sticky skip**
+  (`status: attention`, escalating per ISSUE-006 B) instead of failing — and notifying — every
+  hour: it is a standing condition only a human resolves, exactly like the pre-fetch
+  `receiver is ahead` skip.
+- Tests: `tests/test_issue008_incoming_refs.py` — a refusal leaves no scratch refs and the next
+  snapshot fetches; a planted stale `incoming/wip` cannot gate a fetch; `restore_backup` survives
+  one; sticky escalation fires and clears.
+
+### Prevention
+A scratch namespace must be scratch: never gate on it, always force into it, never leave it
+populated on an exception path. An error raised between "fetched" and "tidied" must tidy first.
+
+---
+
 ## ISSUE-002 — Detected "renames" are dropped from profile-driven syncs entirely: never copied, never renamed, still `status: ok`
 
 - **Status:** **FIXED in 0.6.0** (2026-07-28) — fixes **A + C** below. Was: product bug, verified
@@ -161,6 +252,12 @@ direction was **not** flipped — that would reintroduce ISSUE-001.
   `! <profile>/<path>: N file(s) STRANDED by direction:<dir> — they differ from the peer and were
   withheld, not synced: … | reconcile with: fsync sync folder <path>`, and the summary line says
   `<dir>-only (N STRANDED)` rather than the neutral `(N skipped)`.
+- **C′. Say *what kind* of withheld — DONE (0.6.1).** "they differ from the peer" was wrong for the
+  common case: on 2026-09-13, 4453 of the 4866 withheld `primary` paths existed **only** on the
+  peer (fury-side work, plus files deleted on minis that additive sync never removes — ISSUE-007),
+  and 413 were newer there. The line now reads `withheld, not synced: N exist only on the peer,
+  M are newer on the peer`, and the report carries `stranded_side`, `stranded_only_on_side`,
+  `stranded_newer_on_side`.
 - **D. Rank the report by actionability — NOT DONE.** Also partly misdiagnosed: `views.py` never
   rendered `skipped_by_direction`, `renames_pending` or `untracked_introductions` at all — those
   screens are the *plan preview*, not the run report, and the run report is JSON plus the log
@@ -280,8 +377,14 @@ case correct by default.
 
 ## ISSUE-006 — `kind:git` is producer→receiver only, so receiver-authored commits have no path home; persistent skips never escalate
 
-- **Status:** OPEN — worked around by hand 2026-07-28.
-- **Where seen:** `repos` profile, `asap__owasp-coraza-proxy`.
+- **Status:** **PARTIALLY FIXED in 0.6.1** (2026-09-13) — fixes **B** (sticky-skip escalation)
+  and **C** (`repos` profile `status`) done; **A** (ff-only return path) still OPEN. Worked around
+  by hand 2026-07-28; pending again 2026-09-13 (three fury-authored commits in
+  `asap__owasp-coraza-proxy`, the fury-only repo `afsas-code-ide`, and tracked edits on fury in
+  `dashboard-refactor-v4`, `status4tomcat`, `proxy4afsas`, `mac-address-manager`).
+- **Where seen:** `repos` profile, `asap__owasp-coraza-proxy`. Recurrence 2026-09-13: **13 repos**
+  skipped `receiver has local changes` on every fury run, 10 of them for 170+ consecutive runs
+  (6 dirty only by untracked files such as `vpn.pid`), two of them 2 and 17 commits behind minis.
 
 ### Symptom
 Every run skipped the repo with `reason: "receiver has local changes"`. In fact fury (the
@@ -306,15 +409,18 @@ By hand: `git bundle create --all` on fury, `scp` to minis, `git fetch <bundle>
 'refs/heads/*:refs/remotes/fury/*'`, verified both branches fast-forwardable, then
 `git merge --ff-only` and `git branch -f main`. Both boxes now at `458660f`.
 
-### Fix (proposed, 0.6.0)
-- **A. Allow `direction: both` for `kind: git`,** applying **fast-forward-only** in the
+### Fix
+- **A. (OPEN) Allow `direction: both` for `kind: git`,** applying **fast-forward-only** in the
   receiver→producer direction. Refuse anything non-ff and report it. This would have carried
   `458660f` automatically, with no possibility of clobbering.
-- **B. Escalate sticky skips.** If the same repo is skipped for the same reason for N consecutive
-  runs, raise it to `status: attention` and say which side is ahead — "receiver has local changes"
-  read identically on day 1 and day 15.
-- **C. Give the `repos` profile a `status` field.** It currently reports `applied`/`skipped` lists
-  and no status, so it cannot surface in a summary view at all.
+- **B. Escalate sticky skips — DONE (0.6.1).** Streaks persist in `<state>/auto-apply-sticky.json`,
+  keyed on the reason modulo commit ids. Every skip line now carries `[N in a row since <run>]`;
+  at `AUTO_APPLY_STICKY_RUNS = 24` consecutive runs (and every 168 after) the repo is named in the
+  report's `warnings`, which the run turns into an `fsync sync: attention` desktop notification.
+  The post-fetch `ReceiverAheadError` (ISSUE-008) joins the same sticky path. A dry run reads but
+  never advances a streak; an applied / up-to-date repo ends it.
+- **C. Give the `repos` profile a `status` field — DONE (0.6.1).** `ok` / `attention` (any skip for a
+  non-benign reason) / `error`, plus `sticky` (repos at or past the threshold) and `warnings`.
 
 ### Prevention
 One-way is the right default for *files*, where deletes and renames are ambiguous. For git it is
