@@ -24,7 +24,7 @@ from pathlib import Path
 # `index --store-db` / `agent` if its deps happen to be present.
 CORE_MODULES = [
     "__init__.py", "cli.py", "fileindex.py", "homesync.py", "git_repo_sync.py",
-    "meta_deploy.py", "foldersync.py", "vmclone.py",
+    "meta_deploy.py", "foldersync.py", "vmclone.py", "svnsync.py",
     "db.py", "catalog_client.py", "eventbus.py", "agent.py",
 ]
 

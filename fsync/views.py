@@ -27,6 +27,43 @@ from dream4devops.ui_lite.spec import cell, row
 
 STATE_MARK = {"both": ("⇅", Tone.good), "push": ("→", Tone.accent),
               "pull": ("←", Tone.accent), "off": ("·", Tone.muted)}
+# ISSUE-010 fix 6: svn checkout parity states (preview "svn" rows)
+SVN_STATE = {"ok": ("= parity", Tone.good), "skip": ("✗ SKIPPED", Tone.bad),
+             "advisory": ("! receiver stale", Tone.warn), "unknown": ("? unknown", Tone.warn),
+             "only-local": ("only here", Tone.muted), "only-peer": ("only peer", Tone.muted)}
+
+
+def _rev(v) -> str:
+    return f"r{v}" if isinstance(v, int) else "-"
+
+
+def svn_parity_rows(pdata: dict, *, strike: bool = False) -> list:
+    """One sub-row per svn checkout that is NOT in parity (skipped, receiver
+    stale, unknown) — checkouts in parity are summarised, not listed, so a
+    profile with 20 healthy checkouts costs one line, a stale one stands out."""
+    rows = []
+    svn = pdata.get("svn") or []
+    if not svn:
+        return rows
+    ok = sum(1 for r in svn if r.get("state") == "ok")
+    for r in svn:
+        state = r.get("state", "unknown")
+        if state in ("ok", "only-local", "only-peer"):
+            continue
+        label, tone = SVN_STATE.get(state, (state, Tone.warn))
+        revs = f"local {_rev(r.get('local_rev'))}  peer {_rev(r.get('peer_rev'))}"
+        if r.get("head_rev") is not None:
+            revs += f"  HEAD {_rev(r['head_rev'])}"
+        rows.append(row(cell(""), cell(f"   svn {r.get('rel')}", Tone.muted, strike=strike),
+                        cell(label, tone, strike=strike), cell(revs, tone, strike=strike),
+                        cell(""), cell(""), cell(""), tone=Tone.muted if strike else Tone.default))
+    both = sum(1 for r in svn if r.get("state") not in ("only-local", "only-peer"))
+    if both:
+        rows.append(row(cell(""), cell(f"   svn: {ok}/{both} checkout(s) in revision parity"
+                                       + (f", {len(svn) - both} one-sided" if len(svn) - both else ""),
+                                       Tone.muted, strike=strike),
+                        cell(""), cell(""), cell(""), cell(""), cell(""), tone=Tone.muted))
+    return rows
 PHASE_LABEL = {"queued": "queued", "indexing": "⣷ indexing…", "merging": "⇄ merging",
                "a_to_b": "→ pushing", "b_to_a": "← pulling", "done": "✓ done"}
 
@@ -159,6 +196,7 @@ def plan_screen(plan: dict, state: dict, dry: bool, msg: str = "") -> Screen:
                 totals[1] += d["b_to_a"]; total_bytes += d["bytes_b_to_a"]
             if st != "off":
                 totals[2] += over; totals[3] += d["conflicts"]
+        rows.extend(svn_parity_rows(pdata, strike=st == "off"))
     active = sum(1 for s in state.values() if s != "off")
     rows.append(row(cell(""), cell(f"TOTAL ({active}/{len(names)} profiles active)"),
                     cell(totals[0]), cell(totals[1]), cell(totals[2]), cell(totals[3]),
@@ -169,6 +207,13 @@ def plan_screen(plan: dict, state: dict, dry: bool, msg: str = "") -> Screen:
     hint = (f"{fmt_bytes(total_bytes)} to move. Overwritten files are backed up on the receiver "
             "under ~/.fsync/backups/<run>/. Conflicts (review profiles) are held.")
     blocks.append(Note(text=hint))
+    skipped = [r for p in plan.get("profiles", {}).values() for r in (p.get("svn") or [])
+               if r.get("state") == "skip"]
+    if skipped:
+        blocks.append(Note(text=f"{len(skipped)} svn checkout(s) will NOT be file-synced this run "
+                                f"(stale sender / URL mismatch, ISSUE-010): "
+                                + "; ".join(str(r.get("reason")) for r in skipped[:3])
+                                + (" …" if len(skipped) > 3 else ""), tone=Tone.warn))
     if msg:
         blocks.append(Note(text=msg, tone=Tone.warn))
     blocks.append(Actions(items=[

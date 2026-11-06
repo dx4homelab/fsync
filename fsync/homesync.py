@@ -24,12 +24,13 @@ import subprocess
 import sys
 import time
 import traceback
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any
 
 from . import FEATURES, __version__ as FSYNC_VERSION
 from . import git_repo_sync as grs
+from . import svnsync as svs
 from .fileindex import (
     DEFAULT_RSYNC_SSH,
     build_sync_plan,
@@ -44,7 +45,9 @@ STATE_ROOT = "~/.local/state/fsync"
 ENGINE_DIR = ".local/lib/fsync-engine"  # relative to the peer's $HOME
 DEFAULT_GIT_BUNDLE_DIR = "~/.fsync/git-bundles"  # P5: kind=git bundles land here
 DEFAULT_GIT_BACKUP_ROOT = "~/.fsync/backups"     # pre-apply receiver backups
+DEFAULT_SVN_SNAPSHOT_DIR = "~/.fsync/svn-snapshots"  # ISSUE-010: kind=svn snapshots land here
 STRANDED_SAMPLE = 20  # ISSUE-003: how many withheld paths to name in the report
+RESURRECTED_SAMPLE = 20  # ISSUE-010 fix 3: resurrected paths named inline (full list in a .lst)
 
 # StrictHostKeyChecking=accept-new (not =yes): the SYNC channel is ssh, which
 # verifies host keys against known_hosts. Off-LAN, a new address (the peer's
@@ -116,13 +119,15 @@ profiles:
     paths: [workspaces/homelab]
     # "mtab": extracted OS rootfs trees symlink etc/mtab -> /proc/mounts,
     # whose mtime is always "now" — syncing it ping-pongs every run.
-    exclude: [".venv", "venv", "node_modules", "__pycache__", ".pytest_cache",
+    # ".svn": a working copy's metadata (wc.db, pristine bases) is box-local —
+    # pasting one box's onto the other's tree corrupts it (ISSUE-004/010).
+    exclude: [".svn", ".venv", "venv", "node_modules", "__pycache__", ".pytest_cache",
               "*.pyc", "backups", "mtab", "fsync/scratchpad/repo-sync/*"]
   primary:
     # Client workspace. .metadata is Eclipse runtime state (locks, caches,
     # per-machine UI state) — never sync it.
     paths: [workspaces/primary]
-    exclude: [".venv", "venv", "node_modules", "__pycache__", ".pytest_cache",
+    exclude: [".svn", ".venv", "venv", "node_modules", "__pycache__", ".pytest_cache",
               "*.pyc", "backups", "mtab", ".metadata/*"]
   claude:
     # Durable artifacts only (memories, agents, skills, plugins). Session
@@ -341,6 +346,9 @@ class Profile:
     merge_jsonl: list[str] = field(default_factory=list)
     # P5 git-repo-sync: kind="git" profiles carry full git working state via
     # bundles instead of additive rsync (docs/git-repo-sync.md).
+    # ISSUE-010: kind="svn" mirrors it for Subversion working copies — URL +
+    # revision + diff + unversioned files travel as a snapshot; committed
+    # history travels through the SVN server (fsync/svnsync.py).
     kind: str = "files"
     mirror_branches: bool = False
     # ISSUE-001 fix C: kind:git receiver behaviour. "on-demand" (default, R17 v1)
@@ -458,8 +466,8 @@ def load_config(path: str | None) -> tuple[Peer, dict[str, Profile], dict[str, A
         if direction not in DIRECTIONS:
             raise HomesyncError(f"{cfg_path}: profile '{name}': direction must be one of {DIRECTIONS}")
         kind = raw.get("kind", "files")
-        if kind not in ("files", "git"):
-            raise HomesyncError(f"{cfg_path}: profile '{name}': kind must be 'files' or 'git', got {kind!r}")
+        if kind not in ("files", "git", "svn"):
+            raise HomesyncError(f"{cfg_path}: profile '{name}': kind must be 'files', 'git' or 'svn', got {kind!r}")
         apply_mode = raw.get("apply", defaults.get("apply", "on-demand"))
         if apply_mode not in ("on-demand", "auto"):
             raise HomesyncError(f"{cfg_path}: profile '{name}': apply must be 'on-demand' or 'auto', got {apply_mode!r}")
@@ -770,7 +778,170 @@ def _plan_path(peer: Peer, prof: Profile, rel: str, n_workers: int):
     plan = build_sync_plan(report, conflict=prof.conflict, rename_min_size=prof.rename_min_size,
                            allow_renames=False)
     changed = {pair[0].get("path") for pair in report["name_matches_diff_hash"]}
+    # ISSUE-010 fix 3: the receiver's current path set is what resurrection
+    # detection compares against its previous one; carried on the plan so the
+    # run can save it without re-indexing.
+    plan["index_a"] = {it.get("path") for it in idx_a if it.get("path")}
+    plan["index_b"] = {it.get("path") for it in idx_b if it.get("path")}
     return local_root, remote_root, plan, changed
+
+
+# --------------------------------------------------------------------------- #
+# ISSUE-010 fix 2: stale-sender guard for SVN working copies in file profiles  #
+# --------------------------------------------------------------------------- #
+
+def _local_short_host() -> str:
+    return socket.gethostname().split(".")[0]
+
+
+def svn_guard_for_path(peer: Peer, prof: Profile, rel: str, local_root: Path,
+                       remote_root: str, *, head: bool = False) -> dict[str, Any]:
+    """Probe the SVN checkouts under one file-profile path on both boxes and
+    decide which subtrees this run must not carry (``svnsync.stale_sender_guard``).
+
+    A checkout only this box has needs no peer probe (nothing to compare), so
+    the peer round trip happens only when there is something to guard. A peer
+    probe that fails is reported (``probe_warning``) and treated as "guard
+    inactive" — loudly, never silently."""
+    local, heads_l = svs.probe_local(local_root, head=head)
+    out: dict[str, Any] = {"checked": 0, "skipped": [], "advisory": [], "excludes": [],
+                           "parity": [], "probe_warning": None}
+    if not local:
+        return out
+    remote = svs.probe_remote(lambda cmd, timeout: _ssh(peer, cmd, timeout=timeout),
+                              remote_root, head=False)
+    if remote is None:
+        out["probe_warning"] = (f"{prof.name}/{rel}: svn parity probe failed on {peer.target} — "
+                                f"stale-sender guard inactive this run (ISSUE-010)")
+        out["parity"] = [{"rel": r, "local_rev": v.get("rev"), "peer_rev": None, "head_rev": None,
+                          "state": "unknown", "reason": "peer probe failed"}
+                         for r, v in sorted(local.items())]
+        return out
+    peer_cos, _ = remote
+    out.update(svs.stale_sender_guard(local, peer_cos, direction=prof.direction,
+                                      local_host=_local_short_host(), peer_host=peer.host,
+                                      heads=heads_l))
+    return out
+
+
+# --------------------------------------------------------------------------- #
+# ISSUE-010 fix 3: resurrection detection (receiver deleted it since last run) #
+# --------------------------------------------------------------------------- #
+
+def _prev_index_path(prof_name: str, key: str, side: str) -> Path:
+    return state_root() / "prev-index" / prof_name / f"{key}.{side}.json.gz"
+
+
+def _load_prev_index(prof_name: str, key: str, side: str) -> set[str] | None:
+    """The receiver-side path set this box saw on its previous run of this
+    profile path, or None when there is no baseline yet."""
+    import gzip
+    p = _prev_index_path(prof_name, key, side)
+    try:
+        with gzip.open(p, "rt") as f:
+            data = json.load(f)
+        return set(data.get("paths") or []) if isinstance(data, dict) else None
+    except (OSError, ValueError):
+        return None
+
+
+def _save_prev_index(prof_name: str, key: str, side: str, paths: set[str], run_id: str) -> None:
+    import gzip
+    p = _prev_index_path(prof_name, key, side)
+    try:
+        p.parent.mkdir(parents=True, exist_ok=True)
+        tmp = p.with_suffix(".tmp")
+        with gzip.open(tmp, "wt") as f:
+            json.dump({"run_id": run_id, "ts": time.time(), "paths": sorted(paths)}, f)
+        os.replace(tmp, p)
+    except OSError:
+        pass
+
+
+def detect_resurrections(prof_name: str, key: str, plan: dict, a_paths: list[str],
+                         b_paths: list[str], changed: set[str]) -> dict[str, Any]:
+    """A path the receiver LACKS now but HAD in the previous run's index was
+    deleted on the receiver since — so an additive copy of the sender's still-
+    present file re-creates what the receiver removed (ISSUE-010: svn deleted it
+    there; ISSUE-007's other half for plain folders and git worktrees). Only
+    creates qualify: an overwrite (``changed``) means the receiver still has it.
+    Pure given the plan's ``index_a``/``index_b``; absent those (older plan
+    shape, tests) detection is off."""
+    out: dict[str, Any] = {"on_peer": [], "on_local": [], "count": 0, "truncated": False,
+                           "baseline": {"peer": False, "local": False}}
+    idx_a, idx_b = plan.get("index_a"), plan.get("index_b")
+    if idx_b is not None:
+        prev_b = _load_prev_index(prof_name, key, "peer")
+        if prev_b is not None:
+            out["baseline"]["peer"] = True
+            out["on_peer"] = [p for p in a_paths if p not in idx_b and p not in changed and p in prev_b]
+    if idx_a is not None:
+        prev_a = _load_prev_index(prof_name, key, "local")
+        if prev_a is not None:
+            out["baseline"]["local"] = True
+            out["on_local"] = [p for p in b_paths if p not in idx_a and p not in changed and p in prev_a]
+    out["count"] = len(out["on_peer"]) + len(out["on_local"])
+    return out
+
+
+# --------------------------------------------------------------------------- #
+# sticky skip streaks (ISSUE-006 B/C, shared by git auto-apply and the svn     #
+# stale-sender guard): a skip that repeats run after run is a standing         #
+# condition, escalated once at AUTO_APPLY_STICKY_RUNS and then periodically    #
+# --------------------------------------------------------------------------- #
+
+class StickyStreaks:
+    """Streak bookkeeping for one key prefix (``"<profile>/"`` or
+    ``"<profile>/svn:"``) in ``<state>/auto-apply-sticky.json``. ``note`` records
+    a non-benign skip and returns ``(runs, first_run, log_suffix)``; it also
+    appends to ``sticky`` / ``warnings`` at the escalation points (and, with
+    ``warn_first``, on the first run of a streak — the svn guard wants the
+    operator to hear about a stale checkout right away, not a day later).
+    ``finish`` drops streaks that ended and persists. A dry run reads but never
+    advances a streak."""
+
+    def __init__(self, prefix: str, *, run_id: str, dry_run: bool) -> None:
+        self.prefix = prefix
+        self.run_id = run_id
+        self.dry_run = dry_run
+        self.store = _load_sticky()
+        self.stuck_now: set[str] = set()
+        self.sticky: list[dict[str, Any]] = []
+        self.warnings: list[str] = []
+
+    def note(self, name: str, reason: str, *, warn_first: bool = False,
+             warn_text: str | None = None, label: str = "auto-apply skipped",
+             remedy: str = "receiver work is stuck, reconcile by hand (ISSUE-006)") -> tuple[int, str, str]:
+        key = f"{self.prefix}{name}"
+        self.stuck_now.add(key)
+        prev = self.store.get(key) or {}
+        same = prev.get("reason_key") == _sticky_key(reason)
+        runs = int(prev.get("runs", 0)) if same else 0
+        first = prev.get("first_run", self.run_id) if same else self.run_id
+        if self.dry_run:
+            return runs, first, (f" [{runs} in a row since {first}]" if runs > 1 else "")
+        runs += 1
+        self.store[key] = {"reason": reason, "reason_key": _sticky_key(reason),
+                           "runs": runs, "first_run": first, "last_run": self.run_id}
+        if runs >= AUTO_APPLY_STICKY_RUNS:
+            self.sticky.append({"repo": name, "reason": reason, "runs": runs, "first_run": first})
+        if (warn_first and runs == 1) or runs == AUTO_APPLY_STICKY_RUNS or (
+                runs > AUTO_APPLY_STICKY_RUNS
+                and (runs - AUTO_APPLY_STICKY_RUNS) % AUTO_APPLY_REMIND_EVERY == 0):
+            self.warnings.append(warn_text if (warn_text and runs == 1) else
+                                 f"{key}: {label} {runs} runs in a row since {first} "
+                                 f"({reason}) — {remedy}")
+        return runs, first, (f" [{runs} in a row since {first}]" if runs > 1 else "")
+
+    def finish(self) -> None:
+        if self.dry_run:
+            return
+        for key in [k for k in self.store if k.startswith(self.prefix) and k not in self.stuck_now]:
+            del self.store[key]
+        try:
+            _atomic_write_json(_sticky_path(), self.store)
+        except OSError:
+            pass
 
 
 def build_run_preview(
@@ -808,12 +979,36 @@ def build_run_preview(
             out["profiles"][prof.name] = {"kind": "git",
                                           "repos": [r["rel"] for r in _discover_git_repos(prof)]}
             continue
-        pp: dict[str, Any] = {"conflict": prof.conflict, "direction": prof.direction, "paths": {}}
+        if prof.kind == "svn":
+            out["profiles"][prof.name] = {"kind": "svn",
+                                          "checkouts": [c["rel"] for c in _discover_svn_checkouts(prof)]}
+            continue
+        pp: dict[str, Any] = {"conflict": prof.conflict, "direction": prof.direction, "paths": {},
+                              "svn": []}
+        p_home = peer_home(peer)
         for rel in prof.paths:
+            if prog is not None:
+                prog["profiles"][prof.name]["paths"][rel] = {"phase": "svn-parity"}
+                prog_write()
+            # ISSUE-010 fix 2/6: the preview applies the same stale-sender guard
+            # as the run, and carries per-checkout parity (sender r / receiver r
+            # / server HEAD r) so a stale checkout is visible BEFORE pressing run.
+            home = Path.home()
+            guard = svn_guard_for_path(peer, prof, rel,
+                                       home if rel == "." else home / rel,
+                                       p_home if rel == "." else f"{p_home}/{rel}", head=True)
+            for row in guard["parity"]:
+                pp["svn"].append({"path": rel, **row})
+            if guard.get("probe_warning"):
+                pp["svn"].append({"path": rel, "rel": "*", "state": "unknown",
+                                  "reason": guard["probe_warning"], "local_rev": None,
+                                  "peer_rev": None, "head_rev": None})
+            plan_prof = (replace(prof, exclude=list(prof.exclude) + guard["excludes"])
+                         if guard["excludes"] else prof)
             if prog is not None:
                 prog["profiles"][prof.name]["paths"][rel] = {"phase": "indexing"}
                 prog_write()
-            _, _, plan, changed = _plan_path(peer, prof, rel, workers or prof.workers)
+            _, _, plan, changed = _plan_path(peer, plan_prof, rel, workers or prof.workers)
             a_items = [it for it in plan["a_to_b"] if it.get("path")]
             b_items = [it for it in plan["b_to_a"] if it.get("path")]
             pp["paths"][rel] = {
@@ -826,6 +1021,8 @@ def build_run_preview(
                 "conflicts": len(plan["conflicts"]),
                 "identical": plan["noop"],
                 "renames_demoted": len(plan["renames_suppressed"]),
+                "svn_skipped": len(guard["skipped"]),
+                "svn_checked": guard["checked"],
                 "samples": {
                     "a_to_b": [it["path"] for it in a_items[:sample_n]],
                     "b_to_a": [it["path"] for it in b_items[:sample_n]],
@@ -888,14 +1085,41 @@ def run_profile(
     local_backup = str(Path("~/.fsync/backups").expanduser() / run_id / prof.name)
     remote_backup = f"{p_home}/.fsync/backups/{run_id}/{prof.name}"
 
-    result: dict[str, Any] = {"conflict": prof.conflict, "paths": {}, "status": "ok"}
+    result: dict[str, Any] = {"conflict": prof.conflict, "paths": {}, "status": "ok",
+                              "warnings": []}
+    streaks = StickyStreaks(f"{prof.name}/svn:", run_id=run_id, dry_run=dry_run)
     for rel in prof.paths:
         started = time.time()
         key = "home" if rel == "." else rel.replace("/", "_")
 
+        # ISSUE-010 fix 2: before indexing, find SVN checkouts whose sender is
+        # behind the receiver (or on another URL) and exclude those subtrees —
+        # a stale sender's clean, versioned files would re-create everything
+        # svn deleted on the receiver since. Sticky + attention + notified, like
+        # kind:git's "receiver has local changes".
+        home = Path.home()
+        g_local = home if rel == "." else home / rel
+        g_remote = p_home if rel == "." else f"{p_home}/{rel}"
+        if progress:
+            progress.path_phase(prof.name, rel, "svn-parity")
+        guard = svn_guard_for_path(peer, prof, rel, g_local, g_remote)
+        if guard.get("probe_warning"):
+            result["warnings"].append(guard["probe_warning"])
+            log(f"  ! {guard['probe_warning']}")
+        for adv in guard["advisory"]:
+            log(f"  note: {prof.name}/{rel}: {adv['reason']}")
+        for sk in guard["skipped"]:
+            runs, first, suffix = streaks.note(
+                f"{rel}/{sk['rel']}", sk["reason"], warn_first=True,
+                warn_text=f"{prof.name}/{rel}: {sk['reason']} (ISSUE-010)",
+                label="svn checkout skipped", remedy="svn update the stale side (ISSUE-010)")
+            log(f"  ! {prof.name}/{rel}: SKIPPED {sk['reason']}{suffix}")
+        plan_prof = (replace(prof, exclude=list(prof.exclude) + guard["excludes"])
+                     if guard["excludes"] else prof)
+
         if progress:
             progress.path_phase(prof.name, rel, "indexing")
-        local_root, remote_root, plan, changed_paths = _plan_path(peer, prof, rel, n_workers)
+        local_root, remote_root, plan, changed_paths = _plan_path(peer, plan_prof, rel, n_workers)
 
         # Overwrite = a routed same-path/different-content file; exactly those
         # produce a backup on the receiver. Additive copies overwrite nothing.
@@ -977,6 +1201,20 @@ def run_profile(
         over_ab = sum(1 for p in a_paths if p in changed_paths)
         over_ba = sum(1 for p in b_paths if p in changed_paths)
 
+        # ISSUE-010 fix 3: creates on a receiver that HAD the path last run are
+        # resurrections of something it deleted since. Detection, not a block:
+        # the undo is the listed paths (backup_root holds nothing for creates).
+        resurrected = detect_resurrections(prof.name, key, plan, a_paths, b_paths, changed_paths)
+        if resurrected["count"]:
+            lst = run_dir / prof.name / f"{key}.resurrected.lst"
+            lst.parent.mkdir(parents=True, exist_ok=True)
+            lst.write_text("".join(f"peer\t{p}\n" for p in resurrected["on_peer"])
+                           + "".join(f"local\t{p}\n" for p in resurrected["on_local"]))
+            resurrected["list"] = str(lst)
+        if plan.get("index_a") is not None and plan.get("index_b") is not None:
+            _save_prev_index(prof.name, key, "local", plan["index_a"], run_id)
+            _save_prev_index(prof.name, key, "peer", plan["index_b"], run_id)
+
         if progress:
             progress.path_phase(prof.name, rel, "a_to_b", planned=len(a_paths))
         leg_ab = run_rsync_leg(
@@ -1039,6 +1277,21 @@ def run_profile(
                 "on_peer": ghosts_peer, "on_local": ghosts_local,
                 "count": ghost_total, "truncated": ghosts_truncated,
             },
+            "resurrected": {
+                "on_peer": resurrected["on_peer"][:RESURRECTED_SAMPLE],
+                "on_local": resurrected["on_local"][:RESURRECTED_SAMPLE],
+                "count": resurrected["count"],
+                "truncated": resurrected["count"] > RESURRECTED_SAMPLE,
+                "list": resurrected.get("list"),
+                "baseline": resurrected["baseline"],
+            },
+            "svn_guard": {
+                "checked": guard["checked"],
+                "skipped": guard["skipped"],
+                "advisory": guard["advisory"],
+                "parity": guard["parity"],
+                "probe_warning": guard.get("probe_warning"),
+            },
             "seconds": round(time.time() - started, 2),
         }
         if progress:
@@ -1051,8 +1304,17 @@ def run_profile(
         # ISSUE-003 / ISSUE-002: withheld or unactioned divergence must never
         # render green. "ok" has to mean "the two sides agree", not "the run
         # finished without raising".
-        if stranded or plan["renames"]:
+        if stranded or plan["renames"] or guard["skipped"] or resurrected["count"]:
             result["status"] = "attention"
+        if resurrected["count"]:
+            sample = (resurrected["on_peer"] + resurrected["on_local"])[:5]
+            where = ("the peer" if resurrected["on_peer"] else "this box")
+            msg = (f"{prof.name}/{rel}: {resurrected['count']} file(s) RESURRECTED on {where} — "
+                   f"the receiver had deleted them since the last run; this copy re-created them "
+                   f"(ISSUE-010): " + ", ".join(sample) + (" ..." if resurrected["count"] > 5 else "")
+                   + f" | undo: remove the paths listed in {resurrected.get('list')}")
+            log(f"  ! {msg}")
+            result["warnings"].append(msg[:300])
         if stranded:
             shown = stranded[:5]
             log(f"  ! {prof.name}/{rel}: {skipped_by_direction} file(s) STRANDED by "
@@ -1076,8 +1338,13 @@ def run_profile(
             + (f", {prof.direction}-only ({skipped_by_direction} STRANDED)"
                if prof.direction != "both" and skipped_by_direction else
                (f", {prof.direction}-only" if prof.direction != "both" else ""))
+            + (f", svn {guard['checked']} checked/{len(guard['skipped'])} skipped"
+               if guard["checked"] or guard["skipped"] else "")
             + f" [{result['paths'][rel]['seconds']}s]"
         )
+    streaks.finish()
+    result["warnings"].extend(streaks.warnings)
+    result["sticky"] = streaks.sticky
     return result
 
 
@@ -1138,6 +1405,8 @@ def git_repo_excludes_for_file_profiles(profiles: dict[str, Profile]) -> dict[st
     for p in profiles.values():
         if p.kind == "git" and p.apply == "auto":
             auto_rels.extend(r["rel"] for r in _discover_git_repos(p))
+        elif p.kind == "svn" and p.apply == "auto":
+            auto_rels.extend(r["rel"] for r in _discover_svn_checkouts(p))
     out: dict[str, list[str]] = {}
     if not auto_rels:
         return out
@@ -1235,31 +1504,11 @@ def auto_apply_git_profile(prof: Profile, bundle_dir: str | Path, *,
                            "sticky": [], "warnings": []}
     if not bundle_dir.is_dir():
         return out
-    sticky = _load_sticky()
-    stuck_now: set[str] = set()
+    streaks = StickyStreaks(f"{prof.name}/", run_id=run_id, dry_run=dry_run)
 
     def note_skip(name: str, reason: str) -> str:
         """Record a non-benign skip's streak; return a suffix for the log line."""
-        key = f"{prof.name}/{name}"
-        stuck_now.add(key)
-        prev = sticky.get(key) or {}
-        same = prev.get("reason_key") == _sticky_key(reason)
-        runs = int(prev.get("runs", 0)) if same else 0
-        first = prev.get("first_run", run_id) if same else run_id
-        if dry_run:
-            return f" [{runs} in a row since {first}]" if runs > 1 else ""
-        runs += 1
-        sticky[key] = {"reason": reason, "reason_key": _sticky_key(reason),
-                       "runs": runs, "first_run": first, "last_run": run_id}
-        if runs >= AUTO_APPLY_STICKY_RUNS:
-            out["sticky"].append({"repo": name, "reason": reason, "runs": runs, "first_run": first})
-        if runs == AUTO_APPLY_STICKY_RUNS or (
-                runs > AUTO_APPLY_STICKY_RUNS
-                and (runs - AUTO_APPLY_STICKY_RUNS) % AUTO_APPLY_REMIND_EVERY == 0):
-            out["warnings"].append(
-                f"{prof.name}/{name}: auto-apply skipped {runs} runs in a row since {first} "
-                f"({reason}) — receiver work is stuck, reconcile by hand (ISSUE-006)")
-        return f" [{runs} in a row since {first}]" if runs > 1 else ""
+        return streaks.note(name, reason)[2]
 
     for meta_path in sorted(bundle_dir.glob("*.meta.json")):
         try:
@@ -1311,15 +1560,253 @@ def auto_apply_git_profile(prof: Profile, bundle_dir: str | Path, *,
         out["status"] = "error"
     elif any(s["reason"] not in _STICKY_BENIGN for s in out["skipped"]):
         out["status"] = "attention"
-    if not dry_run:
-        # A repo applied, up to date, or gone this run ends its streak.
-        for key in [k for k in sticky if k.startswith(prof.name + "/") and k not in stuck_now]:
-            del sticky[key]
-        try:
-            _atomic_write_json(_sticky_path(), sticky)
-        except OSError:
-            pass
+    # A repo applied, up to date, or gone this run ends its streak.
+    streaks.finish()
+    out["sticky"].extend(streaks.sticky)
+    out["warnings"].extend(streaks.warnings)
     return out
+
+
+# --------------------------------------------------------------------------- #
+# ISSUE-010 fix 5: kind=svn profiles (fsync/svnsync.py) — same shape as git:   #
+# producer snapshots, carrier file profile moves the snapshot dir, receiver    #
+# applies on demand (`fsync svn apply`) or auto (guarded) when apply: auto.    #
+# --------------------------------------------------------------------------- #
+
+def _discover_svn_checkouts(prof: Profile) -> list[dict]:
+    home = _home()
+    out: list[dict] = []
+    seen: set[str] = set()
+    for p in prof.paths:
+        for name, path in svs.discover_checkouts(home / p, prof.exclude):
+            rel = path.relative_to(home).as_posix()
+            if rel in seen:
+                continue
+            seen.add(rel)
+            out.append({"name": name, "rel": rel, "path": path})
+    return out
+
+
+def svn_profile_snapshots(prof: Profile) -> bool:
+    return prof.kind == "svn" and prof.direction in ("push", "both")
+
+
+def auto_apply_svn_checkouts(prof: Profile) -> bool:
+    return prof.kind == "svn" and prof.apply == "auto" and not svn_profile_snapshots(prof)
+
+
+def snapshot_svn_profile(prof: Profile, snap_dir: str | Path, log) -> dict[str, Any]:
+    """Producer side: capture every working copy in the profile. Read-only on
+    the checkouts; per-checkout isolation like the git snapshot (one locked or
+    conflicted WC never stops the rest)."""
+    snap_dir = Path(snap_dir).expanduser()
+    snap_dir.mkdir(parents=True, exist_ok=True)
+    out: dict[str, Any] = {"kind": "svn", "checkouts": []}
+    cos = _discover_svn_checkouts(prof)
+    if not cos:
+        log(f"  {prof.name}: no svn checkouts found under {prof.paths}")
+        return out
+    failures: list[str] = []
+    for c in cos:
+        try:
+            meta = svs.snapshot_wc(c["path"], snap_dir, name=c["name"], rel=c["rel"],
+                                   exclude=prof.exclude)
+        except svs.SvnSyncError as e:
+            benign = "locked" in str(e) or "conflicted" in str(e)
+            out["checkouts"].append({"name": c["name"], "rel": c["rel"],
+                                     ("skipped" if benign else "error"): str(e)})
+            if not benign:
+                failures.append(f"{c['rel']}: {e}")
+            log(f"  {prof.name}: {'SKIP' if benign else 'ERROR'} {c['rel']} — {e}")
+            continue
+        out["checkouts"].append({"name": c["name"], "rel": c["rel"], "revision": meta["revision"],
+                                 "dirty": meta["dirty"], "unversioned": meta["unversioned_count"],
+                                 "bytes": meta["bytes"]})
+        log(f"  {prof.name}: snapshot {c['rel']} r{meta['revision']}"
+            + (" dirty" if meta["dirty"] else "")
+            + (f", {meta['unversioned_count']} unversioned" if meta["unversioned_count"] else "")
+            + f" ({meta['bytes']}B)")
+    if failures:
+        raise HomesyncError(f"{prof.name}: {len(failures)} checkout(s) failed to snapshot: "
+                            + "; ".join(failures[:3]))
+    return out
+
+
+_SVN_STICKY_BENIGN = {"up to date", "no snapshot", "svn server unreachable"}
+
+
+def auto_apply_svn_profile(prof: Profile, snap_dir: str | Path, *,
+                           run_id: str, dry_run: bool, log) -> dict[str, Any]:
+    """Receiver side (apply:auto): apply each staged snapshot whose checkout
+    belongs to this profile, guarded by ``svnsync.apply_decision``; backs the
+    receiver up first. Same sticky/attention semantics as the git auto-apply."""
+    snap_dir = Path(snap_dir).expanduser()
+    home = _home()
+    backup_dir = Path(DEFAULT_GIT_BACKUP_ROOT).expanduser() / f"{run_id}-svnapply"
+    state_dir = state_root()
+    out: dict[str, Any] = {"kind": "svn", "apply": "auto", "status": "ok",
+                           "applied": [], "skipped": [], "errors": [],
+                           "sticky": [], "warnings": []}
+    if not snap_dir.is_dir():
+        return out
+    streaks = StickyStreaks(f"{prof.name}/", run_id=run_id, dry_run=dry_run)
+    for meta in svs.load_metas(snap_dir):
+        rel = meta.get("rel")
+        if not rel or not any(rel == b or rel.startswith(b + "/") for b in prof.paths):
+            continue
+        name = meta.get("name") or Path(rel).name
+        target = home / rel
+        ok, reason = svs.apply_decision(target, meta, state_dir=state_dir)
+        if not ok:
+            out["skipped"].append({"checkout": name, "reason": reason})
+            suffix = "" if reason in _SVN_STICKY_BENIGN else streaks.note(name, reason)[2]
+            log(f"  {prof.name}/{name}: auto-apply skipped ({reason}){suffix}")
+            continue
+        if dry_run:
+            out["applied"].append({"checkout": name, "dry_run": True})
+            log(f"  {prof.name}/{name}: would auto-apply r{meta.get('revision')}"
+                + (" + diff" if meta.get("dirty") else "")
+                + (f" + {meta.get('unversioned_count')} unversioned" if meta.get("unversioned_count") else ""))
+            continue
+        try:
+            res = svs.apply_wc(target, snap_dir, meta, backup_dir=backup_dir, state_dir=state_dir)
+            out["applied"].append({"checkout": name, "revision": res["revision"],
+                                   "created": res["created"], "backup": res.get("backup")})
+            log(f"  {prof.name}/{name}: auto-applied r{res['revision']}"
+                + (" (new checkout)" if res["created"] else "")
+                + (" + diff" if res["patched"] else "")
+                + (f" + {res['unpacked']} unversioned" if res["unpacked"] else ""))
+        except svs.SvnServerUnreachable as e:
+            reason = "svn server unreachable"
+            out["skipped"].append({"checkout": name, "reason": reason})
+            log(f"  {prof.name}/{name}: auto-apply skipped ({reason}: {str(e)[:120]})")
+        except svs.SvnSyncError as e:
+            out["errors"].append(f"{name}: {e}")
+            log(f"  {prof.name}/{name}: auto-apply ERROR {e}")
+    if out["errors"]:
+        out["status"] = "error"
+    elif any(s["reason"] not in _SVN_STICKY_BENIGN for s in out["skipped"]):
+        out["status"] = "attention"
+    streaks.finish()
+    out["sticky"].extend(streaks.sticky)
+    out["warnings"].extend(streaks.warnings)
+    return out
+
+
+def cmd_svn(args) -> int:
+    """`fsync svn snapshot|apply|status|restore` — kind:svn working-copy sync."""
+    def log(msg: str) -> None:
+        print(msg, file=sys.stderr)
+
+    action = getattr(args, "svn_cmd", None)
+    if action not in ("snapshot", "apply", "status", "restore"):
+        print("usage: fsync svn {snapshot|apply|status|restore} [--profile NAME ...] [--all]",
+              file=sys.stderr)
+        return 2
+    try:
+        _peer, profiles, _defaults = load_config(getattr(args, "config", None))
+    except HomesyncError as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 2
+    snap_dir = Path(getattr(args, "snapshot_dir", None) or DEFAULT_SVN_SNAPSHOT_DIR).expanduser()
+    svn_profiles = {n: p for n, p in profiles.items() if p.kind == "svn"}
+
+    if action == "snapshot":
+        if not svn_profiles:
+            print("no kind:svn profiles in config — add one (see docs/issues-and-fixes.md ISSUE-010)",
+                  file=sys.stderr)
+            return 2
+        want = getattr(args, "profile", None)
+        selected = [p for n, p in svn_profiles.items() if not want or n in want]
+        if want and len(selected) != len(set(want)):
+            print(f"unknown svn profile(s): {sorted(set(want) - set(svn_profiles))}", file=sys.stderr)
+            return 2
+        total = 0
+        rc = 0
+        for prof in selected:
+            try:
+                total += len(snapshot_svn_profile(prof, snap_dir, log)["checkouts"])
+            except HomesyncError as e:
+                print(f"error: {e}", file=sys.stderr)
+                rc = 1
+        print(f"snapshot: {total} checkout(s) -> {snap_dir}")
+        return rc
+
+    metas = svs.load_metas(snap_dir, only=getattr(args, "checkout", None))
+    if not metas:
+        print(f"no svn snapshots in {snap_dir} — run `fsync svn snapshot` on the source box "
+              f"(and let the file-sync carry {snap_dir.name}/) first", file=sys.stderr)
+        return 2
+    home = _home()
+    state_dir = state_root()
+    backup_root = Path(getattr(args, "backup_root", None) or DEFAULT_GIT_BACKUP_ROOT).expanduser()
+
+    if action == "status":
+        for meta in metas:
+            rel = meta.get("rel") or meta["name"]
+            prev = svs.preview_apply(home / rel, meta, state_dir=state_dir)
+            flag = ("receiver-ahead (STALE incoming)" if prev["receiver_ahead"]
+                    else "CHANGE" if prev["would_change"] else f"skip: {prev['reason']}")
+            print(f"{meta['name']}: {rel} [{flag}] incoming r{meta.get('revision')}"
+                  f"{' dirty' if meta.get('dirty') else ''}"
+                  + (f" +{meta.get('unversioned_count')} unversioned" if meta.get("unversioned_count") else "")
+                  + (f" (receiver r{prev['receiver_revision']})" if prev["exists"] else "  (new: absent locally)"))
+        return 0
+
+    if action == "restore":
+        only = getattr(args, "checkout", None)
+        from_dir = getattr(args, "from_dir", None)
+        rc = 0
+        for meta in metas:
+            nm = meta["name"]
+            if only and nm != only:
+                continue
+            run = (Path(from_dir).expanduser() if from_dir
+                   else _latest_backup_run(backup_root, nm, suffix="-svnapply"))
+            if not run or not (run / f"{nm}.pre-apply.meta.json").exists():
+                print(f"{nm}: no pre-apply backup found", file=sys.stderr)
+                rc = 1
+                continue
+            try:
+                res = svs.restore_backup(home / (meta.get("rel") or nm), run, nm)
+            except svs.SvnSyncError as e:
+                print(f"{nm}: ERROR {e}", file=sys.stderr)
+                rc = 1
+                continue
+            print(f"{nm}: restored -> r{res['revision']} (from {run.name}, "
+                  f"{res['restored_unversioned']} unversioned file(s) put back)")
+        return rc
+
+    # apply
+    run_id = time.strftime("%Y%m%d-%H%M%S") + "-manual"
+    backup_dir = backup_root / f"{run_id}-svnapply"
+    rc = 0
+    for meta in metas:
+        nm = meta["name"]
+        target = home / (meta.get("rel") or nm)
+        ok, reason = svs.apply_decision(target, meta, state_dir=state_dir)
+        forced = (not ok and getattr(args, "force", False)
+                  and reason == "receiver has local changes")
+        if not ok and not forced:
+            print(f"{nm}: skipped ({reason})")
+            continue
+        try:
+            if forced:
+                saved = svs.force_clean(target, backup_dir, nm)
+                print(f"{nm}: receiver's local changes saved to {saved} and reverted (--force)")
+            res = svs.apply_wc(target, snap_dir, meta, backup_dir=backup_dir, state_dir=state_dir)
+        except svs.SvnSyncError as e:
+            print(f"{nm}: ERROR {e}", file=sys.stderr)
+            rc = 1
+            continue
+        print(f"{nm}: applied r{res['revision']}" + (" (new checkout)" if res["created"] else "")
+              + (" + diff" if res["patched"] else "")
+              + (f" + {res['unpacked']} unversioned" if res["unpacked"] else "")
+              + (f"  [backup {backup_dir}]" if res.get("backup") else ""))
+    keep = getattr(args, "keep", 10)
+    if keep:
+        svs.prune_backup_runs(backup_root, keep=keep)
+    return rc
 
 
 def snapshot_git_profile(prof: Profile, bundle_dir: str | Path, log) -> dict[str, Any]:
@@ -1395,13 +1882,13 @@ def _load_bundle_metas(bundle_dir: Path, only: str | None = None) -> list[dict]:
     return metas
 
 
-def _latest_backup_run(backup_root: Path, name: str) -> Path | None:
-    """Newest ``*-git`` backup-run dir that contains a pre-apply backup for
+def _latest_backup_run(backup_root: Path, name: str, suffix: str = "-git") -> Path | None:
+    """Newest ``*<suffix>`` backup-run dir that contains a pre-apply backup for
     ``name`` (timestamp-prefixed names sort chronologically)."""
     if not backup_root.exists():
         return None
     for d in sorted((d for d in backup_root.iterdir()
-                     if d.is_dir() and d.name.endswith("-git")), reverse=True):
+                     if d.is_dir() and d.name.endswith(suffix)), reverse=True):
         if (d / f"{name}.pre-apply.meta.json").exists():
             return d
     return None
@@ -2136,13 +2623,32 @@ def _cmd_run(args) -> int:
                         f"bundles arrive via file-sync, apply with `fsync git apply`")
                     report["profiles"][prof.name] = {"kind": "git", "snapshotted": False,
                                                      "reason": "pull-only receiver"}
+            elif prof.kind == "svn":
+                if svn_profile_snapshots(prof):
+                    report["profiles"][prof.name] = snapshot_svn_profile(
+                        prof, DEFAULT_SVN_SNAPSHOT_DIR, log)
+                elif auto_apply_svn_checkouts(prof):
+                    auto_apply_later.append(prof)
+                    report["profiles"][prof.name] = {"kind": "svn", "apply": "auto",
+                                                     "pending": True}
+                    log(f"  {prof.name}: pull-only receiver, apply:auto — "
+                        f"auto-apply after snapshot sync")
+                else:
+                    log(f"  {prof.name}: pull-only (receiver) — not snapshotting; "
+                        f"snapshots arrive via file-sync, apply with `fsync svn apply`")
+                    report["profiles"][prof.name] = {"kind": "svn", "snapshotted": False,
+                                                     "reason": "pull-only receiver"}
             else:
-                report["profiles"][prof.name] = run_profile(
+                res = run_profile(
                     peer, prof, run_dir=run_dir, run_id=run_id,
                     dry_run=args.dry_run, workers=args.workers, log=log, progress=progress,
                 )
+                report["profiles"][prof.name] = res
+                # ISSUE-010: a file profile's warnings (stale svn sender, resurrections,
+                # a dead parity probe) reach the desktop like auto-apply's do.
+                report["warnings"].extend(res.get("warnings") or [])
             progress.profile_done(prof.name)
-        except (HomesyncError, grs.GitSyncError) as e:
+        except (HomesyncError, grs.GitSyncError, svs.SvnSyncError) as e:
             report["profiles"].setdefault(prof.name, {})["status"] = "error"
             report["errors"].append(f"{prof.name}: {e}")
             progress.error(f"{prof.name}: {e}")
@@ -2166,8 +2672,12 @@ def _cmd_run(args) -> int:
     # arrived via the git-bundles file profile this cycle.
     for prof in auto_apply_later:
         try:
-            res = auto_apply_git_profile(prof, DEFAULT_GIT_BUNDLE_DIR,
-                                         run_id=run_id, dry_run=args.dry_run, log=log)
+            if prof.kind == "svn":
+                res = auto_apply_svn_profile(prof, DEFAULT_SVN_SNAPSHOT_DIR,
+                                             run_id=run_id, dry_run=args.dry_run, log=log)
+            else:
+                res = auto_apply_git_profile(prof, DEFAULT_GIT_BUNDLE_DIR,
+                                             run_id=run_id, dry_run=args.dry_run, log=log)
             report["profiles"][prof.name] = res
             log(f"  {prof.name}: auto-apply — {len(res['applied'])} applied, "
                 f"{len(res['skipped'])} skipped, {len(res['errors'])} error(s)"
@@ -2177,14 +2687,14 @@ def _cmd_run(args) -> int:
             if res["errors"]:
                 report["errors"].extend(f"{prof.name}: {e}" for e in res["errors"])
                 rc = 1
-        except (HomesyncError, grs.GitSyncError) as e:
-            report["profiles"][prof.name] = {"kind": "git", "apply": "auto", "status": "error"}
+        except (HomesyncError, grs.GitSyncError, svs.SvnSyncError) as e:
+            report["profiles"][prof.name] = {"kind": prof.kind, "apply": "auto", "status": "error"}
             report["errors"].append(f"{prof.name}: auto-apply: {e}")
             log(f"  {prof.name}: auto-apply ERROR {e}")
             rc = 1
         except Exception as e:  # noqa: BLE001 — ISSUE-009, as above
             msg = f"{prof.name}: auto-apply: unexpected {type(e).__name__}: {e}"
-            report["profiles"][prof.name] = {"kind": "git", "apply": "auto", "status": "error"}
+            report["profiles"][prof.name] = {"kind": prof.kind, "apply": "auto", "status": "error"}
             report["errors"].append(msg)
             log(f"  {prof.name}: ERROR {msg}")
             log(traceback.format_exc().rstrip())

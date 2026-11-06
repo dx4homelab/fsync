@@ -768,6 +768,35 @@ def build_parser() -> argparse.ArgumentParser:
             gp.add_argument("--from", dest="from_dir",
                             help="Restore from this specific backup-run dir (default: newest containing the repo)")
 
+    # svn (ISSUE-010): kind:svn working-copy sync, the git subcommand's mirror
+    p_svn = sub.add_parser("svn", help="SVN working-copy sync: snapshot/apply revision + diff + unversioned files (kind: svn)")
+    svn_sub = p_svn.add_subparsers(dest="svn_cmd")
+    for _name, _help in (("snapshot", "Producer: capture kind:svn profiles' checkouts into snapshots"),
+                         ("apply", "Receiver: svn update -r + patch + unversioned files (backs the receiver up first)"),
+                         ("status", "Preview: what an apply would change (no mutation)"),
+                         ("restore", "Receiver: undo an apply from its pre-apply backup")):
+        sp = svn_sub.add_parser(_name, help=_help)
+        sp.add_argument("--config", help="Profiles YAML (default: ~/.config/fsync/sync-profiles.yaml)")
+        sp.add_argument("--snapshot-dir", help="Snapshot staging dir (default: ~/.fsync/svn-snapshots)")
+        sp.add_argument("--verbose", action="count", default=0, help="Increase verbosity")
+        if _name == "snapshot":
+            sp.add_argument("--profile", action="append", default=None,
+                            help="Limit to svn profile NAME (repeatable); default: all svn profiles")
+            sp.add_argument("--all", action="store_true", help="Snapshot every svn profile (default)")
+        else:
+            sp.add_argument("--checkout", help="Limit to a single checkout by snapshot NAME")
+        if _name == "apply":
+            sp.add_argument("--force", action="store_true",
+                            help="Apply even when the receiver has local changes: its diff is saved "
+                                 "to the pre-apply backup, then reverted (restore puts it back by hand)")
+            sp.add_argument("--keep", type=int, default=10,
+                            help="Keep only the newest N pre-apply backup runs (default 10; 0 = keep all)")
+        if _name in ("apply", "restore"):
+            sp.add_argument("--backup-root", help="Where pre-apply receiver backups live (default: ~/.fsync/backups)")
+        if _name == "restore":
+            sp.add_argument("--from", dest="from_dir",
+                            help="Restore from this specific backup-run dir (default: newest containing the checkout)")
+
     # meta: meta-synchronization — fsync version/capabilities + config compatibility
     p_meta = sub.add_parser("meta", help="Meta-sync: fsync version/capabilities + config compatibility across boxes")
     meta_sub = p_meta.add_subparsers(dest="meta_cmd")
@@ -898,6 +927,10 @@ def main(argv: list[str] | None = None) -> int:
         from .homesync import cmd_sync
 
         return cmd_sync(args)
+    if args.cmd == "svn":
+        from .homesync import cmd_svn
+
+        return cmd_svn(args)
     if args.cmd == "git":
         from .homesync import cmd_git
 

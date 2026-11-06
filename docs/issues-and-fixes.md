@@ -287,7 +287,9 @@ indistinguishable from having nothing to send.
 
 ## ISSUE-004 — SVN working copies are file-synced although `.git` is excluded; fsync has no SVN awareness
 
-- **Status:** OPEN — worked around by hand 2026-07-28; product change proposed.
+- **Status:** **FIXED in 0.7.0** (2026-11-06, via ISSUE-010): **A** `.svn` excluded; **B** shipped as
+  `kind: svn` (`fsync/svnsync.py`, `apply: on-demand`); **C** shipped as a *blocking* guard (stale sender
+  → subtree skipped, sender ahead → advisory) plus per-checkout parity in the plan preview.
 - **Where seen:** `workspaces/primary/asap` (`trunk`, `branches/*`, `asap_e2e`,
   `modsec-container-trunk`, `owasp-coraza-proxy` — 5 SVN working copies, one of them dual-tracked
   with git).
@@ -336,7 +338,9 @@ for versioned content. fsync should carry only what SCM does not: untracked and 
 
 ## ISSUE-005 — Generated build artifacts are ~99% of the diff, hiding the 1% that matters
 
-- **Status:** OPEN — config change proposed, not yet applied.
+- **Status:** **PARTIALLY FIXED** (2026-11-06, via ISSUE-010 fix 4): `.gradle`, `*.class` and the afsas
+  build-output subtrees (`bin/`, `external-libs-builders/*/{bin,build}/`, `test/playwright/build/`) are
+  excluded in `primary`. The full **A** list, **B** presets and **C** artifact-share hint remain open.
 - **Where seen:** `workspaces/primary/asap` (Flutter + Gradle/Eclipse Java), 2026-07-28.
 
 ### Symptom
@@ -659,3 +663,119 @@ new, or not-busy + clean + same-branch; else skip + report. Config surface = per
 `tests/test_issue001_autoapply.py`. **Remaining = the config flip:** set `apply: auto` on the `repos`
 profile once validated with a `--dry-run`; this is a live behavioural change (fury's repos start
 auto-applying) so do it deliberately, not by default.
+
+---
+
+## ISSUE-010 — A stale sender working copy resurrects svn-deleted files on the receiver (ISSUE-004 recurrence, 2026-11-06)
+
+- **Status:** **FIXED in 0.7.0** (2026-11-06) — all six items below shipped; fix 5 (`kind: svn`) is
+  deployed `apply: on-demand` (producer snapshots, receiver applies by hand) until trusted.
+  Incident remediated by hand the same day.
+- **Where seen:** `workspaces/primary/afsas/trunk` (AFSAS trunk SVN working copy), profile `primary`,
+  minis4dx → fury4dx push (the sanctioned one-way direction).
+
+### Symptom
+- fury's trunk working copy was cleaned on 2026-11-06 12:41: 734 "ghost" files (present on disk, deleted
+  from svn between r30000 and r40289) removed with a classified list, plus 50 never-versioned leftovers.
+- At 12:47:30 minis4dx ran `primary` (push, run `20261106-124730-9dbc`, **7,012 files a→b**). At 12:48:54
+  fury had 66 of the 734 ghosts back (birth time 12:48:54, mtimes preserved: rsync), plus `etc/docs`
+  (deleted from trunk in r40267) and the build outputs.
+- Cause of the content: minis4dx's trunk working copy sits at **r40260** (wc.db last touched 2026-10-30),
+  fury's at **r40297**. On minis those 66 files are *versioned and clean*; svn deleted them after r40260.
+  The file engine cannot tell "versioned on a stale checkout" from "a file worth carrying", so every push
+  re-creates on the receiver what the receiver's svn already removed. Reverse of the 2026-07-12 incident
+  that motivated the one-way direction ("stale fury copies resurrecting files"): direction does not fix
+  it, staleness does it in either direction.
+- Near miss: `.svn/wc.db` is file-synced too (ISSUE-004 fix A never applied). fury's wc.db (12:52, five
+  commits that day) was newer than minis' (10-30), so newest-wins left it alone. Had minis run
+  `svn update` first, its newer wc.db would have been pasted over fury's working copy of a different
+  revision and local state.
+
+### Resolution (the incident)
+Hand-made: `svn update` on minis4dx (brings its checkout to HEAD, which deletes the 66 files there), then the
+cleanup helpers on fury again (`afsas/svn-helper/cleanup-trunk-ghosts.sh --apply`,
+`discard-trunk-unversioned.sh --apply`). Until the fixes below land, the rule is: **svn update every
+working copy on the sending box before a `primary` run**.
+
+### Fix — task list (refines ISSUE-004 A/B/C; ordered by value per line of code)
+1. **Exclude `.svn` from every file profile** (ISSUE-004 A). One line in `sync-profiles.yaml`, deploy
+   with `fsync deploy push`. Removes the wc.db pasting hazard for good.
+2. **Stale-sender guard for SVN trees.** In the plan step, for each `.svn` root inside a file profile
+   path, read `svn info --show-item revision` on both sides (the peer over the existing ssh channel).
+   If the sender is behind the receiver, skip that subtree with a sticky skip reason, exactly like
+   `kind:git`'s "receiver has local changes":
+   `afsas/trunk: sender r40260 < receiver r40297 — run svn update on minis4dx, not file-synced`.
+   Report it under `status: attention` and in `--notify`. This alone would have prevented today's run
+   from touching trunk. (ISSUE-004 C, made blocking instead of advisory.)
+3. **Resurrection detection in the report.** fsync already indexes both sides per run. Keep the receiver's
+   previous index; a file the receiver lacked at plan time but had in the previous run's index was
+   deleted by the receiver since. Count and list those under a new `resurrected` field, promote to
+   `attention`, and name the undo (`backup_root` holds nothing for creates, so list the paths).
+   Covers git and plain folders too (ISSUE-007's other half).
+4. **Per-subtree excludes for build output** (ISSUE-005): `**/bin/` and `**/.gradle/` under
+   `etc/external-libs-builders`, `test/playwright/build`, `*.class`, `bin/` at a WC root. They were
+   33 of today's 734 and are regenerated by every build.
+5. **`kind: svn` profile** (ISSUE-004 B): snapshot = URL + revision + `svn status` + `svn diff` +
+   unversioned files list; apply = `svn update -r <rev>` then re-apply the patch and the unversioned
+   files, with the "receiver has local changes" guard. Committed history travels through the server,
+   which both boxes reach over the Staging VPN. Largest item; 1–4 make it less urgent.
+6. **Operator view:** `fsync tui`/`gtk` show per-checkout revision parity (sender r, receiver r, HEAD r)
+   next to the profile row, so a stale checkout is visible before pressing run.
+
+### Implementation (0.7.0, 2026-11-06)
+1. **`.svn` excluded** in `homelab` + `primary` (config) and in the starter config.
+2. **Stale-sender guard** — `fsync/svnsync.py` (`SVN_PROBE`, `stale_sender_guard`) wired into
+   `homesync.run_profile` / `build_run_preview` as `svn_guard_for_path`. Before indexing a file-profile
+   path, both boxes are probed for `.svn` roots (depth ≤ 6; one ssh round trip, ~1 s for 30 checkouts) and
+   each checkout present on both sides is compared: **sender behind receiver → the subtree is excluded**
+   (`<rel>/*`), **URL differs → excluded**, sender ahead → advisory line (ISSUE-004 C). Under
+   `direction: both` any mismatch excludes. The skip is a sticky streak (`<state>/auto-apply-sticky.json`,
+   key `primary/svn:<path>/<rel>`, shared `StickyStreaks` with the git auto-apply), the profile reports
+   `status: attention`, and the **first** detection is notified (`--notify`), then at the ISSUE-006
+   escalation points. A peer probe that fails is a reported warning ("guard inactive"), never a silent
+   stand-down; a box with no local checkouts under the path skips the peer round trip. Report:
+   `paths[rel].svn_guard = {checked, skipped[], advisory[], parity[], probe_warning}`.
+   Live check 2026-11-06 (minis → fury): 26 checkouts compared, 1 skipped
+   (`asap/owasp-coraza-proxy: sender r2754 < receiver r2830`), 6 fury-only, 0 advisory.
+3. **Resurrection detection** — `detect_resurrections`: each run saves both sides' indexed path sets
+   (`<state>/prev-index/<profile>/<path>.{local,peer}.json.gz`); a path the receiver lacks now, had last
+   run, and would be *created* (not overwritten) this run is a resurrection. Reported per path under
+   `resurrected = {on_peer, on_local, count, truncated, list, baseline}`, full list in
+   `<run>/<profile>/<path>.resurrected.lst` (`peer\t<path>` / `local\t<path>` — the undo, since
+   `backup_root` holds nothing for creates), `status: attention` + a warning (notified). Detection only;
+   the first run after deploy has no baseline and reports nothing. Covers git worktrees and plain
+   folders too (ISSUE-007's other half).
+4. **Per-subtree excludes** in `primary`: `.gradle`, `*.class`,
+   `afsas/*/etc/external-libs-builders/*/{bin,build}/*`, `afsas/*/test/playwright/build/*`, `afsas/*/bin/*`
+   (fnmatch: a pattern with `/` matches the whole path, `*` spans `/`). ISSUE-005 A for the afsas trees.
+5. **`kind: svn`** — `svnsync.snapshot_wc` / `apply_wc` / `apply_decision` / `restore_backup`;
+   `homesync.snapshot_svn_profile` / `auto_apply_svn_profile`; CLI `fsync svn snapshot|apply|status|restore`.
+   Snapshot (producer, read-only): `<name>.svn.meta.json` (URL, repo root, revision, dirty, modified[],
+   unversioned[], `snapshot_id`) + `<name>.svn.diff` + `<name>.svn.unversioned.tar.gz` (plain `svn status`
+   `?` entries → svn:ignored build output never travels; profile `exclude` prunes by name; files > 64 MB
+   listed, not carried; the tar is reused while the name/size/mtime fingerprint is unchanged). Staged in
+   `~/.fsync/svn-snapshots`, carried by the `svn-snapshots` file profile. Apply (receiver): fresh
+   `svn checkout -r REV` when absent; else guard — locked → skip, URL differs → skip, modified/conflicted →
+   "receiver has local changes", receiver revision > snapshot → "receiver is ahead … stale snapshot",
+   same `snapshot_id` already applied → "up to date" — then pre-apply backup (receiver revision + its own
+   unversioned files the tar would overwrite), `svn update -r REV --accept postpone`, `svn patch`,
+   unpack. Server unreachable (VPN down) is a benign skip. `apply: auto` mirrors git fix C (file profiles
+   skip the checkouts, guarded auto-apply after the carrier profile ran, sticky skips); shipped as
+   `apply: on-demand`. `requires: [git-sync, svn-sync]` gates the config on the new build.
+6. **Operator view** — the plan preview carries `profiles[p].svn[]` parity rows (`rel, local_rev,
+   peer_rev, head_rev, state ∈ ok|skip|advisory|unknown|only-local|only-peer, reason`); server HEAD is
+   looked up once per repository root (8 s cap) in the preview only, never in the scheduled run.
+   `views.plan_screen` (TUI, web, GTK) lists every checkout NOT in parity under its profile row with
+   `local rN  peer rN  HEAD rN`, one summary line for the healthy ones, and a warning note naming the
+   skips. Progress phase `svn-parity` precedes `indexing`.
+
+Tests: `tests/test_issue010_svn_stale_sender.py` (22; the `kind: svn` ones run against a `file://`
+repository and skip without `svn`/`svnadmin`). Suite: 245 passed.
+
+### Evidence
+- fury: `~/.local/state/fsync/runs/20261106-122908-a802/report.json` (`primary` pull, b→a 0 files,
+  141,252 stranded-only-on-side: the noise of ISSUE-005), ghost list
+  `workspaces/primary/afsas/svn-helper/trunk-ghost-files.txt` (734 paths classified against ten trunk
+  revisions).
+- minis4dx: `~/.local/state/fsync/runs/20261106-124730-9dbc/report.json` (`primary` push, a→b 7,012).
+- `stat -c %w` on the resurrected files: 2026-11-06 12:48:54 ±4 s.
