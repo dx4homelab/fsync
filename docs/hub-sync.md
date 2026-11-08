@@ -418,6 +418,16 @@ escalation for repeated skips is kept (it is the receiver-ahead signal a human m
 from `fsync deploy daemon` (wheelhouse), so a code change still needs that step. files4dx has git
 2.55 and no svn (the svn store is plain files; `svn` runs only on the spokes).
 
+### Direction flip — 2026-11-08 evening
+
+`homelab` and `primary` are `direction: both` on every box (tombstones make it safe); `svn` is
+`apply: auto`, so file profiles skip the svn working copies on each box (25 on minis, 27 on fury) and
+checkouts travel only through the guarded `kind: svn` path. `repos`/`svn` keep the host default
+direction (minis producer → laptops): a checkout or repo that exists **only on a laptop** (e.g.
+fury's `afsas/afsas-tomcat-11-migration`) therefore does not reach the other boxes yet — flipping
+the kinds to `both` needs the auto-apply gate to accept "snapshot and apply others' newest" on one
+box, which is the next step if wanted. Open question 1 is thereby answered "newest wins at the hub".
+
 ### Cutover — EXECUTED 2026-11-08 (hub = files4dx, three spokes live)
 
 Operator steps (refused to the automation, done by hand): firewalld `7446/tcp` on files4dx,
