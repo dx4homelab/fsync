@@ -507,3 +507,16 @@ shared: {{profiles: {{docs: {{paths: [Documents]}}}}}}
     stt = c.get("/v1/hub/status").json()["profiles"]["docs"]
     assert stt["seq"] == seq and stt["live"] == 1 and stt["tombstones"] == 1
     assert stt["cursors"]["fury4dx"]["last_seq"] == seq
+
+
+@pytestmark_rsync
+def test_symlink_pull_verifies_by_presence(tmp_path, monkeypatch):
+    """A symlink's target stats differ per box; pulling one must not be reported
+    as a failed pull run after run (fury 2026-11-08: .../var/lib/dbus/machine-id)."""
+    f = Fleet(tmp_path, monkeypatch)
+    os.symlink("/etc/hostname", f.doc("A", "link"))
+    f.doc("A", "plain.txt").write_text("p")
+    f.run("A")
+    d = _docs(f.run("B"))
+    assert f.doc("B", "link").is_symlink() and d["pull_failed"] == [] and d["unconverged"] == 0
+    assert _docs(f.run("B"))["b_to_a"]["files_planned"] == 0

@@ -3107,9 +3107,15 @@ def _run_path_full(control, peer: Peer, prof: Profile, rel: str, key: str, n_wor
         for relp in plan.pull:
             h = live.get(relp)
             try:
-                st = (local_root / relp).stat()
-                ok = h is not None and st.st_size == (h[0] if h[0] is not None else st.st_size) \
-                    and abs(st.st_mtime - float(h[1] or st.st_mtime)) <= tw.MTIME_TOLERANCE
+                lp = local_root / relp
+                if lp.is_symlink():
+                    # rsync -a carries a link as a link; its target's stats are
+                    # per box, so size/mtime cannot be compared — presence is enough
+                    ok = True
+                else:
+                    st = lp.stat()
+                    ok = h is not None and st.st_size == (h[0] if h[0] is not None else st.st_size) \
+                        and abs(st.st_mtime - float(h[1] or st.st_mtime)) <= tw.MTIME_TOLERANCE
             except OSError:
                 ok = False
             (pulled_ok if ok else pulled_failed).add(relp)
