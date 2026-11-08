@@ -398,6 +398,24 @@ Design notes beyond the draft:
   spoke would re-push the world as "introductions". The spoke refuses with a clear error.
 - `kind: git` / `kind: svn` carriers are untouched (P7.3). `fsync sync folder` still refuses hubs.
 
+### P7.3 — shipped in fsync 0.10.0 (2026-11-08), feature flag `hub-stores`
+
+| Piece | What landed |
+|---|---|
+| `git_repo_sync.py` | `snapshot_repo_to_hub`: capture as before, then `git push --force` branches, tags and the WIP ref into the hub's bare repo under `refs/fsync/<host>/…` (the producer's own namespace, pruned of branches it dropped); `_fetch_incoming` / `apply_repo` take a hub URL + namespace instead of a bundle file; all guards (busy, dirty, branch divergence, receiver-ahead pre- and post-fetch, R15 backup) unchanged; `GIT_SSH_COMMAND` carries the fsync ssh policy |
+| `hubstate.py` / routes | `kind_snapshots (kind, profile, rel, host) → meta, ts` registry; `POST /v1/hub/kind/{git\|svn}/snapshot`, `GET …/snapshots`; status lists per-store hosts and ages; `GET /v1/hub/artifact[/pyz\|/config]` |
+| `homesync.py` | snapshot/auto-apply/CLI for both kinds go through the hub when the config has one: a receiver applies the **newest snapshot another box registered** (never its own); svn snapshot files rsync to `<hub>/svn/<rel>/<host>/` and are mirrored into a local staging dir for the unchanged `svnsync.apply_wc`; `fsync deploy push` publishes the pyz + config + manifest to `<hub>/artifact/` |
+| `hub.py` | `hub_git_url`, `ensure_hub_bare`, `hub_svn_path`, `publish_artifact`, `install_artifact` (backup-first, sha256-verified, `meta version` check, rollback), `fsync self-update [--check\|--force]` |
+| `tests/test_hub_p73.py` | 5 tests incl. the acceptance scenario: producer → hub → receiver (HEAD, branch, dirty file, untracked file intact); receiver commits ahead, producer re-snapshots its old state → receiver **skips as ahead, untouched** (the stomp is a no-op); producer catches up → "up to date"; new producer commit flows; `fsync git status/apply` through the hub; registry newest-wins per repo; artifact publish/route/install |
+
+Notes: the `git-bundles` and `svn-snapshots` **carrier profiles are retired** — nothing is written to
+`~/.fsync/git-bundles` any more (the dir is removed on every box); `~/.fsync/svn-snapshots` stays as
+the producer's local staging dir and the receiver's `hub/<host>/<name>/` mirror. The sticky-streak
+escalation for repeated skips is kept (it is the receiver-ahead signal a human must act on).
+`fsync self-update` updates the pyz + config of a spoke from the hub; the fsyncd venv still comes
+from `fsync deploy daemon` (wheelhouse), so a code change still needs that step. files4dx has git
+2.55 and no svn (the svn store is plain files; `svn` runs only on the spokes).
+
 ### Cutover — EXECUTED 2026-11-08 (hub = files4dx, three spokes live)
 
 Operator steps (refused to the automation, done by hand): firewalld `7446/tcp` on files4dx,

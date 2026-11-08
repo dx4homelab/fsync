@@ -815,7 +815,8 @@ def build_parser() -> argparse.ArgumentParser:
     p_db = deploy_sub.add_parser("build", help="Build the core fsync .pyz locally")
     p_db.add_argument("--out", help="Output path (default: ~/.fsync/deploy/fsync.pyz)")
     p_db.add_argument("--verbose", action="count", default=0)
-    p_dp = deploy_sub.add_parser("push", help="Build + push the pyz + config to remote host(s)")
+    p_dp = deploy_sub.add_parser("push", help="Build + push the pyz + config to remote host(s); with a hub config also publish them on the hub for `fsync self-update`")
+    p_dp.add_argument("--no-publish", action="store_true", help="Do not publish the artifact on the hub")
     p_dp.add_argument("--config", help="Multi-host config YAML (default: ~/.config/fsync/sync-profiles.yaml)")
     p_dp.add_argument("--host", help="Limit to a single remote host key")
     p_dp.add_argument("--out", help="Built pyz path (default: ~/.fsync/deploy/fsync.pyz)")
@@ -908,6 +909,11 @@ def build_parser() -> argparse.ArgumentParser:
     p_hub_holds.add_argument("--json", action="store_true")
     p_hub_holds.add_argument("--config", help="Profiles YAML (default: ~/.config/fsync/sync-profiles.yaml)")
 
+    p_su = sub.add_parser("self-update", help="(spoke) Install the pyz + config the hub publishes when newer than this box's (docs/hub-sync.md P7.3)")
+    p_su.add_argument("--check", action="store_true", help="Report only, install nothing")
+    p_su.add_argument("--force", action="store_true", help="Install even when versions match")
+    p_su.add_argument("--config", help="Profiles YAML (default: ~/.config/fsync/sync-profiles.yaml)")
+
     p_dmn = sub.add_parser("daemon", help="fsyncd backend: REST API over TLS/mTLS, absorbs run scheduling")
     p_dmn.add_argument("action", choices=("run", "install", "remove", "status", "trust", "cert"),
                        help="run: serve in foreground; install: systemd user service (retires the timer); "
@@ -993,6 +999,10 @@ def main(argv: list[str] | None = None) -> int:
         from .hub import cmd_hub
 
         return cmd_hub(args)
+    if args.cmd == "self-update":
+        from .hub import cmd_self_update
+
+        return cmd_self_update(args)
     if args.cmd == "daemon":
         if getattr(args, "action", None) in ("cert", "trust"):
             # stdlib path: works from the deployed .pyz (no fastapi there)

@@ -28,6 +28,7 @@ import socket
 import subprocess
 import tarfile
 import tempfile
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -73,7 +74,12 @@ def _git(repo: str | Path, *args: str, index_file: str | None = None,
          timeout: int = 300) -> subprocess.CompletedProcess:
     env = {**os.environ, **_SNAP_ENV,
            # Never let the user's global/system config change plumbing behaviour.
-           "GIT_CONFIG_SYSTEM": os.environ.get("GIT_CONFIG_SYSTEM", "/dev/null")}
+           "GIT_CONFIG_SYSTEM": os.environ.get("GIT_CONFIG_SYSTEM", "/dev/null"),
+           # P7.3: pushes/fetches against the hub's bare repos go over ssh with the
+           # same policy as the rsync legs (never prompt, pin new hub keys once)
+           "GIT_SSH_COMMAND": os.environ.get(
+               "GIT_SSH_COMMAND",
+               "ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new -o ConnectTimeout=10")}
     if index_file is not None:
         env["GIT_INDEX_FILE"] = index_file
     proc = subprocess.run(
@@ -287,6 +293,48 @@ def snapshot_repo(repo: str | Path, bundle_dir: str | Path, *,
 # apply (receiver) — always-backup then reconstruct                          #
 # --------------------------------------------------------------------------- #
 
+def hub_namespace(host: str) -> str:
+    """Where a producer's snapshot lives in the hub's bare repo (R39)."""
+    return f"refs/fsync/{host}"
+
+
+def snapshot_repo_to_hub(repo: str | Path, url: str, host: str, *, name: str | None = None,
+                         rel: str | None = None) -> dict[str, Any]:
+    """P7.3: capture ``repo`` and push its branches, tags and WIP ref into the
+    hub's bare repository at ``url`` under ``refs/fsync/<host>/…`` (forced: the
+    namespace is this producer's alone, so it always reflects the latest
+    snapshot — a receiver can never pick up a stale one). Returns the meta the
+    hub stores for receivers; no bundle file is written anywhere."""
+    repo = Path(repo)
+    name = name or repo.name
+    busy = repo_busy(repo)
+    if busy:
+        raise GitSyncError(f"{repo}: {busy} — not snapshotting (repo not quiescent)")
+    state = capture_state(repo)
+    ns = hub_namespace(host)
+    _git(repo, "push", "--force", "--quiet", url,
+         f"refs/heads/*:{ns}/heads/*", f"refs/tags/*:{ns}/tags/*", f"{WIP_REF}:{ns}/wip",
+         timeout=900)
+    # prune namespace refs for branches/tags the producer no longer has (the
+    # push above only adds/moves; a deleted branch would otherwise linger)
+    try:
+        remote = {ln.split("\t", 1)[1] for ln in
+                  _out(repo, "ls-remote", url, f"{ns}/heads/*", f"{ns}/tags/*").splitlines() if "\t" in ln}
+        local = {f"{ns}/heads/{b}" for b in _out(repo, "for-each-ref", "--format=%(refname:short)",
+                                                   "refs/heads/").splitlines() if b}
+        local |= {f"{ns}/tags/{t}" for t in _out(repo, "for-each-ref", "--format=%(refname:short)",
+                                                   "refs/tags/").splitlines() if t}
+        stale = sorted(remote - local)
+        if stale:
+            _git(repo, "push", "--quiet", url, *[f":{r}" for r in stale], timeout=300)
+    except GitSyncError:
+        pass  # pruning is tidiness, never a snapshot failure
+    meta = state.to_meta()
+    meta.update(name=name, rel=rel, bundle=None, bytes=0, host=host, store="hub",
+                namespace=ns, ts=time.time())
+    return meta
+
+
 def read_meta(bundle_dir: str | Path, name: str) -> dict[str, Any]:
     mp = Path(bundle_dir) / f"{name}.meta.json"
     if not mp.exists():
@@ -358,19 +406,23 @@ def _prune_incoming(repo: str | Path) -> int:
     return n
 
 
-def _fetch_incoming(repo: str | Path, bundle_path: str | Path) -> None:
-    """Fetch a bundle's branches, tags and WIP ref into ``INCOMING`` — never
-    touching local refs. Prunes the namespace first and uses forced ('+')
+def _fetch_incoming(repo: str | Path, source: str | Path, namespace: str | None = None) -> None:
+    """Fetch a snapshot's branches, tags and WIP ref into ``INCOMING`` — never
+    touching local refs. ``source`` is a bundle file (refs under refs/heads,
+    refs/tags, refs/fsync/wip) or a hub repository URL whose producer refs live
+    under ``namespace`` (P7.3). Prunes the namespace first and uses forced ('+')
     refspecs (ISSUE-008): a leftover ``incoming/wip`` from an earlier refused
     apply is not an ancestor of the next snapshot's WIP commit, and with an
     unforced refspec git rejects that one ref as non-fast-forward and fails the
     whole fetch — so every later run reported ``git fetch … failed`` instead of
     the real refusal."""
     _prune_incoming(repo)
-    _git(repo, "fetch", str(bundle_path),
-         f"+refs/heads/*:{INCOMING}/heads/*",
-         f"+refs/tags/*:{INCOMING}/tags/*",
-         f"+{WIP_REF}:{INCOMING}/wip")
+    heads, tags, wip = ("refs/heads/*", "refs/tags/*", WIP_REF) if not namespace else \
+        (f"{namespace}/heads/*", f"{namespace}/tags/*", f"{namespace}/wip")
+    _git(repo, "fetch", "--quiet", str(source),
+         f"+{heads}:{INCOMING}/heads/*",
+         f"+{tags}:{INCOMING}/tags/*",
+         f"+{wip}:{INCOMING}/wip", timeout=900)
 
 
 def _reconstruct(repo: str | Path, meta: dict[str, Any], *, mirror_branches: bool) -> None:
@@ -432,7 +484,7 @@ def _reconstruct(repo: str | Path, meta: dict[str, Any], *, mirror_branches: boo
 
 def apply_repo(repo: str | Path, bundle_path: str | Path, meta: dict[str, Any], *,
                backup_dir: str | Path, mirror_branches: bool = False,
-               force: bool = False) -> dict[str, Any]:
+               force: bool = False, namespace: str | None = None) -> dict[str, Any]:
     """Reconstruct ``meta``'s exact working state into ``repo`` from
     ``bundle_path``. Backs the receiver up first (R15). Creates the repo from the
     bundle when it does not exist yet (first sync). Refuses to move a receiver
@@ -440,11 +492,11 @@ def apply_repo(repo: str | Path, bundle_path: str | Path, meta: dict[str, Any], 
     ``force`` (ISSUE-006 sub-finding).
     """
     repo = Path(repo)
-    bundle_path = Path(bundle_path)
+    source = str(bundle_path)
     backup_dir = Path(backup_dir)
     name = meta.get("name", repo.name)
-    if not bundle_path.exists():
-        raise GitSyncError(f"bundle not found: {bundle_path}")
+    if namespace is None and not Path(source).exists():
+        raise GitSyncError(f"bundle not found: {source}")
 
     created = not is_git_repo(repo)
     raw_backup = None
@@ -465,7 +517,7 @@ def apply_repo(repo: str | Path, bundle_path: str | Path, meta: dict[str, Any], 
 
     # Fetch producer objects first (into INCOMING; never touches local refs) so
     # the backup can inspect the incoming tree for ignored-file collisions.
-    _fetch_incoming(repo, bundle_path)
+    _fetch_incoming(repo, source, namespace)
 
     # ISSUE-006 sub-finding: never move a receiver BACKWARDS. Post-fetch the
     # incoming head object is present, so ancestry is decidable everywhere the

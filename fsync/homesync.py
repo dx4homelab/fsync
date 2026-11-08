@@ -1705,7 +1705,8 @@ def _sticky_key(reason: str) -> str:
 
 
 def auto_apply_git_profile(prof: Profile, bundle_dir: str | Path, *,
-                           run_id: str, dry_run: bool, log) -> dict[str, Any]:
+                           run_id: str, dry_run: bool, log,
+                           hub: "Hub | None" = None, control=None) -> dict[str, Any]:
     """Receiver side (apply:auto): apply each staged bundle whose repo belongs to
     this profile, guarded by ``_auto_apply_decision``. Every real apply backs the
     receiver up first (R15). Bundles are matched to the profile by their meta
@@ -1720,30 +1721,46 @@ def auto_apply_git_profile(prof: Profile, bundle_dir: str | Path, *,
     reason) / ``error``. A dry run reads the streaks but never advances them."""
     bundle_dir = Path(bundle_dir).expanduser()
     home = _home()
+    via_hub = hub is not None and control is not None
     backup_dir = Path(DEFAULT_GIT_BACKUP_ROOT).expanduser() / f"{run_id}-autoapply"
     out: dict[str, Any] = {"kind": "git", "apply": "auto", "status": "ok",
                            "applied": [], "skipped": [], "errors": [],
-                           "sticky": [], "warnings": []}
-    if not bundle_dir.is_dir():
-        return out
+                           "sticky": [], "warnings": [], "store": "hub" if via_hub else "bundles"}
+    # (meta, source, namespace): a bundle file, or the hub repo + producer namespace
+    items: list[tuple[dict, str, str | None]] = []
+    if via_hub:
+        from .hub import hub_git_url
+        try:
+            metas = _hub_kind_metas(control, "git", prof, self_host=_local_short_host())
+        except Exception as e:  # noqa: BLE001
+            out["errors"].append(f"hub registry: {e}")
+            out["status"] = "error"
+            return out
+        for meta in metas:
+            items.append((meta, hub_git_url(hub, meta["rel"]), meta.get("namespace")
+                          or grs.hub_namespace(meta["host"])))
+    else:
+        if not bundle_dir.is_dir():
+            return out
+        for meta_path in sorted(bundle_dir.glob("*.meta.json")):
+            try:
+                meta = json.loads(meta_path.read_text())
+            except (OSError, ValueError):
+                continue
+            items.append((meta, str(bundle_dir / f"{meta.get('name') or Path(meta.get('rel') or '').name}.bundle"), None))
     streaks = StickyStreaks(f"{prof.name}/", run_id=run_id, dry_run=dry_run)
 
     def note_skip(name: str, reason: str) -> str:
         """Record a non-benign skip's streak; return a suffix for the log line."""
         return streaks.note(name, reason)[2]
 
-    for meta_path in sorted(bundle_dir.glob("*.meta.json")):
-        try:
-            meta = json.loads(meta_path.read_text())
-        except (OSError, ValueError):
-            continue
+    for meta, source, namespace in items:
         rel = meta.get("rel")
         if not rel or not any(rel == b or rel.startswith(b + "/") for b in prof.paths):
             continue
         name = meta.get("name") or Path(rel).name
-        bundle = bundle_dir / f"{name}.bundle"
         target = home / rel
-        if not bundle.exists():
+        if namespace is None and not Path(source).exists():
             out["skipped"].append({"repo": name, "reason": "no bundle"})
             continue
         ok, reason = _auto_apply_decision(target, meta)
@@ -1758,7 +1775,7 @@ def auto_apply_git_profile(prof: Profile, bundle_dir: str | Path, *,
             log(f"  {prof.name}/{name}: would auto-apply {meta.get('branch') or 'DETACHED'}@{head}")
             continue
         try:
-            res = grs.apply_repo(target, bundle, meta, backup_dir=backup_dir)
+            res = grs.apply_repo(target, source, meta, backup_dir=backup_dir, namespace=namespace)
             out["applied"].append({"repo": name, "head": meta.get("head"),
                                    "backup": res.get("backup")})
             log(f"  {prof.name}/{name}: auto-applied {meta.get('branch') or 'DETACHED'}@{head}"
@@ -1817,13 +1834,60 @@ def auto_apply_svn_checkouts(prof: Profile) -> bool:
     return prof.kind == "svn" and prof.apply == "auto" and not svn_profile_snapshots(prof)
 
 
-def snapshot_svn_profile(prof: Profile, snap_dir: str | Path, log) -> dict[str, Any]:
+def _svn_snapshot_files(snap_dir: Path, meta: dict[str, Any]) -> list[Path]:
+    files = [snap_dir / f"{meta['name']}.svn.meta.json"]
+    for key in ("diff", "unversioned_tar"):
+        if meta.get(key):
+            files.append(snap_dir / meta[key])
+    return [f for f in files if f.exists()]
+
+
+def _push_svn_snapshot_to_hub(hub: "Hub", prof: Profile, rel: str, host: str, snap_dir: Path,
+                              meta: dict[str, Any]) -> None:
+    """P7.3: the three snapshot files go to ``<hub>/svn/<rel>/<host>/`` (rsync,
+    --delete so a vanished tar does not linger); the meta is registered after."""
+    from .hub import hub_svn_path
+    dest = hub_svn_path(hub, rel, host)
+    mk = _ssh(hub, f"mkdir -p {shlex.quote(dest)}", timeout=30)
+    if mk.returncode != 0:
+        raise HomesyncError(f"cannot create hub svn store {dest}: {mk.stderr.strip()}")
+    files = _svn_snapshot_files(snap_dir, meta)
+    proc = subprocess.run(
+        ["rsync", "-a", "--delete", "-e", DEFAULT_RSYNC_SSH + " -o BatchMode=yes -o StrictHostKeyChecking=accept-new",
+         *[str(f) for f in files], hub.spec(dest).rstrip("/") + "/"],
+        capture_output=True, text=True, timeout=900)
+    if proc.returncode not in TOLERATED_RSYNC_EXITS:
+        raise HomesyncError(f"svn snapshot upload failed (rc={proc.returncode}): "
+                            + "\n".join(proc.stderr.strip().splitlines()[-3:]))
+
+
+def _pull_svn_snapshot_from_hub(hub: "Hub", meta: dict[str, Any], staging: Path) -> Path:
+    """Receiver side: mirror ``<hub>/svn/<rel>/<host>/`` into a local staging dir
+    the existing ``svnsync.apply_wc`` reads from."""
+    from .hub import hub_svn_path
+    src = hub_svn_path(hub, meta["rel"], meta["host"])
+    staging.mkdir(parents=True, exist_ok=True)
+    proc = subprocess.run(
+        ["rsync", "-a", "--delete", "-e", DEFAULT_RSYNC_SSH + " -o BatchMode=yes -o StrictHostKeyChecking=accept-new",
+         hub.spec(src).rstrip("/") + "/", str(staging).rstrip("/") + "/"],
+        capture_output=True, text=True, timeout=900)
+    if proc.returncode not in TOLERATED_RSYNC_EXITS:
+        raise svs.SvnSyncError(f"svn snapshot download failed (rc={proc.returncode}): "
+                               + "\n".join(proc.stderr.strip().splitlines()[-3:]))
+    return staging
+
+
+def snapshot_svn_profile(prof: Profile, snap_dir: str | Path, log, *,
+                         hub: "Hub | None" = None, control=None) -> dict[str, Any]:
     """Producer side: capture every working copy in the profile. Read-only on
     the checkouts; per-checkout isolation like the git snapshot (one locked or
-    conflicted WC never stops the rest)."""
+    conflicted WC never stops the rest). With a hub (P7.3) each snapshot's files
+    are uploaded to the hub's svn store and its meta registered there."""
     snap_dir = Path(snap_dir).expanduser()
     snap_dir.mkdir(parents=True, exist_ok=True)
-    out: dict[str, Any] = {"kind": "svn", "checkouts": []}
+    via_hub = hub is not None and control is not None
+    host = _local_short_host()
+    out: dict[str, Any] = {"kind": "svn", "checkouts": [], "store": "hub" if via_hub else "snapshots"}
     cos = _discover_svn_checkouts(prof)
     if not cos:
         log(f"  {prof.name}: no svn checkouts found under {prof.paths}")
@@ -1841,6 +1905,15 @@ def snapshot_svn_profile(prof: Profile, snap_dir: str | Path, log) -> dict[str, 
                 failures.append(f"{c['rel']}: {e}")
             log(f"  {prof.name}: {'SKIP' if benign else 'ERROR'} {c['rel']} — {e}")
             continue
+        if via_hub:
+            try:
+                _push_svn_snapshot_to_hub(hub, prof, c["rel"], host, snap_dir, meta)
+                control.put_kind_snapshot("svn", prof.name, c["rel"], host, {**meta, "host": host})
+            except Exception as e:  # noqa: BLE001 — transport/registry failure for ONE checkout
+                out["checkouts"].append({"name": c["name"], "rel": c["rel"], "error": f"hub: {e}"})
+                failures.append(f"{c['rel']}: hub: {e}")
+                log(f"  {prof.name}: ERROR {c['rel']} — hub: {e}")
+                continue
         out["checkouts"].append({"name": c["name"], "rel": c["rel"], "revision": meta["revision"],
                                  "dirty": meta["dirty"], "unversioned": meta["unversioned_count"],
                                  "bytes": meta["bytes"]})
@@ -1858,7 +1931,8 @@ _SVN_STICKY_BENIGN = {"up to date", "no snapshot", "svn server unreachable"}
 
 
 def auto_apply_svn_profile(prof: Profile, snap_dir: str | Path, *,
-                           run_id: str, dry_run: bool, log) -> dict[str, Any]:
+                           run_id: str, dry_run: bool, log,
+                           hub: "Hub | None" = None, control=None) -> dict[str, Any]:
     """Receiver side (apply:auto): apply each staged snapshot whose checkout
     belongs to this profile, guarded by ``svnsync.apply_decision``; backs the
     receiver up first. Same sticky/attention semantics as the git auto-apply."""
@@ -1866,18 +1940,29 @@ def auto_apply_svn_profile(prof: Profile, snap_dir: str | Path, *,
     home = _home()
     backup_dir = Path(DEFAULT_GIT_BACKUP_ROOT).expanduser() / f"{run_id}-svnapply"
     state_dir = state_root()
+    via_hub = hub is not None and control is not None
     out: dict[str, Any] = {"kind": "svn", "apply": "auto", "status": "ok",
                            "applied": [], "skipped": [], "errors": [],
-                           "sticky": [], "warnings": []}
-    if not snap_dir.is_dir():
-        return out
+                           "sticky": [], "warnings": [], "store": "hub" if via_hub else "snapshots"}
+    if via_hub:
+        try:
+            metas = _hub_kind_metas(control, "svn", prof, self_host=_local_short_host())
+        except Exception as e:  # noqa: BLE001
+            out["errors"].append(f"hub registry: {e}")
+            out["status"] = "error"
+            return out
+    else:
+        if not snap_dir.is_dir():
+            return out
+        metas = svs.load_metas(snap_dir)
     streaks = StickyStreaks(f"{prof.name}/", run_id=run_id, dry_run=dry_run)
-    for meta in svs.load_metas(snap_dir):
+    for meta in metas:
         rel = meta.get("rel")
         if not rel or not any(rel == b or rel.startswith(b + "/") for b in prof.paths):
             continue
         name = meta.get("name") or Path(rel).name
         target = home / rel
+        src_dir = snap_dir
         ok, reason = svs.apply_decision(target, meta, state_dir=state_dir)
         if not ok:
             out["skipped"].append({"checkout": name, "reason": reason})
@@ -1891,7 +1976,9 @@ def auto_apply_svn_profile(prof: Profile, snap_dir: str | Path, *,
                 + (f" + {meta.get('unversioned_count')} unversioned" if meta.get("unversioned_count") else ""))
             continue
         try:
-            res = svs.apply_wc(target, snap_dir, meta, backup_dir=backup_dir, state_dir=state_dir)
+            if via_hub:
+                src_dir = _pull_svn_snapshot_from_hub(hub, meta, snap_dir / "hub" / meta["host"] / name)
+            res = svs.apply_wc(target, src_dir, meta, backup_dir=backup_dir, state_dir=state_dir)
             out["applied"].append({"checkout": name, "revision": res["revision"],
                                    "created": res["created"], "backup": res.get("backup")})
             log(f"  {prof.name}/{name}: auto-applied r{res['revision']}"
@@ -1932,6 +2019,18 @@ def cmd_svn(args) -> int:
         return 2
     snap_dir = Path(getattr(args, "snapshot_dir", None) or DEFAULT_SVN_SNAPSHOT_DIR).expanduser()
     svn_profiles = {n: p for n, p in profiles.items() if p.kind == "svn"}
+    hub = _peer if isinstance(_peer, Hub) else None
+    control = None
+    if hub is not None:
+        from .hub import hub_control
+        if not peer_reachable(hub):
+            print(f"{hub.label} not reachable on any address", file=sys.stderr)
+            return 1
+        try:
+            control = hub_control(hub, getattr(args, "config", None))
+        except HomesyncError as e:
+            print(f"error: {e}", file=sys.stderr)
+            return 1
 
     if action == "snapshot":
         if not svn_profiles:
@@ -1947,17 +2046,27 @@ def cmd_svn(args) -> int:
         rc = 0
         for prof in selected:
             try:
-                total += len(snapshot_svn_profile(prof, snap_dir, log)["checkouts"])
+                total += len(snapshot_svn_profile(prof, snap_dir, log, hub=hub, control=control)["checkouts"])
             except HomesyncError as e:
                 print(f"error: {e}", file=sys.stderr)
                 rc = 1
-        print(f"snapshot: {total} checkout(s) -> {snap_dir}")
+        print(f"snapshot: {total} checkout(s) -> {hub.label if hub else snap_dir}")
         return rc
 
-    metas = svs.load_metas(snap_dir, only=getattr(args, "checkout", None))
+    if control is not None:
+        metas = []
+        for prof in svn_profiles.values():
+            metas.extend(_hub_kind_metas(control, "svn", prof, self_host=_local_short_host(),
+                                         only=getattr(args, "checkout", None)))
+    else:
+        metas = svs.load_metas(snap_dir, only=getattr(args, "checkout", None))
     if not metas:
-        print(f"no svn snapshots in {snap_dir} — run `fsync svn snapshot` on the source box "
-              f"(and let the file-sync carry {snap_dir.name}/) first", file=sys.stderr)
+        if control is not None:
+            print("no svn snapshots on the hub — run `fsync svn snapshot` on the producer box first",
+                  file=sys.stderr)
+        else:
+            print(f"no svn snapshots in {snap_dir} — run `fsync svn snapshot` on the source box "
+                  f"(and let the file-sync carry {snap_dir.name}/) first", file=sys.stderr)
         return 2
     home = _home()
     state_dir = state_root()
@@ -2016,7 +2125,9 @@ def cmd_svn(args) -> int:
             if forced:
                 saved = svs.force_clean(target, backup_dir, nm)
                 print(f"{nm}: receiver's local changes saved to {saved} and reverted (--force)")
-            res = svs.apply_wc(target, snap_dir, meta, backup_dir=backup_dir, state_dir=state_dir)
+            src_dir = (_pull_svn_snapshot_from_hub(hub, meta, snap_dir / "hub" / meta["host"] / nm)
+                       if hub is not None else snap_dir)
+            res = svs.apply_wc(target, src_dir, meta, backup_dir=backup_dir, state_dir=state_dir)
         except svs.SvnSyncError as e:
             print(f"{nm}: ERROR {e}", file=sys.stderr)
             rc = 1
@@ -2031,11 +2142,17 @@ def cmd_svn(args) -> int:
     return rc
 
 
-def snapshot_git_profile(prof: Profile, bundle_dir: str | Path, log) -> dict[str, Any]:
-    """Producer side: capture every repo in the profile into ``bundle_dir``."""
+def snapshot_git_profile(prof: Profile, bundle_dir: str | Path, log, *,
+                         hub: "Hub | None" = None, control=None) -> dict[str, Any]:
+    """Producer side: capture every repo in the profile — into the hub's bare
+    repos (P7.3, R39: ``refs/fsync/<host>/…`` + a meta the hub registers) when a
+    hub control plane is given, else into ``bundle_dir`` as bundle files."""
+    via_hub = hub is not None and control is not None
     bundle_dir = Path(bundle_dir).expanduser()
-    bundle_dir.mkdir(parents=True, exist_ok=True)
-    out: dict[str, Any] = {"kind": "git", "repos": []}
+    if not via_hub:
+        bundle_dir.mkdir(parents=True, exist_ok=True)
+    out: dict[str, Any] = {"kind": "git", "repos": [], "store": "hub" if via_hub else "bundles"}
+    host = _local_short_host()
     repos = _discover_git_repos(prof)
     if not repos:
         log(f"  {prof.name}: no git repos found under {prof.paths}")
@@ -2058,16 +2175,30 @@ def snapshot_git_profile(prof: Profile, bundle_dir: str | Path, log) -> dict[str
             log(f"  {prof.name}: SKIP {r['rel']} — {reason}")
             continue
         try:
-            meta = grs.snapshot_repo(r["path"], bundle_dir, name=r["name"], rel=r["rel"])
+            if via_hub:
+                from .hub import ensure_hub_bare, hub_git_url
+                ensure_hub_bare(hub, r["rel"])
+                meta = grs.snapshot_repo_to_hub(r["path"], hub_git_url(hub, r["rel"]), host,
+                                                name=r["name"], rel=r["rel"])
+                control.put_kind_snapshot("git", prof.name, r["rel"], host, meta)
+            else:
+                meta = grs.snapshot_repo(r["path"], bundle_dir, name=r["name"], rel=r["rel"])
         except grs.GitSyncError as e:
             out["repos"].append({"name": r["name"], "rel": r["rel"], "error": str(e)})
             failures.append(f"{r['rel']}: {e}")
             log(f"  {prof.name}: ERROR {e}")
             continue
+        except Exception as e:  # noqa: BLE001 — hub registry/transport failure for ONE repo
+            out["repos"].append({"name": r["name"], "rel": r["rel"], "error": str(e)})
+            failures.append(f"{r['rel']}: hub: {e}")
+            log(f"  {prof.name}: ERROR {r['rel']}: hub: {e}")
+            continue
         out["repos"].append({"name": r["name"], "rel": r["rel"], "branch": meta["branch"],
-                             "dirty": meta["dirty"], "bytes": meta["bytes"]})
-        log(f"  {prof.name}: snapshot {r['rel']} ({meta['bytes']}B"
-            f"{', dirty' if meta['dirty'] else ''})")
+                             "dirty": meta["dirty"], "bytes": meta.get("bytes", 0)})
+        log(f"  {prof.name}: snapshot {r['rel']}"
+            + (f" -> hub {meta['branch'] or 'DETACHED'}@{meta['head'][:9]}" if via_hub
+               else f" ({meta['bytes']}B)")
+            + (", dirty" if meta["dirty"] else ""))
         for w in grs.special_warnings(r["path"]):
             log(f"  {prof.name}: warn {r['rel']}: {w}")
     if failures:
@@ -2087,6 +2218,28 @@ def _select_git_profiles(profiles: dict[str, Profile], args) -> list[Profile] | 
             sel.append(profiles[n])
         return sel
     return list(profiles.values())  # default + --all: every git profile
+
+
+def _hub_kind_metas(control, kind: str, prof: Profile, *, self_host: str,
+                    only: str | None = None) -> list[dict]:
+    """P7.3 receiver side: for each repo/checkout of ``prof`` the NEWEST snapshot
+    another box registered on the hub (never our own — a producer does not
+    apply itself). Each meta carries ``host`` (its namespace / store dir)."""
+    best: dict[str, dict] = {}
+    for row in control.kind_snapshots(kind, prof.name):
+        if row["host"] == self_host:
+            continue
+        meta = dict(row["meta"] or {})
+        meta.setdefault("rel", row["rel"])
+        meta.setdefault("name", row.get("name") or Path(row["rel"]).name)
+        meta["host"] = row["host"]
+        meta["ts"] = row["ts"]
+        if only and meta.get("name") != only:
+            continue
+        cur = best.get(row["rel"])
+        if cur is None or row["ts"] > cur["ts"]:
+            best[row["rel"]] = meta
+    return [best[k] for k in sorted(best)]
 
 
 def _load_bundle_metas(bundle_dir: Path, only: str | None = None) -> list[dict]:
@@ -2132,9 +2285,21 @@ def cmd_git(args) -> int:
         print(f"error: {e}", file=sys.stderr)
         return 2
     bundle_dir = Path(getattr(args, "bundle_dir", None) or DEFAULT_GIT_BUNDLE_DIR).expanduser()
+    hub = _peer if isinstance(_peer, Hub) else None
+    control = None
+    if hub is not None:
+        from .hub import hub_control, hub_git_url
+        if not peer_reachable(hub):
+            print(f"{hub.label} not reachable on any address", file=sys.stderr)
+            return 1
+        try:
+            control = hub_control(hub, getattr(args, "config", None))
+        except HomesyncError as e:
+            print(f"error: {e}", file=sys.stderr)
+            return 1
+    git_profiles = {n: p for n, p in profiles.items() if p.kind == "git"}
 
     if action == "snapshot":
-        git_profiles = {n: p for n, p in profiles.items() if p.kind == "git"}
         if not git_profiles:
             print("no kind:git profiles in config — add one (see docs/git-repo-sync.md)",
                   file=sys.stderr)
@@ -2145,21 +2310,36 @@ def cmd_git(args) -> int:
         total = 0
         try:
             for prof in selected:
-                total += len(snapshot_git_profile(prof, bundle_dir, log)["repos"])
+                total += len(snapshot_git_profile(prof, bundle_dir, log, hub=hub, control=control)["repos"])
         except grs.GitSyncError as e:
             print(f"error: {e}", file=sys.stderr)
             return 1
-        print(f"snapshot: {total} repo(s) -> {bundle_dir}")
+        print(f"snapshot: {total} repo(s) -> {hub.label if hub else bundle_dir}")
         return 0
 
-    # apply / status operate on the bundles present in bundle_dir (carried here
-    # by the file-sync, or written locally by snapshot).
-    metas = _load_bundle_metas(bundle_dir, only=getattr(args, "repo", None))
+    # apply / status operate on the snapshots the hub registered for other boxes
+    # (P7.3), or on the bundles present in bundle_dir (v1 carriers).
+    sources: dict[str, tuple[str, str | None]] = {}
+    if control is not None:
+        metas = []
+        for prof in git_profiles.values():
+            for m in _hub_kind_metas(control, "git", prof, self_host=_local_short_host(),
+                                     only=getattr(args, "repo", None)):
+                metas.append(m)
+                sources[m["name"]] = (hub_git_url(hub, m["rel"]), m.get("namespace") or grs.hub_namespace(m["host"]))
+    else:
+        metas = _load_bundle_metas(bundle_dir, only=getattr(args, "repo", None))
+        for m in metas:
+            sources[m["name"]] = (str(bundle_dir / f"{m['name']}.bundle"), None)
     if not metas:
         where = f" matching {args.repo}" if getattr(args, "repo", None) else ""
-        print(f"no bundles in {bundle_dir}{where} — run `fsync git snapshot` on the "
-              f"source box (and let the file-sync carry {bundle_dir.name}/) first",
-              file=sys.stderr)
+        if control is not None:
+            print(f"no git snapshots on the hub{where} — run `fsync git snapshot` on the producer box first",
+                  file=sys.stderr)
+        else:
+            print(f"no bundles in {bundle_dir}{where} — run `fsync git snapshot` on the "
+                  f"source box (and let the file-sync carry {bundle_dir.name}/) first",
+                  file=sys.stderr)
         return 2
 
     home = _home()
@@ -2215,7 +2395,7 @@ def cmd_git(args) -> int:
     rc = 0
     for meta in metas:
         rel = meta.get("rel") or meta["name"]
-        bundle = bundle_dir / f"{meta['name']}.bundle"
+        source, namespace = sources[meta["name"]]
         target = home / rel
         # Never mutate a receiver repo that has a git operation in flight —
         # applying would race a running git or clobber a merge/rebase.
@@ -2261,9 +2441,9 @@ def cmd_git(args) -> int:
                     f"({ahead['incoming_head'][:9]} ancestor of "
                     f"{ahead['receiver_head'][:9]}) — proceeding under --force")
         try:
-            res = grs.apply_repo(target, bundle, meta, backup_dir=backup_dir,
+            res = grs.apply_repo(target, source, meta, backup_dir=backup_dir,
                                  mirror_branches=getattr(args, "mirror_branches", False),
-                                 force=getattr(args, "force", False))
+                                 force=getattr(args, "force", False), namespace=namespace)
         except grs.GitSyncError as e:
             print(f"{meta['name']}: ERROR {e}", file=sys.stderr)
             rc = 1
@@ -2694,6 +2874,21 @@ def cmd_deploy(args) -> int:
                      else "ROLLBACK ALSO FAILED (inspect *.bak on the remote)"),
                   file=sys.stderr)
             log(f"  verify output: {res['verify'][:200]}")
+    # P7.3: publish the same pyz + config on the hub so a spoke that missed this
+    # push (laptop away) can `fsync self-update` the next time it sees the hub.
+    if not dry and not getattr(args, "no_publish", False):
+        try:
+            peer_cfg, _, _ = load_config(config_path)
+        except HomesyncError:
+            peer_cfg = None
+        if isinstance(peer_cfg, Hub) and (peer_cfg.local or peer_reachable(peer_cfg)):
+            from .hub import publish_artifact
+            try:
+                man = publish_artifact(peer_cfg, pyz, str(cfg_file))
+                print(f"hub {peer_cfg.host}: artifact {man['version']} published")
+            except (HomesyncError, OSError, subprocess.SubprocessError) as e:
+                print(f"hub artifact publish FAILED: {e}", file=sys.stderr)
+                rc = 1
     return rc
 
 
@@ -2861,7 +3056,8 @@ def _cmd_run(args) -> int:
                 # `fsync git apply` (or auto-apply, guarded, when apply:auto).
                 if git_profile_snapshots(prof):
                     report["profiles"][prof.name] = snapshot_git_profile(
-                        prof, DEFAULT_GIT_BUNDLE_DIR, log)
+                        prof, DEFAULT_GIT_BUNDLE_DIR, log,
+                        hub=peer if isinstance(peer, Hub) else None, control=control)
                 elif auto_apply_git_repos(prof):
                     # Defer to a post-pass so the git-bundles file profile (which
                     # carries fresh bundles) has already run this cycle.
@@ -2878,7 +3074,8 @@ def _cmd_run(args) -> int:
             elif prof.kind == "svn":
                 if svn_profile_snapshots(prof):
                     report["profiles"][prof.name] = snapshot_svn_profile(
-                        prof, DEFAULT_SVN_SNAPSHOT_DIR, log)
+                        prof, DEFAULT_SVN_SNAPSHOT_DIR, log,
+                        hub=peer if isinstance(peer, Hub) else None, control=control)
                 elif auto_apply_svn_checkouts(prof):
                     auto_apply_later.append(prof)
                     report["profiles"][prof.name] = {"kind": "svn", "apply": "auto",
@@ -2925,12 +3122,15 @@ def _cmd_run(args) -> int:
     # arrived via the git-bundles file profile this cycle.
     for prof in auto_apply_later:
         try:
+            _hub = peer if isinstance(peer, Hub) else None
             if prof.kind == "svn":
                 res = auto_apply_svn_profile(prof, DEFAULT_SVN_SNAPSHOT_DIR,
-                                             run_id=run_id, dry_run=args.dry_run, log=log)
+                                             run_id=run_id, dry_run=args.dry_run, log=log,
+                                             hub=_hub, control=control)
             else:
                 res = auto_apply_git_profile(prof, DEFAULT_GIT_BUNDLE_DIR,
-                                             run_id=run_id, dry_run=args.dry_run, log=log)
+                                             run_id=run_id, dry_run=args.dry_run, log=log,
+                                             hub=_hub, control=control)
             report["profiles"][prof.name] = res
             log(f"  {prof.name}: auto-apply — {len(res['applied'])} applied, "
                 f"{len(res['skipped'])} skipped, {len(res['errors'])} error(s)"

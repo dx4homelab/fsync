@@ -74,6 +74,191 @@ def hub_control(hub: Hub, config_path: str | None = None) -> HubControl:
 
 
 # --------------------------------------------------------------------------- #
+# P7.3 hub stores (R39): bare git repos, svn snapshot dirs, the artifact       #
+# --------------------------------------------------------------------------- #
+
+def hub_git_path(hub: Hub, rel: str) -> str:
+    return f"{hs.hub_root(hub)}/git/{rel.strip('/')}.git"
+
+
+def hub_git_url(hub: Hub, rel: str) -> str:
+    """What git pushes to / fetches from: a plain path on the hub box itself,
+    ``user@host:path`` over ssh from a spoke (address follows the probe)."""
+    path = hub_git_path(hub, rel)
+    return path if hub.local else f"{hub.target}:{path}"
+
+
+def hub_svn_path(hub: Hub, rel: str, host: str) -> str:
+    return f"{hs.hub_root(hub)}/svn/{rel.strip('/')}/{host}"
+
+
+def ensure_hub_bare(hub: Hub, rel: str) -> None:
+    """Create the bare repository for ``rel`` on the hub if absent (one ssh
+    round trip; idempotent)."""
+    path = hub_git_path(hub, rel)
+    q = hs.shlex.quote(path)
+    proc = hs._ssh(hub, f"test -d {q} || (mkdir -p {q} && git init -q --bare {q})", timeout=60)
+    if proc.returncode != 0:
+        raise HomesyncError(f"cannot create hub repo {path}: {proc.stderr.strip()[-200:]}")
+
+
+def _sha256(path: str | Path) -> str:
+    import hashlib
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def publish_artifact(hub: Hub, pyz: str | Path, cfg: str | Path) -> dict[str, Any]:
+    """Copy the deployed pyz + config to ``<hub>/artifact/`` with a manifest
+    (version, features, sha256s) for `fsync self-update` (P7.3)."""
+    import shutil
+    import tempfile
+    from . import FEATURES
+    dest = f"{hs.hub_root(hub)}/artifact"
+    manifest = {"version": hs.FSYNC_VERSION, "features": sorted(FEATURES), "ts": time.time(),
+                "published_by": hs._local_short_host(),
+                "pyz": {"name": "fsync.pyz", "sha256": _sha256(pyz), "bytes": Path(pyz).stat().st_size},
+                "config": {"name": "sync-profiles.yaml", "sha256": _sha256(cfg),
+                           "bytes": Path(cfg).stat().st_size}}
+    with tempfile.TemporaryDirectory(prefix="fsync-artifact-") as td:
+        stage = Path(td)
+        shutil.copy2(pyz, stage / "fsync.pyz")
+        shutil.copy2(cfg, stage / "sync-profiles.yaml")
+        (stage / "manifest.json").write_text(json.dumps(manifest, indent=2))
+        mk = hs._ssh(hub, f"mkdir -p {hs.shlex.quote(dest)}", timeout=30)
+        if mk.returncode != 0:
+            raise HomesyncError(f"cannot create {dest} on the hub: {mk.stderr.strip()[-200:]}")
+        proc = hs.subprocess.run(
+            ["rsync", "-a", "-e", hs.DEFAULT_RSYNC_SSH + " -o BatchMode=yes -o StrictHostKeyChecking=accept-new",
+             str(stage).rstrip("/") + "/", hub.spec(dest).rstrip("/") + "/"],
+            capture_output=True, text=True, timeout=600)
+        if proc.returncode not in hs.TOLERATED_RSYNC_EXITS:
+            raise HomesyncError(f"artifact upload failed (rc={proc.returncode}): "
+                                + "\n".join(proc.stderr.strip().splitlines()[-3:]))
+    return manifest
+
+
+def install_artifact(pyz_tmp: Path, cfg_tmp: Path, manifest: dict[str, Any], *,
+                     home: Path | None = None, verify: bool = True) -> dict[str, Any]:
+    """Atomically install a downloaded pyz + config into this home (the same
+    backup-first / verify / rollback contract as `fsync deploy push`, R24)."""
+    import shutil
+    from . import meta_deploy as md
+    home = home or Path.home()
+    binp = home / md.REMOTE_BIN_REL
+    cfgp = home / md.REMOTE_CONFIG_REL
+    for tmp, want in ((pyz_tmp, manifest["pyz"]["sha256"]), (cfg_tmp, manifest["config"]["sha256"])):
+        got = _sha256(tmp)
+        if got != want:
+            raise HomesyncError(f"{tmp.name}: sha256 mismatch ({got[:12]} != {want[:12]}) — not installed")
+    binp.parent.mkdir(parents=True, exist_ok=True)
+    cfgp.parent.mkdir(parents=True, exist_ok=True)
+    backups = []
+    for cur in (binp, cfgp):
+        if cur.exists():
+            shutil.copy2(cur, cur.with_name(cur.name + ".bak"))
+            backups.append(str(cur) + ".bak")
+    shutil.copy2(pyz_tmp, binp.with_name(binp.name + ".tmp"))
+    shutil.copy2(cfg_tmp, cfgp.with_name(cfgp.name + ".tmp"))
+    binp.with_name(binp.name + ".tmp").chmod(0o755)
+    binp.with_name(binp.name + ".tmp").replace(binp)
+    cfgp.with_name(cfgp.name + ".tmp").replace(cfgp)
+    if verify:
+        proc = hs.subprocess.run([str(binp), "meta", "version"], capture_output=True, text=True, timeout=60)
+        if proc.returncode != 0 or "fsync_version" not in proc.stdout:
+            for b in backups:
+                shutil.copy2(b, b[:-4])
+            raise HomesyncError("installed pyz failed `meta version` — rolled back from .bak")
+    return {"pyz": str(binp), "config": str(cfgp), "version": manifest["version"], "backups": backups}
+
+
+def cmd_self_update(args: argparse.Namespace) -> int:
+    """`fsync self-update [--check] [--force]`: fetch the hub's published pyz +
+    config when newer than this box's (P7.3). A source install updates only
+    its config (its code comes from git)."""
+    config_path = getattr(args, "config", None)
+    try:
+        hub, _profiles = _load_hub(config_path)
+    except HomesyncError as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 2
+    from . import meta_deploy as md
+    source_install = md._pkg_dir().is_dir()
+    if hub.local:
+        mp = Path(hs.hub_root(hub)) / "artifact" / "manifest.json"
+        if not mp.exists():
+            print("no artifact published on this hub yet", file=sys.stderr)
+            return 1
+        manifest = json.loads(mp.read_text())
+        fetch = lambda which, dest: Path(dest).write_bytes(  # noqa: E731
+            (mp.parent / ("fsync.pyz" if which == "pyz" else "sync-profiles.yaml")).read_bytes())
+    else:
+        if not hs.peer_reachable(hub):
+            print(f"{hub.label} not reachable on any address — nothing to do", file=sys.stderr)
+            return 0
+        try:
+            ctl = hub_control(hub, config_path)
+            manifest = ctl.client.artifact_manifest()  # type: ignore[attr-defined]
+        except Exception as e:  # noqa: BLE001
+            print(f"error: hub control plane: {e}", file=sys.stderr)
+            return 1
+        if not manifest:
+            print("no artifact published on the hub yet (`fsync deploy push` from the deploy origin)",
+                  file=sys.stderr)
+            return 1
+        fetch = ctl.client.download_artifact  # type: ignore[attr-defined]
+    local_cfg = Path(hs.DEFAULT_CONFIG).expanduser()
+    cfg_same = local_cfg.exists() and _sha256(local_cfg) == manifest["config"]["sha256"]
+    newer = _version_tuple(manifest["version"]) > _version_tuple(hs.FSYNC_VERSION)
+    print(f"hub artifact: fsync {manifest['version']} (this box {hs.FSYNC_VERSION}"
+          f"{', source install' if source_install else ''}); config "
+          f"{'identical' if cfg_same else 'DIFFERS'}", file=sys.stderr)
+    if getattr(args, "check", False):
+        return 0
+    if not newer and cfg_same and not getattr(args, "force", False):
+        print("up to date", file=sys.stderr)
+        return 0
+    import tempfile
+    with tempfile.TemporaryDirectory(prefix="fsync-selfupdate-") as td:
+        pyz_tmp, cfg_tmp = Path(td) / "fsync.pyz", Path(td) / "sync-profiles.yaml"
+        try:
+            fetch("config", str(cfg_tmp))
+            if source_install:
+                if _sha256(cfg_tmp) != manifest["config"]["sha256"]:
+                    print("error: config sha256 mismatch", file=sys.stderr)
+                    return 1
+                import shutil
+                if local_cfg.exists():
+                    shutil.copy2(local_cfg, local_cfg.with_name(local_cfg.name + ".bak"))
+                shutil.copy2(cfg_tmp, local_cfg)
+                print(f"config updated ({local_cfg}); code is a source install — `git pull` for {manifest['version']}",
+                      file=sys.stderr)
+                return 0
+            fetch("pyz", str(pyz_tmp))
+            res = install_artifact(pyz_tmp, cfg_tmp, manifest)
+        except (HomesyncError, OSError) as e:
+            print(f"error: {e}", file=sys.stderr)
+            return 1
+        except Exception as e:  # noqa: BLE001 — HubUnavailable / HubApiError
+            print(f"error: hub: {e}", file=sys.stderr)
+            return 1
+    print(f"installed fsync {res['version']} -> {res['pyz']} (+ config); backups: "
+          + (", ".join(res["backups"]) or "none"), file=sys.stderr)
+    return 0
+
+
+def _version_tuple(v: str) -> tuple:
+    out = []
+    for part in str(v).split("."):
+        num = "".join(ch for ch in part if ch.isdigit())
+        out.append(int(num) if num else 0)
+    return tuple(out)
+
+
+# --------------------------------------------------------------------------- #
 # CLI                                                                         #
 # --------------------------------------------------------------------------- #
 
@@ -166,6 +351,13 @@ def render_status(hub: Hub, st: dict[str, Any], profiles: dict[str, hs.Profile])
                              f" {sm.get('pushed', 0)}↑ {sm.get('pulled', 0)}↓{behind}")
             spokes_s = " · ".join(parts)
         lines.append(f"{name:<{width}}  {lease_s:<22}  {hub_s:<30}  {spokes_s}")
+    kinds = st.get("kinds") or {}
+    if kinds:
+        lines.append("")
+        for prof_name, k in sorted(kinds.items()):
+            parts = [f"{h} {v['snapshots']} snapshot(s), latest {_age(v['age_s'])}"
+                     for h, v in sorted(k["hosts"].items())]
+            lines.append(f"{prof_name} ({k['kind']} store): " + " · ".join(parts))
     hosts = st.get("hosts") or {}
     if hosts:
         lines.append("")

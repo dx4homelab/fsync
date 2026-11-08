@@ -14,7 +14,7 @@ flowchart TB
         T["~/.fsync/hub/&lt;profile&gt;/tree<br/>canonical tree per profile"]
         S[("state.sqlite<br/>leases · spoke_runs<br/>P7.2: paths · journal · cursors · holds")]
         B["~/.fsync/hub/backups/&lt;run&gt;/&lt;profile&gt;"]
-        G["P7.3: hub/git/*.git · hub/svn/…"]
+        G["hub/git/*.git · hub/svn/… · hub/artifact/ (P7.3)"]
         D --- S
     end
 
@@ -203,7 +203,7 @@ gantt
     section P7.2 state
     tombstones, journal, cursors, 3-way (0.9.0) :done, p72, 2026-11-08, 1d
     section P7.3 kinds
-    git/svn hub stores, self-update             :p73, 2026-11-09, 7d
+    git/svn hub stores, self-update (0.10.0)    :done, p73, 2026-11-08, 1d
 ```
 
 ## 8. Benefits, in one table
@@ -214,7 +214,7 @@ gantt
 | one-way profiles because two live homes cannot express a delete | hub tombstones + journal (P7.2); every profile two-way |
 | whole-box `peer_busy` flock probe over ssh | per-profile hub lease with TTL; crashed spoke self-heals |
 | a laptop away for days re-plans against a live tree that moved on | journal since `last_seq`: replay exactly what was missed, once |
-| stale git bundle / svn snapshot can re-apply over fresh work | hub store knows ancestry (P7.3); stale replay is a no-op |
+| stale git bundle / svn snapshot can re-apply over fresh work | hub bare repos + snapshot registry: a receiver ahead of the newest snapshot is skipped, never rolled back |
 | "who is behind?" = read two run reports | `fsync hub status`: per profile, per spoke |
 | dev boxes are each other's servers | files4dx — always on, 238 GB NVMe free, 65 TB tank behind it |
 

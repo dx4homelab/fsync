@@ -130,6 +130,18 @@ class HubState:
                     last_seen   REAL NOT NULL,
                     PRIMARY KEY (host, profile)
                 );
+                -- P7.3 (R39): one row per (kind, profile, repo/checkout, producer host) —
+                -- the meta a receiver applies; bytes live in <root>/git/*.git or <root>/svn/.
+                CREATE TABLE IF NOT EXISTS kind_snapshots (
+                    kind    TEXT NOT NULL,
+                    profile TEXT NOT NULL,
+                    rel     TEXT NOT NULL,
+                    host    TEXT NOT NULL,
+                    name    TEXT,
+                    meta    TEXT NOT NULL,
+                    ts      REAL NOT NULL,
+                    PRIMARY KEY (kind, profile, rel, host)
+                );
                 CREATE TABLE IF NOT EXISTS holds (
                     profile         TEXT NOT NULL,
                     path            TEXT NOT NULL,
@@ -496,6 +508,36 @@ class HubState:
                 c.execute("DELETE FROM paths WHERE deleted_at IS NOT NULL AND deleted_at < ?", (t_cut,))
         return {"tombstones": int(n_t), "journal": int(n_j)}
 
+    # ------------------------------------------------------- kind snapshots
+
+    def put_kind_snapshot(self, kind: str, profile: str, rel: str, host: str, meta: dict,
+                          now: float | None = None) -> dict[str, Any]:
+        now = now or time.time()
+        with self._tx() as c:
+            c.execute("INSERT INTO kind_snapshots(kind, profile, rel, host, name, meta, ts) "
+                      "VALUES (?, ?, ?, ?, ?, ?, ?) ON CONFLICT(kind, profile, rel, host) DO UPDATE SET "
+                      "name=excluded.name, meta=excluded.meta, ts=excluded.ts",
+                      (kind, profile, rel, host, meta.get("name"), json.dumps(meta, sort_keys=True), now))
+        return {"kind": kind, "profile": profile, "rel": rel, "host": host, "ts": now}
+
+    def kind_snapshots(self, kind: str, profile: str | None = None,
+                       rel: str | None = None) -> list[dict[str, Any]]:
+        q = "SELECT * FROM kind_snapshots WHERE kind = ?"
+        args: list = [kind]
+        if profile:
+            q += " AND profile = ?"; args.append(profile)
+        if rel:
+            q += " AND rel = ?"; args.append(rel)
+        out = []
+        for r in self._conn.execute(q + " ORDER BY rel, ts DESC", args):
+            try:
+                meta = json.loads(r["meta"])
+            except ValueError:
+                meta = {}
+            out.append({"kind": r["kind"], "profile": r["profile"], "rel": r["rel"], "host": r["host"],
+                        "name": r["name"], "ts": r["ts"], "meta": meta})
+        return out
+
     def status(self, now: float | None = None) -> dict[str, Any]:
         """Per-profile lease + per-spoke last run; the body of `fsync hub status`."""
         now = now or time.time()
@@ -530,8 +572,14 @@ class HubState:
             e["cursors"] = by_host
         for prof, e in profiles.items():
             e["indexed"] = self.is_indexed(prof)
+        kinds: dict[str, Any] = {}
+        for r in self._conn.execute(
+                "SELECT kind, profile, host, COUNT(*) AS n, MAX(ts) AS ts FROM kind_snapshots "
+                "GROUP BY kind, profile, host"):
+            kinds.setdefault(r["profile"], {"kind": r["kind"], "hosts": {}})["hosts"][r["host"]] = {
+                "snapshots": int(r["n"]), "latest": r["ts"], "age_s": max(0, int(now - r["ts"]))}
         return {"now": now, "schema": SCHEMA_VERSION, "profiles": profiles, "hosts": hosts,
-                "leases": leases}
+                "leases": leases, "kinds": kinds}
 
 
 # --------------------------------------------------------------------------- #
@@ -602,6 +650,9 @@ class HubControl:
     def commit(self, profile: str, host: str, run_id: str, lease_id: str | None,
                puts: list[dict], dels: list[dict], holds: list[dict]) -> dict: ...
     def holds(self, profile: str | None = None) -> list[dict]: ...
+    # P7.3
+    def put_kind_snapshot(self, kind: str, profile: str, rel: str, host: str, meta: dict) -> dict: ...
+    def kind_snapshots(self, kind: str, profile: str | None = None, rel: str | None = None) -> list[dict]: ...
 
     def lease(self, profile: str, host: str, run_id: str, ttl: int = DEFAULT_LEASE_TTL) -> Lease:
         return Lease(self, profile, host, run_id, ttl)
@@ -643,3 +694,9 @@ class LocalHubControl(HubControl):
 
     def holds(self, profile=None):
         return self.state_db.holds(profile)
+
+    def put_kind_snapshot(self, kind, profile, rel, host, meta):
+        return self.state_db.put_kind_snapshot(kind, profile, rel, host, meta)
+
+    def kind_snapshots(self, kind, profile=None, rel=None):
+        return self.state_db.kind_snapshots(kind, profile, rel)

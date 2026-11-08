@@ -364,6 +364,14 @@ class RunRecordBody(BaseModel):
     summary: dict = {}
 
 
+class KindSnapshotBody(BaseModel):
+    """POST /v1/hub/kind/{kind}/snapshot (P7.3 R39): a producer's git/svn snapshot meta."""
+    profile: str
+    rel: str
+    host: str
+    meta: dict
+
+
 class CommitBody(BaseModel):
     """POST /v1/hub/{profile}/commit (P7.2 R34): what a spoke's finished transfer
     changed on the hub. puts/dels/holds are path dicts, see hubstate.commit."""
@@ -429,6 +437,35 @@ def register_hub_routes(app: FastAPI, state, hub: Hub, protected: list) -> None:
     @app.get("/v1/hub/{profile}/holds", dependencies=protected)
     def hub_holds(profile: str) -> list:
         return state.holds(profile)
+
+    # P7.3 — git/svn snapshot registry (bytes travel by git push / rsync) + artifact
+    @app.post("/v1/hub/kind/{kind}/snapshot", dependencies=protected)
+    def hub_kind_snapshot(kind: str, body: KindSnapshotBody) -> dict:
+        if kind not in ("git", "svn"):
+            raise HTTPException(status_code=400, detail="kind must be git or svn")
+        return state.put_kind_snapshot(kind, body.profile, body.rel, body.host, body.meta)
+
+    @app.get("/v1/hub/kind/{kind}/snapshots", dependencies=protected)
+    def hub_kind_snapshots(kind: str, profile: str | None = None, rel: str | None = None) -> list:
+        return state.kind_snapshots(kind, profile or None, rel or None)
+
+    @app.get("/v1/hub/artifact", dependencies=protected)
+    def hub_artifact() -> dict:
+        mp = Path(_hub_root(hub)) / "artifact" / "manifest.json"
+        if not mp.exists():
+            raise HTTPException(status_code=404, detail="no artifact published — `fsync deploy push` from the deploy origin")
+        return json.loads(mp.read_text())
+
+    @app.get("/v1/hub/artifact/{which}", dependencies=protected)
+    def hub_artifact_file(which: str):
+        from fastapi.responses import FileResponse
+        names = {"pyz": "fsync.pyz", "config": "sync-profiles.yaml"}
+        if which not in names:
+            raise HTTPException(status_code=404, detail="artifact is pyz or config")
+        fp = Path(_hub_root(hub)) / "artifact" / names[which]
+        if not fp.exists():
+            raise HTTPException(status_code=404, detail="artifact not published")
+        return FileResponse(str(fp), media_type="application/octet-stream", filename=names[which])
 
     @app.post("/v1/hub/{profile}/commit", dependencies=protected)
     def hub_commit(profile: str, body: CommitBody) -> dict:

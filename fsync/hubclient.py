@@ -165,6 +165,45 @@ class HubClient:
                 else "/v1/hub/holds")
         return self._request("GET", path) or []
 
+    # P7.3
+    def put_kind_snapshot(self, kind: str, profile: str, rel: str, host: str, meta: dict) -> dict:
+        return self._request("POST", f"/v1/hub/kind/{urllib.parse.quote(kind, safe='')}/snapshot",
+                             {"profile": profile, "rel": rel, "host": host, "meta": meta})
+
+    def kind_snapshots(self, kind: str, profile: str | None = None, rel: str | None = None) -> list[dict]:
+        return self._request("GET", f"/v1/hub/kind/{urllib.parse.quote(kind, safe='')}/snapshots",
+                             params={"profile": profile, "rel": rel}) or []
+
+    def artifact_manifest(self) -> dict | None:
+        try:
+            return self._request("GET", "/v1/hub/artifact")
+        except HubApiError as e:
+            if e.status == 404:
+                return None
+            raise
+
+    def download_artifact(self, which: str, dest: str) -> int:
+        """Stream /v1/hub/artifact/{pyz|config} to ``dest``; returns bytes."""
+        base = self.active or self.base_urls[0]
+        req = urllib.request.Request(f"{base}/v1/hub/artifact/{which}")
+        if self.token:
+            req.add_header("Authorization", f"Bearer {self.token}")
+        n = 0
+        try:
+            with urllib.request.urlopen(req, timeout=max(self.timeout, 120), context=self._ctx) as resp, \
+                    open(dest, "wb") as out:
+                while True:
+                    chunk = resp.read(1 << 16)
+                    if not chunk:
+                        break
+                    out.write(chunk)
+                    n += len(chunk)
+        except urllib.error.HTTPError as e:
+            raise HubApiError(e.code, e.read().decode(errors="replace")) from None
+        except (urllib.error.URLError, OSError) as e:
+            raise HubUnavailable(f"artifact download failed: {e}") from e
+        return n
+
 
 def _held_fields(detail: str) -> tuple[str, str | None, float]:
     """The 409 body is JSON {holder, run_id, expires} when the hub produced it;
@@ -206,3 +245,9 @@ class RemoteHubControl(HubControl):
 
     def holds(self, profile=None):
         return self.client.holds(profile)
+
+    def put_kind_snapshot(self, kind, profile, rel, host, meta):
+        return self.client.put_kind_snapshot(kind, profile, rel, host, meta)
+
+    def kind_snapshots(self, kind, profile=None, rel=None):
+        return self.client.kind_snapshots(kind, profile, rel)
