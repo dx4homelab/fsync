@@ -344,9 +344,9 @@ def render_status(hub: Hub, st: dict[str, Any], profiles: dict[str, hs.Profile])
                 sm = e.get("summary") or {}
                 cur = cursors.get(host)
                 behind = ""
-                if cur is not None and row.get("seq") is not None:
-                    gap = int(row["seq"]) - int(cur["last_seq"])
-                    behind = f" @{cur['last_seq']}" + (f" (−{gap})" if gap > 0 else "")
+                if cur is not None:
+                    gap = int(cur.get("behind") or 0)
+                    behind = f" @{cur['last_seq']}" + (f" ({gap} behind)" if gap > 0 else "")
                 parts.append(f"{host} {_age(e.get('age_s'))} {sm.get('status', '?')}"
                              f" {sm.get('pushed', 0)}↑ {sm.get('pulled', 0)}↓{behind}")
             spokes_s = " · ".join(parts)

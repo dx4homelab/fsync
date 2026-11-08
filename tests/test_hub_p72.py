@@ -506,7 +506,11 @@ shared: {{profiles: {{docs: {{paths: [Documents]}}}}}}
     assert c.get("/v1/hub/holds").json() == []
     stt = c.get("/v1/hub/status").json()["profiles"]["docs"]
     assert stt["seq"] == seq and stt["live"] == 1 and stt["tombstones"] == 1
-    assert stt["cursors"]["fury4dx"]["last_seq"] == seq
+    assert stt["cursors"]["fury4dx"]["last_seq"] == seq and stt["cursors"]["fury4dx"]["behind"] == 0
+    # another profile's journal traffic must not count as "behind" for docs
+    c.post("/v1/hub/other/commit", json={"host": "x", "run_id": "R9", "puts": [], "dels": [{"path": "z"}], "holds": []})
+    stt = c.get("/v1/hub/status").json()["profiles"]["docs"]
+    assert stt["cursors"]["fury4dx"]["behind"] == 0
 
 
 @pytestmark_rsync

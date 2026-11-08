@@ -580,6 +580,12 @@ class HubState:
             profiles.setdefault(r["profile"], {"lease": None, "spokes": {}})["holds"] = int(r["n"])
         for prof, by_host in self.cursors().items():
             e = profiles.setdefault(prof, {"lease": None, "spokes": {}})
+            # "behind" = THIS profile's journal entries past the spoke's cursor
+            # (seq is global across profiles, so a raw difference would lie)
+            for host, cur in by_host.items():
+                cur["behind"] = int(self._conn.execute(
+                    "SELECT COUNT(*) AS n FROM journal WHERE profile = ? AND seq > ?",
+                    (prof, cur["last_seq"])).fetchone()["n"])
             e["cursors"] = by_host
         for prof, e in profiles.items():
             e["indexed"] = self.is_indexed(prof)
