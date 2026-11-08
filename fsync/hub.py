@@ -182,8 +182,12 @@ def cmd_hub(args: argparse.Namespace) -> int:
             return hs._cmd_run(argparse.Namespace(
                 all=True, profile=None, dry_run=bool(getattr(args, "dry_run", False)),
                 workers=None, notify=False, plan_only=False, config=config_path))
-        print("next: `fsync sync run --all` on this box seeds the tree from this home; "
-              "spokes then run the same command", file=sys.stderr)
+        if "spoke" in hub.roles:
+            print("next: `fsync sync run --all` on this box seeds the tree from this home; "
+                  "spokes then run the same command", file=sys.stderr)
+        else:
+            print("next: hub-only box — seed the tree with `fsync sync run --all` on the producer "
+                  "spoke (R42); `fsync hub status` here shows each spoke's last run", file=sys.stderr)
         return 0
 
     if args.hub_cmd == "status":

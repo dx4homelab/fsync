@@ -368,7 +368,28 @@ Deviations from the draft above, on purpose:
   tree has `.svn` excluded), so the guard reports only. The durable answer stays `svn` profile
   `apply: auto` (file profiles skip the checkouts).
 
-### Cutover checklist (not yet executed — live config is still v1; hub = files4dx)
+### Cutover status (2026-11-08 evening) — hub prepared, spokes still on v1
+
+Done on files4dx: fsync 0.8.0 pyz + daemon venv installed, `fsync hub init` laid down the ten
+profile trees + `state.sqlite`, the daemon pins minis4dx/fury4dx/omen4dx and its mTLS listener is
+up on `0.0.0.0:7446`. Done on spokes: minis4dx and fury4dx pin `files4dx.pem`; omen4dx has the
+pyz, the daemon venv, the v2 config and the hub pin. The v2 config is validated for all four
+hosts and staged as `~/.config/fsync/sync-profiles.v2.yaml` on minis4dx and fury4dx.
+
+**Blocked on three operator actions** (each refused to the automation on purpose):
+
+1. files4dx firewall (zone FedoraServer) drops 7446/tcp — `fsync hub status` from any spoke fails
+   with "No route to host": `sudo firewall-cmd --add-port=7446/tcp --permanent && sudo firewall-cmd --reload`
+2. files4dx `Linger=no`: the hub daemon stops when the last ssh session ends:
+   `loginctl enable-linger developer` (same on omen4dx for its daemon).
+3. omen4dx's ssh key (`developer@omen4dx`) is not authorized on files4dx, so its rsync legs and
+   address probe fail: from omen4dx `ssh-copy-id developer@files4dx.lan`.
+
+Then: `cp ~/.config/fsync/sync-profiles.v2.yaml ~/.config/fsync/sync-profiles.yaml` on minis4dx and
+fury4dx, `fsync hub status` from minis (must list the profiles), seed with `fsync sync run --all`
+on minis4dx (≈ 41 GB), then `fsync sync run --all` on fury4dx and omen4dx.
+
+### Cutover checklist (reference; hub = files4dx)
 
 1. **Install fsync on files4dx.** Add `files4dx: {ssh: developer@files4dx.lan, role: [hub]}` to
    `hosts:` and switch the shared config to v2 in one edit on minis: top-level `version: 2`,
