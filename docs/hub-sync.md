@@ -418,6 +418,17 @@ escalation for repeated skips is kept (it is the receiver-ahead signal a human m
 from `fsync deploy daemon` (wheelhouse), so a code change still needs that step. files4dx has git
 2.55 and no svn (the svn store is plain files; `svn` runs only on the spokes).
 
+### Build images: excluded + pruned — 2026-11-08 evening
+
+The first `both` run from fury pushed 35 GB of build output (`server4home/output/image/disk.raw`
+22.8 GB, two ISOs) into the hub. Fix: `homelab` excludes `*.iso *.raw *.qcow2 *.vhd *.vmdk`,
+`server4home/output/*`, `server4home/_build-*`, `dx4bluefin/scratchpad/install-iso/*`; new
+`fsync hub prune --profile P --pattern …` tombstoned the 8 matching hub paths (43 GB incl. the
+el4homelab/kairos ISOs from the seed; hub copies under `<root>/backups/<ts>-prune/`, hub tree
+36 → 9.8 GB). Spokes that hold those files keep them (excluded = unobserved); spokes that never
+pulled them never will. Two live findings fixed on the way: excluded paths were read as local
+deletions after an exclude change (cc13700), and the mass-delete guard did its job in between.
+
 ### Direction flip — 2026-11-08 evening
 
 `homelab` and `primary` are `direction: both` on every box (tombstones make it safe); `svn` is
