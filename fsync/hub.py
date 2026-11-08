@@ -447,6 +447,20 @@ def cmd_hub(args: argparse.Namespace) -> int:
             print(f"error: `fsync hub gc` runs on the hub box ({hub.host})", file=sys.stderr)
             return 2
         root = Path(hs.hub_root(hub))
+        drop = getattr(args, "drop_profile", None)
+        if drop:
+            state = HubState(root / "state.sqlite")
+            for name in drop:
+                if name in profiles:
+                    print(f"error: '{name}' is still in the config — remove the profile first", file=sys.stderr)
+                    state.close()
+                    return 2
+                res = state.drop_profile(name)
+                print(f"dropped '{name}' from hub state: " + ", ".join(f"{t} {n}" for t, n in res.items() if n)
+                      + (f"; tree dir {root / name} is yours to remove" if (root / name).exists() else ""),
+                      file=sys.stderr)
+            state.close()
+            return 0
         ret = hub.retention or {}
         t_days = _days(ret.get("tombstones"), 90)
         b_days = _days(ret.get("backups"), 60)

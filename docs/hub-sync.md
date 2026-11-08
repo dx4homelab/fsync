@@ -408,8 +408,10 @@ Design notes beyond the draft:
 | `hub.py` | `hub_git_url`, `ensure_hub_bare`, `hub_svn_path`, `publish_artifact`, `install_artifact` (backup-first, sha256-verified, `meta version` check, rollback), `fsync self-update [--check\|--force]` |
 | `tests/test_hub_p73.py` | 5 tests incl. the acceptance scenario: producer → hub → receiver (HEAD, branch, dirty file, untracked file intact); receiver commits ahead, producer re-snapshots its old state → receiver **skips as ahead, untouched** (the stomp is a no-op); producer catches up → "up to date"; new producer commit flows; `fsync git status/apply` through the hub; registry newest-wins per repo; artifact publish/route/install |
 
-Notes: the `git-bundles` and `svn-snapshots` **carrier profiles are retired** — nothing is written to
-`~/.fsync/git-bundles` any more (the dir is removed on every box); `~/.fsync/svn-snapshots` stays as
+Notes: the `git-bundles` and `svn-snapshots` **carrier profiles are retired** (removed from the live
+config 2026-11-08; the old dirs were moved aside as `*.retired-20261108` on every box and under the
+hub root — delete them when satisfied; `fsync hub gc --drop-profile NAME` forgets their hub state);
+nothing is written to `~/.fsync/git-bundles` any more; `~/.fsync/svn-snapshots` stays as
 the producer's local staging dir and the receiver's `hub/<host>/<name>/` mirror. The sticky-streak
 escalation for repeated skips is kept (it is the receiver-ahead signal a human must act on).
 `fsync self-update` updates the pyz + config of a spoke from the hub; the fsyncd venv still comes

@@ -234,3 +234,15 @@ shared: {{profiles: {{docs: {{paths: [D]}}}}}}
 def test_features_and_version():
     from fsync import FEATURES, __version__
     assert "hub-stores" in FEATURES and __version__ == "0.10.0"
+
+
+def test_drop_retired_profile(tmp_path):
+    st = HubState(tmp_path / "s.sqlite")
+    st.index_tree("old", [{"path": "a", "size": 1, "mtime": 1.0, "hash": "h"}], now=1.0)
+    st.record_run("fury4dx", "old", "R1", {"status": "ok"})
+    st.put_kind_snapshot("git", "old", "r", "minis4dx", {})
+    st.index_tree("keep", [{"path": "b", "size": 1, "mtime": 1.0, "hash": "h"}], now=1.0)
+    res = st.drop_profile("old")
+    assert res["paths"] == 1 and res["journal"] == 1 and res["spoke_runs"] == 1 and res["kind_snapshots"] == 1
+    assert not st.is_indexed("old") and st.is_indexed("keep")
+    assert "old" not in st.status()["profiles"] and "keep" in st.status()["profiles"]

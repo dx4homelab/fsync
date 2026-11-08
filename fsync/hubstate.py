@@ -538,6 +538,17 @@ class HubState:
                         "name": r["name"], "ts": r["ts"], "meta": meta})
         return out
 
+    def drop_profile(self, profile: str) -> dict[str, int]:
+        """Forget a retired profile entirely (rows in every table + meta keys).
+        The tree directory is the operator's to remove."""
+        out: dict[str, int] = {}
+        with self._tx() as c:
+            for t in ("paths", "journal", "cursors", "spoke_runs", "leases", "holds", "kind_snapshots"):
+                out[t] = c.execute(f"DELETE FROM {t} WHERE profile = ?", (profile,)).rowcount
+            c.execute("DELETE FROM meta WHERE key IN (?, ?)",
+                      (INDEXED_KEY + profile, JOURNAL_FLOOR_KEY + profile))
+        return out
+
     def status(self, now: float | None = None) -> dict[str, Any]:
         """Per-profile lease + per-spoke last run; the body of `fsync hub status`."""
         now = now or time.time()

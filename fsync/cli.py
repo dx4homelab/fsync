@@ -903,6 +903,8 @@ def build_parser() -> argparse.ArgumentParser:
     p_hub_index.add_argument("--config", help="Profiles YAML (default: ~/.config/fsync/sync-profiles.yaml)")
     p_hub_gc = hub_sub.add_parser("gc", help="(hub box) Compact tombstones/journal/backups past hub.retention")
     p_hub_gc.add_argument("--dry-run", action="store_true")
+    p_hub_gc.add_argument("--drop-profile", action="append", metavar="NAME",
+                          help="Forget a profile no longer in the config (all hub state rows; repeatable)")
     p_hub_gc.add_argument("--config", help="Profiles YAML (default: ~/.config/fsync/sync-profiles.yaml)")
     p_hub_holds = hub_sub.add_parser("holds", help="List conflict: review holds on the hub (or release one)")
     p_hub_holds.add_argument("--release", nargs=2, metavar=("PROFILE", "PATH"), help="Drop one hold (next run re-resolves)")
