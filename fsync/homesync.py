@@ -2681,6 +2681,18 @@ def _cmd_run(args) -> int:
             log(f"note: {_n}: {len(_pats)} git-profile repo tree(s) excluded from file "
                 f"sync (apply:auto)")
 
+    # P7.1: a hub-only box (role: [hub], e.g. a file server with no carry-set
+    # of its own) serves the spokes and never syncs its own home — an additive
+    # two-way run from an empty home would pull the whole hub tree into it.
+    if isinstance(peer, Hub) and "spoke" not in peer.roles:
+        if getattr(args, "plan_only", False):
+            print(json.dumps({"peer_reachable": True, "peer": peer.label, "hub_only": True,
+                              "profiles": {}}))
+            return 0
+        print(f"this box is hub-only ({peer.label}, role {peer.roles}) — nothing to sync here; "
+              f"spokes run `fsync sync run` against it, see `fsync hub status`", file=sys.stderr)
+        return 0
+
     # R6: away-tolerant — a missing peer is a clean no-op, not an error.
     if not peer_reachable(peer):
         if getattr(args, "plan_only", False):

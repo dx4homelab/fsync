@@ -106,7 +106,7 @@ active hub (option C), staged so each phase ships on its own.
 ## Architecture
 
 ```
-          ┌───────────── hub box (minis4dx) ─────────────┐
+          ┌───────────── hub box (files4dx) ─────────────┐
           │ fsyncd  (hub role, daemon venv, :7444 mTLS)   │
           │   ├─ ~/.fsync/hub/<profile>/tree   (R31)      │
           │   ├─ ~/.fsync/hub/state.sqlite     (R32-R36)  │
@@ -122,7 +122,7 @@ active hub (option C), staged so each phase ships on its own.
    │  fsync (pyz) + fsyncd    │     │  fsync (pyz) + fsyncd    │
    │  ~/.fsync/base/<profile> │     │  ~/.fsync/base/<profile> │
    └──────────────────────────┘     └──────────────────────────┘
-   (minis4dx also runs a spoke against its own hub: local rsync, hub addr = 127.0.0.1)
+   (minis4dx is a third spoke; a hub box that also carries a home would run a local spoke)
 ```
 
 ### Hub state (sqlite via `fsync/db.py`)
@@ -205,11 +205,21 @@ have today.
 
 ### Hub placement
 
-minis4dx: always on, already the deploy origin and today's producer, already runs fsyncd.
-Hub tree = a second copy of the carry-set on minis's disk; P7.0 measures it. If it is too big,
-mount `files4dx-tank` NFS under `~/.fsync/hub/` (rsync to NFS is fine; sqlite stays local).
-files4dx itself is *not* the hub while its pool key lives on an offline USB (a reboot would
-lock the hub).
+**Decision 2026-11-08 (user): the hub is files4dx**, the always-on file server — not minis4dx as
+the first draft below assumed. Measured on files4dx the same day: Fedora CoreOS (uCore HCI),
+Python 3.14.6, rsync 3.4.1, OpenSSL 3.5, sshd on :22, 16 cores / 31 GB; `$HOME` is on the local
+NVMe (`/var`, xfs, 238 GB free), the 65 TB encrypted `tank` is unlocked with its key file in `/etc`
+on that same local disk. The hub tree (≈ 41 GB) therefore lives on files4dx's **local NVMe** under
+`~/.fsync/hub` — it does not depend on the tank being unlocked, which retires the earlier
+"offline pool key would lock the hub" objection; the tank stays available later for hub backups
+or the P7.3 git/svn stores if they outgrow the NVMe. files4dx runs the hub role only
+(`role: [hub]`): it has no carry-set of its own, so its daemon serves leases/state and `fsync sync
+run` there is a gated no-op. minis4dx becomes an ordinary spoke and stays the deploy origin
+(`fsync deploy push` targets files4dx like any other host). The same `developer@bluefin` ssh key
+is already authorized on files4dx from both minis4dx and fury4dx.
+
+Superseded draft reasoning, kept for the record: minis4dx was proposed because it is always on,
+already the deploy origin and today's producer, with the tank NFS as the fallback for the tree.
 
 ### Deploy (P6 interplay)
 
@@ -358,18 +368,24 @@ Deviations from the draft above, on purpose:
   tree has `.svn` excluded), so the guard reports only. The durable answer stays `svn` profile
   `apply: auto` (file profiles skip the checkouts).
 
-### Cutover checklist (not yet executed — live config is still v1)
+### Cutover checklist (not yet executed — live config is still v1; hub = files4dx)
 
-1. minis4dx (hub + spoke): switch `~/.config/fsync/sync-profiles.yaml` to v2 — top-level
-   `version: 2`, `requires: [git-sync, svn-sync, hub-sync]`, a `hub:` block
-   (`host: minis4dx`, `ssh: developer@minis4dx.lan`, `addresses: [minis4dx.lan, <tailnet name>]`),
-   `role: [hub, spoke]` under `hosts.minis4dx`, `role: [spoke]` under the others; drop every
-   `peer:` block; keep the per-host `defaults: {direction: …}` overlays and all profiles verbatim.
-2. `fsync hub init --seed` on minis (≈ 41 GB local rsync, first run only), then
-   `fsync deploy push` (config reaches the spokes) and `fsync deploy daemon` (hub routes come up
-   with the restart; `fsync hub status` shows the seeded profiles).
-3. Each spoke pins the hub cert once (`fsync daemon trust developer@minis4dx.lan --name minis4dx`;
-   fury4dx already has it from P4) and the hub pins the spoke's; the spoke's ssh key is already
-   accepted on minis. Then `fsync sync run --all` on the spoke; `fsync hub status` on any box.
-4. Acceptance per P7.1: create a file on any box → present on both others after each ran once;
-   no spoke holds another spoke's ssh/TLS trust (fury's pinned `minis4dx.pem` is the hub's).
+1. **Install fsync on files4dx.** Add `files4dx: {ssh: developer@files4dx.lan, role: [hub]}` to
+   `hosts:` and switch the shared config to v2 in one edit on minis: top-level `version: 2`,
+   `requires: [git-sync, svn-sync, hub-sync]`, `hub: {host: files4dx, ssh: developer@files4dx.lan,
+   addresses: [files4dx.lan], root: ~/.fsync/hub}`, `role: [spoke]` under minis4dx/fury4dx, drop
+   every `peer:` block, keep the per-host `defaults: {direction: …}` overlays and all profiles
+   verbatim. Then `fsync deploy push` (pyz + config to fury4dx and files4dx — minis accepts
+   files4dx's host key on first contact) and `fsync deploy daemon` (daemon venv on all three;
+   files4dx has `python3 -m venv` + ensurepip). `fsync hub init` on files4dx lays down the trees.
+2. **Trust.** On each spoke: `fsync daemon trust developer@files4dx.lan --name files4dx`; on
+   files4dx: `fsync daemon trust developer@minis4dx.lan --name minis4dx` and the same for fury4dx
+   (its mTLS listener starts once it pins at least one spoke). `fsync hub status` from a spoke then
+   answers over TLS.
+3. **Seed (R42).** `fsync sync run --all` on minis4dx: the first run pushes the whole carry-set
+   (≈ 41 GB over the wired LAN) into the empty hub tree; nothing comes back. Then fury4dx runs.
+4. **Acceptance (P7.1).** A file created on any box is present on the others after each ran once;
+   `fsync hub status` on files4dx lists both spokes; no spoke holds another spoke's ssh/TLS trust
+   (the pairwise `minis4dx.pem`/`fury4dx.pem` pins can be removed from the spokes).
+5. **Scale.** Add omen4dx as `role: [spoke]` with the same two trust commands once it is on the LAN
+   or files4dx is on the tailnet (`hub.addresses` then gains the MagicDNS name).

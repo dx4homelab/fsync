@@ -473,6 +473,29 @@ def test_overwrite_through_hub_backs_up_loser(tmp_path, monkeypatch):
     assert len(backups) == 1 and backups[0].read_text() == "v1"
 
 
+def test_hub_only_box_never_syncs_its_own_home(tmp_path, monkeypatch, capsys):
+    """A file server with role [hub] alone serves the spokes; `sync run` there is
+    a clean no-op (no run dir, nothing pulled into its empty home), hub init works."""
+    hub_root = tmp_path / "hub"
+    cfg = _v2(tmp_path, hub_host=HOST, roles="[hub]", root=str(hub_root))
+    home = tmp_path / "home"
+    home.mkdir()
+    _be(monkeypatch, home)
+    hub, profiles, _ = load_config(cfg)
+    assert hub.local and hub.roles == ["hub"]
+    # seed the tree as a spoke would have
+    (hub_root / "docs" / "tree" / "Documents").mkdir(parents=True)
+    (hub_root / "docs" / "tree" / "Documents" / "a.txt").write_text("A")
+    assert hs._cmd_run(_run_args(cfg)) == 0
+    assert "hub-only" in capsys.readouterr().err
+    assert not (home / "Documents").exists()
+    assert not (hs.state_root() / "runs").exists()
+    assert hs._cmd_run(_run_args(cfg, plan_only=True)) == 0
+    assert json.loads(capsys.readouterr().out)["hub_only"] is True
+    from fsync.hub import hub_init
+    assert hub_init(hub, profiles)["profiles"] == ["docs"]
+
+
 def test_hub_cli_status_json_local(tmp_path, monkeypatch, capsys):
     from fsync.hub import cmd_hub
     hub_root = tmp_path / "hub"
