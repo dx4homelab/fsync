@@ -534,3 +534,19 @@ def test_pyz_carries_the_hub_stack(tmp_path):
                           env={"HOME": str(tmp_path), "PATH": "/usr/bin:/bin"},
                           capture_output=True, text=True, timeout=60)
     assert proc.returncode == 0 and "SHA256" in proc.stdout, proc.stderr
+
+
+def test_peer_baseline_is_scoped_to_the_hub(tmp_path, monkeypatch):
+    """Cutover finding: a pairwise baseline must not judge the hub tree. The
+    peer-side prev-index for a Hub lives under its own name; a v1 peer's does
+    not move (no spurious reset for a fleet that stays pairwise)."""
+    monkeypatch.setenv("HOME", str(tmp_path))
+    hs._save_prev_index("docs", "D", "peer", {"old.txt"}, "R0")                       # v1 baseline
+    assert hs._load_prev_index("docs", "D", "peer") == {"old.txt"}
+    assert hs._load_prev_index("docs", "D", "peer", "hub-files4dx") is None           # fresh for the hub
+    plan = {"index_a": {"old.txt"}, "index_b": set()}
+    res = hs.detect_resurrections("docs", "D", plan, ["old.txt"], [], set(), counterpart="hub-files4dx")
+    assert res["count"] == 0 and res["baseline"]["peer"] is False
+    res_v1 = hs.detect_resurrections("docs", "D", plan, ["old.txt"], [], set())
+    assert res_v1["on_peer"] == ["old.txt"]
+    assert hs._prev_index_path("docs", "D", "peer", "hub-files4dx").name == "D.peer@hub-files4dx.json.gz"

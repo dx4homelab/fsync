@@ -973,15 +973,21 @@ def svn_guard_for_path(peer: Peer, prof: Profile, rel: str, local_root: Path,
 # ISSUE-010 fix 3: resurrection detection (receiver deleted it since last run) #
 # --------------------------------------------------------------------------- #
 
-def _prev_index_path(prof_name: str, key: str, side: str) -> Path:
-    return state_root() / "prev-index" / prof_name / f"{key}.{side}.json.gz"
+def _prev_index_path(prof_name: str, key: str, side: str, counterpart: str | None = None) -> Path:
+    """``counterpart`` scopes the PEER-side baseline to the tree it describes
+    (P7.1: ``hub-<host>``): switching a box from a pairwise peer to the hub
+    must start a fresh baseline, or every file the new counterpart lacks reads
+    as "resurrected" once (the 2026-11-08 cutover seed reported 160k of them)."""
+    tag = f"@{counterpart}" if counterpart else ""
+    return state_root() / "prev-index" / prof_name / f"{key}.{side}{tag}.json.gz"
 
 
-def _load_prev_index(prof_name: str, key: str, side: str) -> set[str] | None:
+def _load_prev_index(prof_name: str, key: str, side: str,
+                     counterpart: str | None = None) -> set[str] | None:
     """The receiver-side path set this box saw on its previous run of this
     profile path, or None when there is no baseline yet."""
     import gzip
-    p = _prev_index_path(prof_name, key, side)
+    p = _prev_index_path(prof_name, key, side, counterpart)
     try:
         with gzip.open(p, "rt") as f:
             data = json.load(f)
@@ -990,9 +996,10 @@ def _load_prev_index(prof_name: str, key: str, side: str) -> set[str] | None:
         return None
 
 
-def _save_prev_index(prof_name: str, key: str, side: str, paths: set[str], run_id: str) -> None:
+def _save_prev_index(prof_name: str, key: str, side: str, paths: set[str], run_id: str,
+                     counterpart: str | None = None) -> None:
     import gzip
-    p = _prev_index_path(prof_name, key, side)
+    p = _prev_index_path(prof_name, key, side, counterpart)
     try:
         p.parent.mkdir(parents=True, exist_ok=True)
         tmp = p.with_suffix(".tmp")
@@ -1004,7 +1011,8 @@ def _save_prev_index(prof_name: str, key: str, side: str, paths: set[str], run_i
 
 
 def detect_resurrections(prof_name: str, key: str, plan: dict, a_paths: list[str],
-                         b_paths: list[str], changed: set[str]) -> dict[str, Any]:
+                         b_paths: list[str], changed: set[str],
+                         counterpart: str | None = None) -> dict[str, Any]:
     """A path the receiver LACKS now but HAD in the previous run's index was
     deleted on the receiver since — so an additive copy of the sender's still-
     present file re-creates what the receiver removed (ISSUE-010: svn deleted it
@@ -1016,7 +1024,7 @@ def detect_resurrections(prof_name: str, key: str, plan: dict, a_paths: list[str
                            "baseline": {"peer": False, "local": False}}
     idx_a, idx_b = plan.get("index_a"), plan.get("index_b")
     if idx_b is not None:
-        prev_b = _load_prev_index(prof_name, key, "peer")
+        prev_b = _load_prev_index(prof_name, key, "peer", counterpart)
         if prev_b is not None:
             out["baseline"]["peer"] = True
             out["on_peer"] = [p for p in a_paths if p not in idx_b and p not in changed and p in prev_b]
@@ -1354,7 +1362,10 @@ def run_profile(
         # ISSUE-010 fix 3: creates on a receiver that HAD the path last run are
         # resurrections of something it deleted since. Detection, not a block:
         # the undo is the listed paths (backup_root holds nothing for creates).
-        resurrected = detect_resurrections(prof.name, key, plan, a_paths, b_paths, changed_paths)
+        # the peer-side baseline belongs to the counterpart tree it describes
+        counterpart = f"hub-{peer.host}" if isinstance(peer, Hub) else None
+        resurrected = detect_resurrections(prof.name, key, plan, a_paths, b_paths, changed_paths,
+                                           counterpart=counterpart)
         if resurrected["count"]:
             lst = run_dir / prof.name / f"{key}.resurrected.lst"
             lst.parent.mkdir(parents=True, exist_ok=True)
@@ -1363,7 +1374,8 @@ def run_profile(
             resurrected["list"] = str(lst)
         if plan.get("index_a") is not None and plan.get("index_b") is not None:
             _save_prev_index(prof.name, key, "local", plan["index_a"], run_id)
-            _save_prev_index(prof.name, key, "peer", plan["index_b"], run_id)
+            _save_prev_index(prof.name, key, "peer", plan["index_b"], run_id,
+                             counterpart=counterpart)
 
         if progress:
             progress.path_phase(prof.name, rel, "a_to_b", planned=len(a_paths))
