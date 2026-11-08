@@ -524,3 +524,28 @@ def test_symlink_pull_verifies_by_presence(tmp_path, monkeypatch):
     d = _docs(f.run("B"))
     assert f.doc("B", "link").is_symlink() and d["pull_failed"] == [] and d["unconverged"] == 0
     assert _docs(f.run("B"))["b_to_a"]["files_planned"] == 0
+
+
+@pytestmark_rsync
+def test_newly_excluded_tree_is_not_a_deletion(tmp_path, monkeypatch):
+    """Live finding 2026-11-08: when svn `apply: auto` made the file profile skip
+    27 checkouts, 120k base paths vanished from fury's index and read as local
+    deletions (the mass-delete guard held them). Excluded paths are unobserved:
+    no tombstone, no pull, and they leave the base."""
+    f = Fleet(tmp_path, monkeypatch)
+    (f.doc("A", "co")).mkdir()
+    for i in range(5):
+        f.doc("A", f"co/f{i}.txt").write_text(str(i))
+    f.doc("A", "keep.txt").write_text("k")
+    f.run("A"); f.run("B")
+    assert f.doc("B", "co/f1.txt").exists()
+    # now exclude the subtree on both boxes (config change)
+    f.cfg.write_text(f.cfg.read_text().replace("    docs: {paths: [Documents]}",
+                                               "    docs: {paths: [Documents], exclude: ['co/*']}"))
+    d = _docs(f.run("A"))
+    assert d["deleted_hub_count"] == 0 and d["mass_delete_held_count"] == 0 and d["b_to_a"]["files_planned"] == 0
+    assert f.hub_tree("co/f1.txt").exists()                 # hub copy untouched
+    base = tw.load_base(tw.base_path("docs", "Documents", home=f.homes["A"]))
+    assert "co/f1.txt" not in base["paths"] and "keep.txt" in base["paths"]
+    d = _docs(f.run("B"))
+    assert d["deleted_local_count"] == 0 and f.doc("B", "co/f1.txt").exists()

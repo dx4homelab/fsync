@@ -1174,7 +1174,7 @@ def build_run_preview(
                 prog_write()
             if isinstance(peer, Hub) and prof.mode == "full" and control is not None:
                 key = "home" if rel == "." else rel.replace("/", "_")
-                _, _, L, live, _t, _b, head, fplan, _rm = _plan_full_path(
+                _, _, L, live, _t, _b, head, fplan, _rm, _cv = _plan_full_path(
                     control, peer, plan_prof, rel, key, workers or prof.workers)
                 pp["paths"][rel] = {
                     "mode": "full", "seq": head,
@@ -3201,15 +3201,26 @@ def _plan_full_path(control, peer: Peer, prof: Profile, rel: str, key: str, n_wo
             raise HomesyncError(f"hub profile '{prof.name}' is not indexed — run `fsync hub index` on the hub")
         live, tomb = tw.strip_state_prefix(st, rel)
         head = int(st.get("seq") or 0)
-    plan = tw.classify(tw.converged_base(base), L, live, tomb,
+    # Paths the profile EXCLUDES are not observed on this box — a tree newly
+    # excluded (an svn checkout once `apply: auto` arrived, a new pattern) must
+    # not read as "deleted locally" against a base that still lists it. Drop
+    # them from every view; they leave the base this run.
+    converged = tw.converged_base(base)
+    if prof.exclude:
+        ex = prof.exclude
+        live = {p_: v for p_, v in live.items() if not matches_exclude(p_, ex)}
+        tomb = {p_: v for p_, v in tomb.items() if not matches_exclude(p_, ex)}
+        if converged is not None:
+            converged = {p_: v for p_, v in converged.items() if not matches_exclude(p_, ex)}
+    plan = tw.classify(converged, L, live, tomb,
                        conflict=prof.conflict, merge_jsonl=prof.merge_jsonl)
     root_missing = not local_root.is_dir()
     if root_missing:
         # an absent local root says nothing about deletes (new box, unmounted tree)
         plan.del_hub = []
     tw.apply_direction(plan, prof.direction)
-    tw.guard_mass_delete(plan, len(base["paths"]) if base else 0, allow=allow_mass_delete)
-    return local_root, remote_root, L, live, tomb, base, head, plan, root_missing
+    tw.guard_mass_delete(plan, len(converged) if converged else 0, allow=allow_mass_delete)
+    return local_root, remote_root, L, live, tomb, base, head, plan, root_missing, converged
 
 
 def _move_to_backup(src: Path, backup_root: Path, relp: str) -> None:
@@ -3229,7 +3240,7 @@ def _run_path_full(control, peer: Peer, prof: Profile, rel: str, key: str, n_wor
     """One profile path in mode: full — plan, two rsync legs, local removals to
     the backup dir, hub commit (puts verified there, dels → tombstones, holds),
     then the new base. Anything that did not converge keeps its old base entry."""
-    local_root, remote_root, L, live, tomb, base, head, plan, root_missing = _plan_full_path(
+    local_root, remote_root, L, live, tomb, base, head, plan, root_missing, converged = _plan_full_path(
         control, peer, prof, rel, key, n_workers, allow_mass_delete=allow_mass_delete)
     warnings: list[str] = []
     host = _local_short_host()
@@ -3360,7 +3371,7 @@ def _run_path_full(control, peer: Peer, prof: Profile, rel: str, key: str, n_wor
                       | set(plan.stranded_del_local) | set(plan.mass_delete_held) | set(merge_failed)
                       | set(del_local_failed) | {c["path"] for c in plan.conflicts})
         new_base, overrides = tw.next_base(
-            live, L, tw.converged_base(base),
+            live, L, converged,
             accepted_puts=accepted_puts, rejected_puts=rejected_puts,
             accepted_dels=accepted_dels, rejected_dels=rejected_dels,
             pulled_ok=pulled_ok, pulled_failed=pulled_failed,
