@@ -315,9 +315,22 @@ class Peer:
     home: str | None = None
     addresses: list[str] = field(default_factory=list)  # ordered; first = host
     _active: str | None = None   # the address a recent probe found reachable
+    # P7.1 hub-sync: the counterpart lives on THIS box (the hub box runs a
+    # spoke against its own hub tree) — every "remote" operation is a plain
+    # local command / local rsync; ssh and the engine push are skipped.
+    local: bool = False
 
     def all_addresses(self) -> list[str]:
         return self.addresses or [self.host]
+
+    def spec(self, path: str) -> str:
+        """rsync endpoint for ``path`` on the counterpart: ``user@host:path``,
+        or the bare path when the counterpart is this very box."""
+        return path if self.local else f"{self.target}:{path}"
+
+    @property
+    def label(self) -> str:
+        return self.target
 
     @property
     def active_host(self) -> str:
@@ -329,6 +342,23 @@ class Peer:
         h = self.active_host
         return f"{self.user}@{h}" if self.user else h
 
+
+@dataclass
+class Hub(Peer):
+    """The star topology's centre (docs/hub-sync.md R30/R31): a Peer whose
+    remote roots are the hub TREE (``<root>/<profile>/tree``), not a live home,
+    plus this box's roles. ``local`` is True on the hub box itself, which runs
+    an ordinary spoke run against its own tree (local rsync, no ssh)."""
+    root: str = "~/.fsync/hub"
+    roles: list[str] = field(default_factory=lambda: ["spoke"])  # THIS box's roles
+    retention: dict[str, Any] = field(default_factory=dict)
+
+    @property
+    def label(self) -> str:
+        return f"hub {self.host}" + (" (this box)" if self.local else f" via {self.target}")
+
+
+HUB_ROLES = ("hub", "spoke")
 
 DIRECTIONS = ("both", "push", "pull")  # push = local->peer only, pull = peer->local only
 
@@ -414,7 +444,51 @@ def _select_host_config(data: dict, hostname: str) -> dict:
     merged = _deep_merge(data.get("shared") or {}, hosts[key] or {})
     if data.get("requires"):
         merged["requires"] = data["requires"]
+    # P7.1 (config v2): the hub block is global, the role is per host (already
+    # merged in from hosts[key]); both ride along to the v2 loader.
+    for k in ("hub", "version"):
+        if k in data and k not in merged:
+            merged[k] = data[k]
     return merged
+
+
+def _split_ssh_target(target: str | None) -> tuple[str | None, str | None]:
+    """'user@host' -> (user, host); 'host' -> (None, host); None -> (None, None)."""
+    if not target:
+        return None, None
+    user, sep, host = str(target).rpartition("@")
+    return (user or None) if sep else None, host or None
+
+
+def _build_hub(data: dict, cfg_path: Path, hostname: str) -> Hub:
+    """Config v2 (docs/hub-sync.md): one ``hub:`` block + ``role:`` per host.
+    The hub box must declare the hub role and vice versa — a mismatch is a
+    config error, never a guess."""
+    raw = data.get("hub")
+    if not isinstance(raw, dict) or not raw.get("host"):
+        raise HomesyncError(f"{cfg_path}: version 2 config needs a `hub:` block with `host`")
+    host = str(raw["host"])
+    user, ssh_host = _split_ssh_target(raw.get("ssh"))
+    addrs = raw.get("addresses") or [ssh_host or host]
+    if not isinstance(addrs, list) or not all(isinstance(a, str) and a for a in addrs):
+        raise HomesyncError(f"{cfg_path}: hub.addresses must be a list of non-empty strings")
+    roles = data.get("role") or ["spoke"]
+    if isinstance(roles, str):
+        roles = [roles]
+    if not isinstance(roles, list) or not roles or any(r not in HUB_ROLES for r in roles):
+        raise HomesyncError(f"{cfg_path}: role must be a non-empty subset of {HUB_ROLES}, got {roles!r}")
+    is_hub_box = _match_host({host: True}, hostname) is not None
+    if ("hub" in roles) != is_hub_box:
+        raise HomesyncError(
+            f"{cfg_path}: hub.host is {host!r} but this box ({hostname}) "
+            + ("declares the hub role" if "hub" in roles else "does not declare role: [hub, ...]"))
+    root = str(raw.get("root") or "~/.fsync/hub")
+    retention = raw.get("retention") or {}
+    if not isinstance(retention, dict):
+        raise HomesyncError(f"{cfg_path}: hub.retention must be a mapping")
+    return Hub(host=host, user=user, home=raw.get("home"), addresses=[str(a) for a in addrs],
+               local="hub" in roles, root=root, roles=[str(r) for r in roles],
+               retention=dict(retention))
 
 
 def load_config(path: str | None) -> tuple[Peer, dict[str, Profile], dict[str, Any]]:
@@ -440,14 +514,23 @@ def load_config(path: str | None) -> tuple[Peer, dict[str, Profile], dict[str, A
             f"{cfg_path}: requires fsync feature(s) {missing} not in this build "
             f"{sorted(FEATURES)} — upgrade fsync on this box (meta-sync skew)")
 
-    peer_raw = data.get("peer") or {}
-    if not peer_raw.get("host"):
-        raise HomesyncError(f"{cfg_path}: peer.host is required")
-    addrs = peer_raw.get("addresses") or [peer_raw["host"]]
-    if not isinstance(addrs, list) or not all(isinstance(a, str) and a for a in addrs):
-        raise HomesyncError(f"{cfg_path}: peer.addresses must be a list of non-empty strings")
-    peer = Peer(host=peer_raw["host"], user=peer_raw.get("user"), home=peer_raw.get("home"),
-                addresses=[str(a) for a in addrs])
+    peer: Peer
+    try:
+        version = int(data.get("version") or 1)
+    except (TypeError, ValueError):
+        raise HomesyncError(f"{cfg_path}: version must be an integer") from None
+    if version >= 2 or data.get("hub") is not None:
+        # P7.1 star topology: the counterpart of every box is the hub.
+        peer = _build_hub(data, cfg_path, socket.gethostname())
+    else:
+        peer_raw = data.get("peer") or {}
+        if not peer_raw.get("host"):
+            raise HomesyncError(f"{cfg_path}: peer.host is required")
+        addrs = peer_raw.get("addresses") or [peer_raw["host"]]
+        if not isinstance(addrs, list) or not all(isinstance(a, str) and a for a in addrs):
+            raise HomesyncError(f"{cfg_path}: peer.addresses must be a list of non-empty strings")
+        peer = Peer(host=peer_raw["host"], user=peer_raw.get("user"), home=peer_raw.get("home"),
+                    addresses=[str(a) for a in addrs])
 
     defaults = data.get("defaults") or {}
     profiles: dict[str, Profile] = {}
@@ -510,7 +593,20 @@ def _ssh_to(target: str, command: str, *, timeout: int = 900) -> subprocess.Comp
         ) from e
 
 
+def _local_shell(command: str, *, timeout: int = 900) -> subprocess.CompletedProcess:
+    """The local-mode twin of ``_ssh_to``: same command text, same contract
+    (``HomesyncError`` on a hang), run by bash on this box."""
+    try:
+        return subprocess.run(["bash", "-c", command], capture_output=True, text=True,
+                              timeout=timeout)
+    except subprocess.TimeoutExpired as e:
+        raise HomesyncError(f"local command gave no reply within {timeout}s: "
+                            f"{command[:80]}{'…' if len(command) > 80 else ''}") from e
+
+
 def _ssh(peer: Peer, command: str, *, timeout: int = 900) -> subprocess.CompletedProcess:
+    if peer.local:
+        return _local_shell(command, timeout=timeout)
     # peer.target follows peer._active, set by the most recent peer_reachable()
     return _ssh_to(peer.target, command, timeout=timeout)
 
@@ -519,6 +615,9 @@ def peer_reachable(peer: Peer) -> bool:
     """Probe the peer's addresses in order; remember the first ssh-reachable one
     on the Peer (so the sync + API then use it). LAN name first, off-LAN
     (Tailscale) fallback next — so a run just works whether home or away."""
+    if peer.local:
+        peer._active = "127.0.0.1"
+        return True
     user = peer.user
     for addr in peer.all_addresses():
         target = f"{user}@{addr}" if user else addr
@@ -538,7 +637,12 @@ def peer_busy(peer: Peer) -> bool:
     transfers. flock(1) and Python's fcntl.flock share BSD lock semantics,
     so probing with a non-blocking flock is exact. An ssh failure counts as
     busy — deferring is always the safe answer for a scheduled run.
+
+    A hub is never "busy" as a whole: its per-profile leases (R36) are taken
+    inside the run, so one profile in flight elsewhere defers only itself.
     """
+    if isinstance(peer, Hub):
+        return False
     try:
         probe = _ssh(
             peer,
@@ -563,6 +667,9 @@ def peer_home(peer: Peer) -> str:
     """The peer's home dir: from config, else asked once over SSH."""
     if peer.home:
         return peer.home.rstrip("/")
+    if peer.local:
+        peer.home = str(Path.home())
+        return peer.home
     proc = _ssh(peer, 'printf %s "$HOME"', timeout=15)
     if proc.returncode != 0 or not proc.stdout.strip():
         raise HomesyncError(f"cannot determine peer home on {peer.target}: {proc.stderr.strip()}")
@@ -593,6 +700,8 @@ def ensure_peer_engine(peer: Peer) -> None:
     imports the standard library, and the engine copy is refreshed on every
     run so both sides always execute the same code. The engine is the package
     dir (source install) or the running .pyz (deployed box)."""
+    if peer.local:
+        return  # the counterpart runs this very code
     src_args, dst = _engine_push_args(Path(__file__).resolve().parent)
     mk = _ssh(peer, f"mkdir -p {shlex.quote(ENGINE_DIR)}/fsync", timeout=30)
     if mk.returncode != 0:
@@ -616,6 +725,9 @@ def remote_index(
     workers: int = 8,
 ) -> list[dict]:
     """Index ``root`` on the peer and return its records (JSONL over stdout)."""
+    if peer.local:
+        return local_index(Path(root), recursive=recursive, exclude=exclude,
+                           hash_algo=hash_algo, workers=workers)
     if _ssh(peer, f"test -d {shlex.quote(root)}", timeout=30).returncode != 0:
         return []  # absent on the peer -> everything local flows over as additive
     parts = [
@@ -655,6 +767,40 @@ def local_index(
         exclude=exclude or None,
         cache_path=default_cache_path(root),
     )
+
+
+# --------------------------------------------------------------------------- #
+# P7.1 hub-sync: where a profile path lives on the counterpart                #
+# --------------------------------------------------------------------------- #
+
+def hub_root(hub: Hub) -> str:
+    """Absolute hub root on the hub box (``~`` expands against ITS home)."""
+    r = hub.root.rstrip("/") or "~"
+    if r == "~":
+        return peer_home(hub)
+    if r.startswith("~/"):
+        return f"{peer_home(hub)}/{r[2:]}"
+    return r
+
+
+def hub_tree(hub: Hub, prof_name: str) -> str:
+    """The canonical tree of one profile on the hub (R31)."""
+    return f"{hub_root(hub)}/{prof_name}/tree"
+
+
+def remote_root_for(peer: Peer, prof: Profile, rel: str) -> str:
+    """Counterpart root of profile path ``rel``: under the hub tree for a Hub,
+    under the peer's live home for a v1 peer. The ONE place this is decided."""
+    base = hub_tree(peer, prof.name) if isinstance(peer, Hub) else peer_home(peer)
+    return base if rel == "." else f"{base}/{rel}"
+
+
+def remote_backup_for(peer: Peer, prof: Profile, run_id: str) -> str:
+    """Counterpart-side --backup-dir for files this run overwrites there (R4):
+    the hub keeps its own backups under its root, a peer under its home."""
+    if isinstance(peer, Hub):
+        return f"{hub_root(peer)}/backups/{run_id}/{prof.name}"
+    return f"{peer_home(peer)}/.fsync/backups/{run_id}/{prof.name}"
 
 
 # --------------------------------------------------------------------------- #
@@ -766,9 +912,8 @@ def _plan_path(peer: Peer, prof: Profile, rel: str, n_workers: int):
     ones whose transfer overwrites (and therefore backs up) a file.
     """
     home = Path.home()
-    p_home = peer_home(peer)
     local_root = home if rel == "." else home / rel
-    remote_root = p_home if rel == "." else f"{p_home}/{rel}"
+    remote_root = remote_root_for(peer, prof, rel)
     idx_a = local_index(local_root, recursive=prof.recursive, exclude=prof.exclude, workers=n_workers)
     idx_b = remote_index(peer, remote_root, recursive=prof.recursive, exclude=prof.exclude, workers=n_workers)
     report = compare_file_lists(idx_a, idx_b, match_on="path")
@@ -985,7 +1130,6 @@ def build_run_preview(
             continue
         pp: dict[str, Any] = {"conflict": prof.conflict, "direction": prof.direction, "paths": {},
                               "svn": []}
-        p_home = peer_home(peer)
         for rel in prof.paths:
             if prog is not None:
                 prog["profiles"][prof.name]["paths"][rel] = {"phase": "svn-parity"}
@@ -996,7 +1140,7 @@ def build_run_preview(
             home = Path.home()
             guard = svn_guard_for_path(peer, prof, rel,
                                        home if rel == "." else home / rel,
-                                       p_home if rel == "." else f"{p_home}/{rel}", head=True)
+                                       remote_root_for(peer, prof, rel), head=True)
             for row in guard["parity"]:
                 pp["svn"].append({"path": rel, **row})
             if guard.get("probe_warning"):
@@ -1080,10 +1224,9 @@ def run_profile(
     progress: ProgressWriter | None = None,
 ) -> dict[str, Any]:
     """Index both sides, plan, and execute every path of one profile."""
-    p_home = peer_home(peer)
     n_workers = workers or prof.workers
     local_backup = str(Path("~/.fsync/backups").expanduser() / run_id / prof.name)
-    remote_backup = f"{p_home}/.fsync/backups/{run_id}/{prof.name}"
+    remote_backup = remote_backup_for(peer, prof, run_id)
 
     result: dict[str, Any] = {"conflict": prof.conflict, "paths": {}, "status": "ok",
                               "warnings": []}
@@ -1099,7 +1242,14 @@ def run_profile(
         # kind:git's "receiver has local changes".
         home = Path.home()
         g_local = home if rel == "." else home / rel
-        g_remote = p_home if rel == "." else f"{p_home}/{rel}"
+        g_remote = remote_root_for(peer, prof, rel)
+        if isinstance(peer, Hub) and not dry_run:
+            # The hub tree is ours to create (R31): a fresh hub or a profile
+            # added later has no directory yet, and rsync --files-from makes
+            # only the last path component.
+            mk = _ssh(peer, f"mkdir -p {shlex.quote(g_remote)}", timeout=30)
+            if mk.returncode != 0:
+                raise HomesyncError(f"cannot create hub tree {g_remote}: {mk.stderr.strip()}")
         if progress:
             progress.path_phase(prof.name, rel, "svn-parity")
         guard = svn_guard_for_path(peer, prof, rel, g_local, g_remote)
@@ -1218,7 +1368,7 @@ def run_profile(
         if progress:
             progress.path_phase(prof.name, rel, "a_to_b", planned=len(a_paths))
         leg_ab = run_rsync_leg(
-            a_paths, str(local_root), f"{peer.target}:{remote_root}", remote_backup,
+            a_paths, str(local_root), peer.spec(remote_root), remote_backup,
             run_dir / prof.name / f"{key}.a_to_b.lst", dry_run=dry_run, overwrites=over_ab,
             on_progress=(lambda b, p, fd, ft: progress.leg_progress(prof.name, rel, "a_to_b", b, p, fd, ft))
             if progress else None,
@@ -1226,7 +1376,7 @@ def run_profile(
         if progress:
             progress.path_phase(prof.name, rel, "b_to_a", planned=len(b_paths))
         leg_ba = run_rsync_leg(
-            b_paths, f"{peer.target}:{remote_root}", str(local_root), local_backup,
+            b_paths, peer.spec(remote_root), str(local_root), local_backup,
             run_dir / prof.name / f"{key}.b_to_a.lst", dry_run=dry_run, overwrites=over_ba,
             on_progress=(lambda b, p, fd, ft: progress.leg_progress(prof.name, rel, "b_to_a", b, p, fd, ft))
             if progress else None,
@@ -2536,7 +2686,7 @@ def _cmd_run(args) -> int:
         if getattr(args, "plan_only", False):
             print(json.dumps({"peer_reachable": False, "peer": peer.target}))
             return 0
-        print(f"peer {peer.target} not reachable on the LAN — nothing to do", file=sys.stderr)
+        print(f"{peer.label} not reachable on any address — nothing to do", file=sys.stderr)
         return 0
 
     if getattr(args, "plan_only", False):
@@ -2567,9 +2717,21 @@ def _cmd_run(args) -> int:
               file=sys.stderr)
         return 0
 
+    control = None
+    if isinstance(peer, Hub):
+        # P7.1 (R36): per-profile leases on the hub replace the whole-box busy
+        # probe. Taken inside the loop, so one profile in flight elsewhere
+        # defers only itself; the hub's control plane being down is an error
+        # for every file profile, never a silent pairwise fallback.
+        from .hub import hub_control
+        try:
+            control = hub_control(peer, getattr(args, "config", None))
+        except HomesyncError as e:
+            print(f"error: {e}", file=sys.stderr)
+            return 1
     # Cross-box guard: if the peer is driving a sync right now, defer cleanly.
     # (Local lock is already held, so the peer's own probe of us backs off.)
-    if peer_busy(peer):
+    elif peer_busy(peer):
         print(f"peer {peer.target} is running a sync — deferring, nothing done", file=sys.stderr)
         return 0
 
@@ -2580,12 +2742,13 @@ def _cmd_run(args) -> int:
         "run_id": run_id,
         "started": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
         "dry_run": bool(args.dry_run),
-        "peer": {"host": peer.host, "user": peer.user},
+        "peer": {"host": peer.host, "user": peer.user, "hub": isinstance(peer, Hub),
+                 "local": peer.local},
         "profiles": {},
         "errors": [],
         "warnings": [],
     }
-    log(f"sync run {run_id}{' (DRY RUN)' if args.dry_run else ''} -> {peer.target}")
+    log(f"sync run {run_id}{' (DRY RUN)' if args.dry_run else ''} -> {peer.label}")
     progress = ProgressWriter(run_dir, run_id, bool(args.dry_run), [p.name for p in selected])
 
     rc = 0
@@ -2639,8 +2802,8 @@ def _cmd_run(args) -> int:
                     report["profiles"][prof.name] = {"kind": "svn", "snapshotted": False,
                                                      "reason": "pull-only receiver"}
             else:
-                res = run_profile(
-                    peer, prof, run_dir=run_dir, run_id=run_id,
+                res = _run_file_profile(
+                    control, peer, prof, run_dir=run_dir, run_id=run_id,
                     dry_run=args.dry_run, workers=args.workers, log=log, progress=progress,
                 )
                 report["profiles"][prof.name] = res
@@ -2720,6 +2883,56 @@ def _cmd_run(args) -> int:
                      if moved else []) + report["warnings"]
             _notify("fsync sync" if moved else "fsync sync: attention", "; ".join(parts)[:200])
     return rc
+
+
+def _run_summary(res: dict[str, Any], dry_run: bool) -> dict[str, Any]:
+    """What the hub remembers about a spoke's run (R41): enough for
+    `fsync hub status` to say which box moved what, and when."""
+    up = down = conflicts = 0
+    for pr in (res.get("paths") or {}).values():
+        up += (pr.get("a_to_b") or {}).get("files_transferred", 0)
+        down += (pr.get("b_to_a") or {}).get("files_transferred", 0)
+        conflicts += pr.get("conflicts", 0)
+    return {"status": res.get("status"), "pushed": up, "pulled": down, "conflicts": conflicts,
+            "dry_run": dry_run, "fsync": FSYNC_VERSION}
+
+
+def _run_file_profile(control, peer: Peer, prof: Profile, *, run_dir: Path, run_id: str,
+                      dry_run: bool, workers: int | None, log, progress) -> dict[str, Any]:
+    """``run_profile`` under the hub's per-profile lease (P7.1, R36/R41); a
+    plain pass-through for a v1 peer. A lease held elsewhere defers THIS
+    profile (reported, exit 0 — the next run picks it up); the hub's control
+    plane being unreachable is a profile error."""
+    if control is None:
+        return run_profile(peer, prof, run_dir=run_dir, run_id=run_id, dry_run=dry_run,
+                           workers=workers, log=log, progress=progress)
+    from .hubclient import HubApiError, HubUnavailable
+    from .hubstate import LeaseHeld
+
+    host = _local_short_host()
+    try:
+        with control.lease(prof.name, host, run_id) as lease:
+            res = run_profile(peer, prof, run_dir=run_dir, run_id=run_id, dry_run=dry_run,
+                              workers=workers, log=log, progress=progress)
+    except LeaseHeld as e:
+        log(f"  {prof.name}: {e} — deferring this profile")
+        return {"conflict": prof.conflict, "paths": {}, "status": "deferred",
+                "reason": str(e), "warnings": []}
+    except (HubUnavailable, HubApiError) as e:
+        raise HomesyncError(f"hub control plane: {e}") from e
+    if lease.lost:
+        msg = (f"{prof.name}: hub lease renewal failed mid-run ({lease.lost}) — another spoke "
+               f"may have started on this profile; the next run re-converges")
+        res.setdefault("warnings", []).append(msg)
+        res["status"] = "attention"
+        log(f"  ! {msg}")
+    if not dry_run:
+        try:
+            control.record_run(host, prof.name, run_id, _run_summary(res, dry_run))
+        except Exception as e:  # noqa: BLE001 — bookkeeping must never fail a finished transfer
+            res.setdefault("warnings", []).append(
+                f"{prof.name}: hub did not record this run ({type(e).__name__}: {e})")
+    return res
 
 
 # --------------------------------------------------------------------------- #

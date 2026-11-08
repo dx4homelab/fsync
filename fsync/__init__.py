@@ -7,7 +7,7 @@ __all__ = ["fileindex"]
 # Bump FEATURES when adding a capability a config can depend on; the config's
 # `requires:` list is checked against this set at load time (see homesync.load_config)
 # so a box never acts on config its code doesn't yet understand (the skew window).
-__version__ = "0.7.0"
+__version__ = "0.8.0"
 FEATURES = frozenset({
     "home-sync",   # P1-P4: profile-driven file sync
     "git-sync",    # P5: full-fidelity git working-tree sync (kind: git)
@@ -15,4 +15,5 @@ FEATURES = frozenset({
     "folder-sync", # P8: ad-hoc VCS-aware `fsync sync folder` (SVN-first)
     "git-auto-apply",  # ISSUE-001 fix C: kind:git `apply: auto` (file-skip + guarded receiver apply)
     "svn-sync",    # ISSUE-010: svn stale-sender guard in file profiles + kind: svn profiles
+    "hub-sync",    # P7.1: config v2 hub/spoke star topology, hub leases, `fsync hub`
 })

@@ -884,6 +884,17 @@ def build_parser() -> argparse.ArgumentParser:
     p_vm_clone.add_argument("--verbose", action="count", default=0, help="Increase verbosity (rsync progress)")
 
     # daemon: the operational backend (REST over TLS/mTLS + scheduler)
+    p_hub = sub.add_parser("hub", help="Hub role for the star topology (docs/hub-sync.md): init the hub tree, show which spoke is behind")
+    hub_sub = p_hub.add_subparsers(dest="hub_cmd")
+    p_hub_init = hub_sub.add_parser("init", help="Create the hub tree + state on THIS box (needs role: [hub, ...])")
+    p_hub_init.add_argument("--seed", action="store_true",
+                            help="Then run `fsync sync run --all` here to seed the tree from this home (R42)")
+    p_hub_init.add_argument("--dry-run", action="store_true", help="(with --seed) preview the seeding run")
+    p_hub_init.add_argument("--config", help="Profiles YAML (default: ~/.config/fsync/sync-profiles.yaml)")
+    p_hub_status = hub_sub.add_parser("status", help="Per-profile leases + each spoke's last run against the hub")
+    p_hub_status.add_argument("--json", action="store_true", help="Machine-readable output")
+    p_hub_status.add_argument("--config", help="Profiles YAML (default: ~/.config/fsync/sync-profiles.yaml)")
+
     p_dmn = sub.add_parser("daemon", help="fsyncd backend: REST API over TLS/mTLS, absorbs run scheduling")
     p_dmn.add_argument("action", choices=("run", "install", "remove", "status", "trust", "cert"),
                        help="run: serve in foreground; install: systemd user service (retires the timer); "
@@ -965,6 +976,10 @@ def main(argv: list[str] | None = None) -> int:
         from .vmclone import cmd_vm
 
         return cmd_vm(args)
+    if args.cmd == "hub":
+        from .hub import cmd_hub
+
+        return cmd_hub(args)
     if args.cmd == "daemon":
         from .daemon import cmd_daemon
 

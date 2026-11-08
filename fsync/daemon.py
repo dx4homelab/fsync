@@ -39,6 +39,7 @@ from pydantic import BaseModel
 
 from . import certs
 from .homesync import (
+    Hub,
     DIRECTIONS,
     HomesyncError,
     discover_run,
@@ -349,6 +350,57 @@ class PlanBody(BaseModel):
     workers: int | None = None
 
 
+class LeaseBody(BaseModel):
+    """POST /v1/hub/{profile}/lease: acquire (host [, run_id]) or renew (lease_id)."""
+    host: str | None = None
+    run_id: str | None = None
+    ttl: int | None = None
+    lease_id: str | None = None
+
+
+class RunRecordBody(BaseModel):
+    host: str
+    run_id: str
+    summary: dict = {}
+
+
+def register_hub_routes(app: FastAPI, state, hub: Hub, protected: list) -> None:
+    """P7.1 hub role (docs/hub-sync.md R36/R41): leases + per-spoke run records.
+    Mounted only when this box's config declares ``role: [hub, ...]``. Reached
+    by spokes over the mTLS listener (pinned client certs) and by this box's
+    own tools over loopback (token)."""
+    from .hubstate import LeaseHeld, LeaseLost
+
+    @app.get("/v1/hub/status", dependencies=protected)
+    def hub_status() -> dict:
+        from .homesync import hub_root
+        return {"host": hub.host, "root": hub_root(hub), **state.status()}
+
+    @app.post("/v1/hub/{profile}/lease", dependencies=protected)
+    def hub_lease(profile: str, body: LeaseBody) -> dict:
+        if body.lease_id:
+            try:
+                return state.renew(profile, body.lease_id, body.ttl)
+            except LeaseLost as e:
+                raise HTTPException(status_code=410, detail=str(e))
+        if not body.host:
+            raise HTTPException(status_code=400, detail="lease needs host (acquire) or lease_id (renew)")
+        try:
+            return state.acquire(profile, body.host, body.run_id, body.ttl)
+        except LeaseHeld as e:
+            raise HTTPException(status_code=409, detail={
+                "holder": e.holder, "run_id": e.run_id, "expires": e.expires, "message": str(e)})
+
+    @app.delete("/v1/hub/{profile}/lease/{lease_id}", dependencies=protected)
+    def hub_lease_release(profile: str, lease_id: str) -> dict:
+        return {"released": state.release(profile, lease_id)}
+
+    @app.post("/v1/hub/{profile}/runs", dependencies=protected)
+    def hub_record_run(profile: str, body: RunRecordBody) -> dict:
+        state.record_run(body.host, profile, body.run_id, body.summary)
+        return {"recorded": True}
+
+
 class ScheduleBody(BaseModel):
     enabled: bool | None = None
     interval: str | None = None
@@ -396,6 +448,19 @@ def create_app(config: str | None = None, *, require_token: bool = False,
             raise HTTPException(status_code=401, detail="missing or invalid API token")
 
     protected = [Depends(auth)]
+
+    # P7.1 hub role: the hub box serves leases + run records to its spokes.
+    try:
+        _cfg_peer, _, _ = load_config(config)
+    except HomesyncError:
+        _cfg_peer = None
+    if isinstance(_cfg_peer, Hub) and _cfg_peer.local:
+        from .hub import hub_state_path
+        from .hubstate import HubState
+
+        hub_state = shared.setdefault("hub_state", HubState(hub_state_path(_cfg_peer)))
+        register_hub_routes(app, hub_state, _cfg_peer, protected)
+        app.state.hub = _cfg_peer
 
     @app.get("/v1/status", dependencies=protected)
     def status() -> dict:
@@ -578,7 +643,10 @@ def create_app(config: str | None = None, *, require_token: bool = False,
         # Relay the peer daemon's own status over mTLS (the daemon holds the
         # certs + address list, so UIs never do cross-box mTLS themselves).
         trusted = certs.trusted_peers()
-        if trusted:
+        if isinstance(peer, Hub):
+            out["hub"] = True
+            out["label"] = peer.label
+        if trusted and not peer.local:
             from .client import DaemonUnavailable, FsyncClient
 
             name = trusted[0]

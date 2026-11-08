@@ -471,6 +471,13 @@ def cmd_sync_folder(args: argparse.Namespace) -> int:
         print(f"error: {e}", file=sys.stderr)
         return 2
 
+    if isinstance(peer, hs.Hub):
+        # P7.1: the hub tree is not a live checkout to reconcile against; the
+        # folder reconcile stays pairwise until P7.2 gives it a hub plan.
+        print("error: `fsync sync folder` is not hub-aware yet (docs/hub-sync.md P7.2) — "
+              "use `fsync sync run --profile NAME` against the hub", file=sys.stderr)
+        return 2
+
     if not hs.peer_reachable(peer):
         print(f"peer {peer.target} not reachable — nothing to do", file=sys.stderr)
         return 0
