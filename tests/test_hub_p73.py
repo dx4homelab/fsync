@@ -246,3 +246,36 @@ def test_drop_retired_profile(tmp_path):
     assert res["paths"] == 1 and res["journal"] == 1 and res["spoke_runs"] == 1 and res["kind_snapshots"] == 1
     assert not st.is_indexed("old") and st.is_indexed("keep")
     assert "old" not in st.status()["profiles"] and "keep" in st.status()["profiles"]
+
+
+@needs_git
+def test_hub_prune_tombstones_matching_paths(tmp_path, monkeypatch, capsys):
+    """Live 2026-11-08: 35 GB of build images reached the hub from a spoke.
+    `hub prune --pattern` tombstones them hub-side (copies kept in the hub
+    backup dir); a spoke that excludes them keeps its files (unobserved), a
+    spoke that never pulled them never will."""
+    from test_hub_p72 import Fleet, _docs
+    from fsync.hub import cmd_hub
+    f = Fleet(tmp_path, monkeypatch)
+    (f.doc("A", "out")).mkdir()
+    f.doc("A", "out/disk.raw").write_bytes(b"x" * 4096)
+    f.doc("A", "src.txt").write_text("s")
+    f.run("A")
+    assert f.hub_tree("out/disk.raw").exists()
+    f.be("A")
+    assert cmd_hub(argparse.Namespace(hub_cmd="prune", profile="docs", pattern=["*.raw"], dry_run=True,
+                                      show=20, config=str(f.cfg))) == 0
+    assert "would tombstone 1 path" in capsys.readouterr().err and f.hub_tree("out/disk.raw").exists()
+    assert cmd_hub(argparse.Namespace(hub_cmd="prune", profile="docs", pattern=["*.raw"], dry_run=False,
+                                      show=20, config=str(f.cfg))) == 0
+    assert not f.hub_tree("out/disk.raw").exists()
+    assert list((f.hub_root / "backups").rglob("disk.raw"))
+    st = f.state.state("docs")
+    assert "Documents/out/disk.raw" in st["tombstones"] and "Documents/src.txt" in st["paths"]
+    # B never pulled it and never will; A excludes it and keeps its copy
+    d = _docs(f.run("B"))
+    assert not f.doc("B", "out/disk.raw").exists() and f.doc("B", "src.txt").exists() and d["deleted_local_count"] == 0
+    f.cfg.write_text(f.cfg.read_text().replace("    docs: {paths: [Documents]}",
+                                               "    docs: {paths: [Documents], exclude: ['*.raw']}"))
+    d = _docs(f.run("A"))
+    assert d["deleted_local_count"] == 0 and f.doc("A", "out/disk.raw").exists()

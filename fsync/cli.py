@@ -906,6 +906,12 @@ def build_parser() -> argparse.ArgumentParser:
     p_hub_gc.add_argument("--drop-profile", action="append", metavar="NAME",
                           help="Forget a profile no longer in the config (all hub state rows; repeatable)")
     p_hub_gc.add_argument("--config", help="Profiles YAML (default: ~/.config/fsync/sync-profiles.yaml)")
+    p_hub_prune = hub_sub.add_parser("prune", help="(hub box) Tombstone hub paths matching a pattern (files move to the hub backup dir) — e.g. build images that should never have synced; pair with a profile exclude")
+    p_hub_prune.add_argument("--profile", required=True, help="File profile whose tree to prune")
+    p_hub_prune.add_argument("--pattern", action="append", metavar="PAT", help="Exclude-style pattern (repeatable)")
+    p_hub_prune.add_argument("--dry-run", action="store_true")
+    p_hub_prune.add_argument("--show", type=int, default=20, help="How many matches to list")
+    p_hub_prune.add_argument("--config", help="Profiles YAML (default: ~/.config/fsync/sync-profiles.yaml)")
     p_hub_holds = hub_sub.add_parser("holds", help="List conflict: review holds on the hub (or release one)")
     p_hub_holds.add_argument("--release", nargs=2, metavar=("PROFILE", "PATH"), help="Drop one hold (next run re-resolves)")
     p_hub_holds.add_argument("--json", action="store_true")

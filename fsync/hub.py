@@ -505,7 +505,45 @@ def cmd_hub(args: argparse.Namespace) -> int:
                       f"{time.strftime('%Y-%m-%d %H:%M', time.localtime(h['since']))}")
         return 0
 
-    print("usage: fsync hub {init,status,index,gc,holds}", file=sys.stderr)
+    if args.hub_cmd == "prune":
+        if not hub.local:
+            print(f"error: `fsync hub prune` runs on the hub box ({hub.host})", file=sys.stderr)
+            return 2
+        prof_name = args.profile
+        if prof_name not in profiles or profiles[prof_name].kind != "files":
+            print(f"error: '{prof_name}' is not a file profile in the config", file=sys.stderr)
+            return 2
+        patterns = list(args.pattern or [])
+        if not patterns:
+            print("error: at least one --pattern (same syntax as a profile exclude)", file=sys.stderr)
+            return 2
+        from .fileindex import matches_exclude
+        root = Path(hs.hub_root(hub))
+        state = HubState(root / "state.sqlite")
+        hits = [(p_, sz) for p_, sz in state.live_paths(prof_name) if matches_exclude(p_, patterns)]
+        total = sum(sz or 0 for _, sz in hits)
+        verb = "would tombstone" if getattr(args, "dry_run", False) else "tombstoning"
+        print(f"{prof_name}: {verb} {len(hits)} path(s), {total / 1e9:.2f} GB, matching {patterns}",
+              file=sys.stderr)
+        for p_, sz in hits[:int(getattr(args, "show", 20) or 20)]:
+            print(f"  {(sz or 0) / 1e6:9.1f} MB  {p_}", file=sys.stderr)
+        if len(hits) > int(getattr(args, "show", 20) or 20):
+            print(f"  … {len(hits) - int(getattr(args, 'show', 20) or 20)} more", file=sys.stderr)
+        if getattr(args, "dry_run", False) or not hits:
+            state.close()
+            return 0
+        run_id = time.strftime("%Y%m%d-%H%M%S") + "-prune"
+        res = state.tombstone_paths(prof_name, [p_ for p_, _ in hits], tree_root=root / prof_name / "tree",
+                                    backup_dir=root / "backups" / run_id / prof_name)
+        state.close()
+        print(f"{prof_name}: {len(res['tombstoned'])} tombstoned (hub copies under "
+              f"{root / 'backups' / run_id / prof_name}), {len(res['failed'])} failed, seq {res['seq']}",
+              file=sys.stderr)
+        for f_ in res["failed"][:5]:
+            print(f"  ! {f_['path']}: {f_['reason']}", file=sys.stderr)
+        return 1 if res["failed"] else 0
+
+    print("usage: fsync hub {init,status,index,gc,holds,prune}", file=sys.stderr)
     return 2
 
 

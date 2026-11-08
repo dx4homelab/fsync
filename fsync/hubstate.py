@@ -446,6 +446,45 @@ class HubState:
         return {"seq_to": int(head), "accepted_puts": accepted_puts, "accepted_dels": accepted_dels,
                 "rejected": rejected, "holds": len(holds), "moved_to_backup": len(moved)}
 
+    def tombstone_paths(self, profile: str, paths: list[str], *, tree_root: Path, backup_dir: Path,
+                        origin: str = "hub-prune", now: float | None = None) -> dict[str, Any]:
+        """Hub-side delete of live paths (P7.3 `fsync hub prune`): each tree file
+        moves to ``backup_dir`` (never rm) and the row becomes a tombstone with a
+        journal ``del``, exactly as a spoke's commit would — so spokes that never
+        pulled the path skip it and spokes that hold it move theirs to backup
+        (unless the path is excluded there, in which case it is unobserved)."""
+        now = now or time.time()
+        done: list[str] = []
+        failed: list[dict[str, str]] = []
+        for path in paths:
+            src = tree_root / path
+            if src.is_file() or src.is_symlink():
+                dst = backup_dir / path
+                try:
+                    dst.parent.mkdir(parents=True, exist_ok=True)
+                    try:
+                        src.replace(dst)
+                    except OSError:
+                        import shutil
+                        shutil.move(str(src), str(dst))
+                except OSError as e:
+                    failed.append({"path": path, "reason": str(e)})
+                    continue
+            done.append(path)
+        with self._tx() as c:
+            for path in done:
+                row = c.execute("SELECT hash FROM paths WHERE profile = ? AND path = ?",
+                                (profile, path)).fetchone()
+                seq = self._journal(c, profile, path, "del", row["hash"] if row else None, None, None,
+                                    origin, now)
+                self._upsert_path(c, profile, path, row["hash"] if row else None, None, None, seq, origin, now)
+                c.execute("DELETE FROM holds WHERE profile = ? AND path = ?", (profile, path))
+        return {"tombstoned": done, "failed": failed, "seq": self.head_seq(profile)}
+
+    def live_paths(self, profile: str) -> list[tuple[str, int | None]]:
+        return [(r["path"], r["size"]) for r in self._conn.execute(
+            "SELECT path, size FROM paths WHERE profile = ? AND deleted_at IS NULL ORDER BY path", (profile,))]
+
     def index_tree(self, profile: str, records: list[dict], *, origin: str = "hub-index",
                    now: float | None = None) -> dict[str, int]:
         """Make the paths table agree with an index of the profile tree (bootstrap
