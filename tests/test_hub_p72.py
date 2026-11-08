@@ -549,3 +549,19 @@ def test_newly_excluded_tree_is_not_a_deletion(tmp_path, monkeypatch):
     assert "co/f1.txt" not in base["paths"] and "keep.txt" in base["paths"]
     d = _docs(f.run("B"))
     assert d["deleted_local_count"] == 0 and f.doc("B", "co/f1.txt").exists()
+
+
+def test_commit_accepts_symlink_put_by_presence(tmp_path):
+    """Live 2026-11-08: .../var/lib/dbus/machine-id and a dangling rcfstrim link were
+    rejected ("not in hub tree") or re-pushed every run because the hub stat'ed
+    through the link. A link is verified by presence and keeps the spoke's stats."""
+    st, root, tree = _tree(tmp_path)
+    os.symlink("/nonexistent/target", tree / "dangling")
+    os.symlink("/etc/hostname", tree / "machine-id")
+    res = st.commit("docs", "fury4dx", "R1", None,
+                    puts=[{"path": "dangling", "size": 11, "mtime": 5.0, "hash": None},
+                          {"path": "machine-id", "size": 13, "mtime": 6.0, "hash": None}],
+                    dels=[], holds=[], tree_root=tree, backup_dir=root / "b")
+    assert res["rejected"] == [] and sorted(res["accepted_puts"]) == ["dangling", "machine-id"]
+    s = st.state("docs")
+    assert s["paths"]["machine-id"][:2] == [13, 6.0]      # the spoke's (link) stats, not the target's

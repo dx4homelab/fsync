@@ -395,11 +395,17 @@ class HubState:
                 continue
             f = tree_root / path
             try:
-                st = f.stat()
+                # lstat: a symlink is carried as a link (rsync -a); its target's
+                # stats are per box and may not even resolve on the hub
+                st = f.lstat()
             except OSError:
                 rejected.append({"path": path, "reason": "not in hub tree"})
                 continue
             size, mtime = p.get("size"), p.get("mtime")
+            if f.is_symlink():
+                put_ok.append({**p, "size": size if size is not None else st.st_size,
+                               "mtime": mtime if mtime is not None else st.st_mtime})
+                continue
             if size is not None and int(size) != st.st_size:
                 rejected.append({"path": path, "reason": f"size {st.st_size} != {size}"})
                 continue
