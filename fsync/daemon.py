@@ -364,6 +364,17 @@ class RunRecordBody(BaseModel):
     summary: dict = {}
 
 
+class CommitBody(BaseModel):
+    """POST /v1/hub/{profile}/commit (P7.2 R34): what a spoke's finished transfer
+    changed on the hub. puts/dels/holds are path dicts, see hubstate.commit."""
+    host: str
+    run_id: str
+    lease_id: str | None = None
+    puts: list[dict] = []
+    dels: list[dict] = []
+    holds: list[dict] = []
+
+
 def register_hub_routes(app: FastAPI, state, hub: Hub, protected: list) -> None:
     """P7.1 hub role (docs/hub-sync.md R36/R41): leases + per-spoke run records.
     Mounted only when this box's config declares ``role: [hub, ...]``. Reached
@@ -399,6 +410,36 @@ def register_hub_routes(app: FastAPI, state, hub: Hub, protected: list) -> None:
     def hub_record_run(profile: str, body: RunRecordBody) -> dict:
         state.record_run(body.host, profile, body.run_id, body.summary)
         return {"recorded": True}
+
+    # P7.2 — state, journal, commit, holds (docs/hub-sync.md R32–R35)
+    from .homesync import hub_root as _hub_root
+
+    @app.get("/v1/hub/holds", dependencies=protected)
+    def hub_holds_all() -> list:
+        return state.holds(None)
+
+    @app.get("/v1/hub/{profile}/state", dependencies=protected)
+    def hub_state(profile: str, prefix: str | None = None) -> dict:
+        return state.state(profile, prefix or "")
+
+    @app.get("/v1/hub/{profile}/journal", dependencies=protected)
+    def hub_journal(profile: str, since: int = 0, prefix: str | None = None) -> dict:
+        return state.journal_since(profile, since, prefix or "")
+
+    @app.get("/v1/hub/{profile}/holds", dependencies=protected)
+    def hub_holds(profile: str) -> list:
+        return state.holds(profile)
+
+    @app.post("/v1/hub/{profile}/commit", dependencies=protected)
+    def hub_commit(profile: str, body: CommitBody) -> dict:
+        root = Path(_hub_root(hub))
+        try:
+            return state.commit(profile, body.host, body.run_id, body.lease_id,
+                                body.puts, body.dels, body.holds,
+                                tree_root=root / profile / "tree",
+                                backup_dir=root / "backups" / body.run_id / profile)
+        except LeaseLost as e:
+            raise HTTPException(status_code=410, detail=str(e))
 
 
 class ScheduleBody(BaseModel):

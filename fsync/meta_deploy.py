@@ -26,6 +26,7 @@ CORE_MODULES = [
     "__init__.py", "cli.py", "fileindex.py", "homesync.py", "git_repo_sync.py",
     "meta_deploy.py", "foldersync.py", "vmclone.py", "svnsync.py",
     "hub.py", "hubstate.py", "hubclient.py", "certs.py",   # P7.1 hub-sync (stdlib only)
+    "threeway.py",                                         # P7.2 three-way classifier + base
     "db.py", "catalog_client.py", "eventbus.py", "agent.py",
 ]
 

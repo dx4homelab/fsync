@@ -31,7 +31,8 @@ def _cfg(tmp_path: Path, text: str, name: str = "sync-profiles.yaml") -> str:
 
 
 def _v2(tmp_path: Path, *, hub_host: str, roles: str, root: str | None = None,
-        extra_hub: str = "", profiles: str = "    docs: {paths: [Documents]}\n") -> str:
+        extra_hub: str = "", profiles: str = "    docs: {paths: [Documents]}\n",
+        mode: str = "full") -> str:
     root_line = f"  root: {root}\n" if root else ""
     return _cfg(tmp_path, f"""
 version: 2
@@ -44,7 +45,7 @@ hub:
 hosts:
   {HOST}: {{ssh: developer@{HOST}.lan, role: {roles}}}
 shared:
-  defaults: {{conflict: newer}}
+  defaults: {{conflict: newer, mode: {mode}}}
   profiles:
 {profiles}""")
 
@@ -432,7 +433,7 @@ def test_two_homes_converge_through_local_hub(tmp_path, monkeypatch):
 @pytest.mark.skipif(shutil.which("rsync") is None, reason="rsync required")
 def test_profile_held_elsewhere_is_deferred_not_failed(tmp_path, monkeypatch):
     hub_root = tmp_path / "hub"
-    cfg = _v2(tmp_path, hub_host=HOST, roles="[hub, spoke]", root=str(hub_root),
+    cfg = _v2(tmp_path, hub_host=HOST, roles="[hub, spoke]", root=str(hub_root), mode="additive",
               profiles="    docs: {paths: [Documents]}\n    tools: {paths: [tools]}\n")
     home = tmp_path / "home"
     (home / "Documents").mkdir(parents=True)
@@ -458,7 +459,7 @@ def test_overwrite_through_hub_backs_up_loser(tmp_path, monkeypatch):
     """conflict: newer through the hub (R35): the newer spoke copy wins and the
     hub keeps the overwritten tree file under its own backups (R4)."""
     hub_root = tmp_path / "hub"
-    cfg = _v2(tmp_path, hub_host=HOST, roles="[hub, spoke]", root=str(hub_root))
+    cfg = _v2(tmp_path, hub_host=HOST, roles="[hub, spoke]", root=str(hub_root), mode="additive")
     home = tmp_path / "home"
     (home / "Documents").mkdir(parents=True)
     f = home / "Documents" / "n.txt"

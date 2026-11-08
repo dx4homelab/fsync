@@ -709,6 +709,8 @@ def build_parser() -> argparse.ArgumentParser:
     p_sync_run.add_argument("--plan-progress", metavar="FILE", default=None,
                             help="With --plan-only: maintain a live per-path planning snapshot at FILE (for UIs)")
     p_sync_run.add_argument("--workers", type=int, default=None, help="Override hashing workers on both sides")
+    p_sync_run.add_argument("--allow-mass-delete", action="store_true",
+                            help="(hub, mode: full) apply a run's local deletions to the hub even when they exceed the mass-delete guard")
     p_sync_run.add_argument("--notify", action="store_true",
                             help="Desktop notification when files moved or the run failed (used by the timer)")
     p_sync_run.add_argument("--verbose", action="count", default=0, help="Increase verbosity")
@@ -894,6 +896,17 @@ def build_parser() -> argparse.ArgumentParser:
     p_hub_status = hub_sub.add_parser("status", help="Per-profile leases + each spoke's last run against the hub")
     p_hub_status.add_argument("--json", action="store_true", help="Machine-readable output")
     p_hub_status.add_argument("--config", help="Profiles YAML (default: ~/.config/fsync/sync-profiles.yaml)")
+    p_hub_index = hub_sub.add_parser("index", help="(hub box) Make the paths table agree with the profile trees — bootstrap a pre-P7.2 tree or repair")
+    p_hub_index.add_argument("--profile", action="append", help="Only this profile (repeatable)")
+    p_hub_index.add_argument("--workers", type=int, default=8)
+    p_hub_index.add_argument("--config", help="Profiles YAML (default: ~/.config/fsync/sync-profiles.yaml)")
+    p_hub_gc = hub_sub.add_parser("gc", help="(hub box) Compact tombstones/journal/backups past hub.retention")
+    p_hub_gc.add_argument("--dry-run", action="store_true")
+    p_hub_gc.add_argument("--config", help="Profiles YAML (default: ~/.config/fsync/sync-profiles.yaml)")
+    p_hub_holds = hub_sub.add_parser("holds", help="List conflict: review holds on the hub (or release one)")
+    p_hub_holds.add_argument("--release", nargs=2, metavar=("PROFILE", "PATH"), help="Drop one hold (next run re-resolves)")
+    p_hub_holds.add_argument("--json", action="store_true")
+    p_hub_holds.add_argument("--config", help="Profiles YAML (default: ~/.config/fsync/sync-profiles.yaml)")
 
     p_dmn = sub.add_parser("daemon", help="fsyncd backend: REST API over TLS/mTLS, absorbs run scheduling")
     p_dmn.add_argument("action", choices=("run", "install", "remove", "status", "trust", "cert"),

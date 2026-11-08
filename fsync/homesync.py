@@ -31,6 +31,7 @@ from typing import Any
 from . import FEATURES, __version__ as FSYNC_VERSION
 from . import git_repo_sync as grs
 from . import svnsync as svs
+from . import threeway as tw
 from .fileindex import (
     DEFAULT_RSYNC_SSH,
     build_sync_plan,
@@ -387,6 +388,10 @@ class Profile:
     # repos, and the receiver auto-applies bundles in the run, guarded (clean +
     # same-branch + not-busy; else skip). Realizes R17's reserved guarded mode.
     apply: str = "on-demand"
+    # P7.2 hub-sync: "full" = three-way vs base + tombstones + journal through the
+    # hub (deletes propagate, reversibly); "additive" = the P7.1 behaviour (never
+    # removes anything). v1 pairwise configs are always additive.
+    mode: str = "additive"
 
 
 def _deep_merge(base: dict, override: dict) -> dict:
@@ -554,6 +559,11 @@ def load_config(path: str | None) -> tuple[Peer, dict[str, Profile], dict[str, A
         apply_mode = raw.get("apply", defaults.get("apply", "on-demand"))
         if apply_mode not in ("on-demand", "auto"):
             raise HomesyncError(f"{cfg_path}: profile '{name}': apply must be 'on-demand' or 'auto', got {apply_mode!r}")
+        mode = raw.get("mode", defaults.get("mode", "full" if isinstance(peer, Hub) else "additive"))
+        if mode not in ("full", "additive"):
+            raise HomesyncError(f"{cfg_path}: profile '{name}': mode must be 'full' or 'additive', got {mode!r}")
+        if mode == "full" and not isinstance(peer, Hub):
+            raise HomesyncError(f"{cfg_path}: profile '{name}': mode: full needs a hub (config v2)")
         profiles[name] = Profile(
             name=name,
             paths=[str(p) for p in paths],
@@ -567,6 +577,7 @@ def load_config(path: str | None) -> tuple[Peer, dict[str, Profile], dict[str, A
             kind=kind,
             mirror_branches=bool(raw.get("mirror_branches", False)),
             apply=apply_mode,
+            mode=mode,
         )
     if not profiles:
         raise HomesyncError(f"{cfg_path}: no profiles defined")
@@ -1103,6 +1114,7 @@ def build_run_preview(
     workers: int | None = None,
     sample_n: int = 8,
     progress_path: str | Path | None = None,
+    control=None,
 ) -> dict[str, Any]:
     """Plan every selected profile without transferring: 'what is coming'.
 
@@ -1160,6 +1172,31 @@ def build_run_preview(
             if prog is not None:
                 prog["profiles"][prof.name]["paths"][rel] = {"phase": "indexing"}
                 prog_write()
+            if isinstance(peer, Hub) and prof.mode == "full" and control is not None:
+                key = "home" if rel == "." else rel.replace("/", "_")
+                _, _, L, live, _t, _b, head, fplan, _rm = _plan_full_path(
+                    control, peer, plan_prof, rel, key, workers or prof.workers)
+                pp["paths"][rel] = {
+                    "mode": "full", "seq": head,
+                    "a_to_b": len(fplan.push), "b_to_a": len(fplan.pull),
+                    "bytes_a_to_b": sum((L.get(x) or {}).get("size") or 0 for x in fplan.push),
+                    "bytes_b_to_a": sum((live.get(x) or [0])[0] or 0 for x in fplan.pull),
+                    "overwrites_a_to_b": len(fplan.overwrite_push),
+                    "overwrites_b_to_a": len(fplan.overwrite_pull),
+                    "del_hub": len(fplan.del_hub), "del_local": len(fplan.del_local),
+                    "conflicts": len(fplan.conflicts), "identical": fplan.noop,
+                    "renames_demoted": 0, "svn_skipped": len(guard["skipped"]),
+                    "svn_checked": guard["checked"],
+                    "stranded": len(fplan.stranded_push) + len(fplan.stranded_pull)
+                    + len(fplan.stranded_del_hub) + len(fplan.stranded_del_local),
+                    "mass_delete_held": len(fplan.mass_delete_held),
+                    "samples": {"a_to_b": fplan.push[:sample_n], "b_to_a": fplan.pull[:sample_n],
+                                "del_hub": fplan.del_hub[:sample_n], "del_local": fplan.del_local[:sample_n]},
+                }
+                if prog is not None:
+                    prog["profiles"][prof.name]["paths"][rel] = {"phase": "done", **pp["paths"][rel]}
+                    prog_write()
+                continue
             _, _, plan, changed = _plan_path(peer, plan_prof, rel, workers or prof.workers)
             a_items = [it for it in plan["a_to_b"] if it.get("path")]
             b_items = [it for it in plan["b_to_a"] if it.get("path")]
@@ -1230,9 +1267,13 @@ def run_profile(
     workers: int | None,
     log,
     progress: ProgressWriter | None = None,
+    control=None,
+    lease_id: str | None = None,
+    allow_mass_delete: bool = False,
 ) -> dict[str, Any]:
     """Index both sides, plan, and execute every path of one profile."""
     n_workers = workers or prof.workers
+    full_mode = isinstance(peer, Hub) and prof.mode == "full" and control is not None
     local_backup = str(Path("~/.fsync/backups").expanduser() / run_id / prof.name)
     remote_backup = remote_backup_for(peer, prof, run_id)
 
@@ -1277,6 +1318,25 @@ def run_profile(
 
         if progress:
             progress.path_phase(prof.name, rel, "indexing")
+
+        if full_mode:
+            # P7.2: three-way vs base with hub tombstones + journal (docs/hub-sync.md R32–R35)
+            pr = _run_path_full(control, peer, plan_prof, rel, key, n_workers, run_dir=run_dir,
+                                run_id=run_id, dry_run=dry_run, log=log, progress=progress,
+                                local_backup=local_backup, remote_backup=remote_backup,
+                                lease_id=lease_id, allow_mass_delete=allow_mass_delete)
+            pr["svn_guard"] = {"checked": guard["checked"], "skipped": guard["skipped"],
+                               "advisory": guard["advisory"], "parity": guard["parity"],
+                               "probe_warning": guard.get("probe_warning")}
+            pr["seconds"] = round(time.time() - started, 2)
+            result["paths"][rel] = pr
+            if progress:
+                progress.path_done(prof.name, rel, pr)
+            if pr["attention"] or guard["skipped"]:
+                result["status"] = "attention"
+            result["warnings"].extend(pr["warnings"])
+            continue
+
         local_root, remote_root, plan, changed_paths = _plan_path(peer, plan_prof, rel, n_workers)
 
         # Overwrite = a routed same-path/different-content file; exactly those
@@ -2717,8 +2777,13 @@ def _cmd_run(args) -> int:
         # Preview for a UI: JSON on stdout, no lock, nothing transferred.
         try:
             ensure_peer_engine(peer)
+            pv_control = None
+            if isinstance(peer, Hub):
+                from .hub import hub_control
+                pv_control = hub_control(peer, getattr(args, "config", None))
             preview = build_run_preview(peer, selected, workers=args.workers,
-                                        progress_path=getattr(args, "plan_progress", None))
+                                        progress_path=getattr(args, "plan_progress", None),
+                                        control=pv_control)
         except HomesyncError as e:
             print(f"error: {e}", file=sys.stderr)
             return 1
@@ -2829,6 +2894,7 @@ def _cmd_run(args) -> int:
                 res = _run_file_profile(
                     control, peer, prof, run_dir=run_dir, run_id=run_id,
                     dry_run=args.dry_run, workers=args.workers, log=log, progress=progress,
+                    allow_mass_delete=bool(getattr(args, "allow_mass_delete", False)),
                 )
                 report["profiles"][prof.name] = res
                 # ISSUE-010: a file profile's warnings (stale svn sender, resurrections,
@@ -2909,6 +2975,258 @@ def _cmd_run(args) -> int:
     return rc
 
 
+def _plan_full_path(control, peer: Peer, prof: Profile, rel: str, key: str, n_workers: int,
+                    *, allow_mass_delete: bool = False):
+    """Index locally, fetch the hub view (journal since the base, else full
+    state), classify (R32). Shared by the executing run and the preview."""
+    home = Path.home()
+    local_root = home if rel == "." else home / rel
+    remote_root = remote_root_for(peer, prof, rel)
+    idx = local_index(local_root, recursive=prof.recursive, exclude=prof.exclude, workers=n_workers)
+    L = {it["path"]: it for it in idx if it.get("path")}
+    base = tw.load_base(tw.base_path(prof.name, key))
+    live = tomb = None
+    head = 0
+    if base is not None:
+        j = control.journal(prof.name, base["seq"], prefix=rel)
+        if not j.get("indexed", True):
+            raise HomesyncError(f"hub profile '{prof.name}' is not indexed — run `fsync hub index` on the hub")
+        if j.get("complete"):
+            live, tomb = tw.hub_view_from_base(base)
+            tw.apply_journal(live, tomb, j.get("entries") or [], strip_prefix=rel)
+            head = int(j.get("seq") or 0)
+    if live is None:
+        st = control.state(prof.name, prefix=rel)
+        if not st.get("indexed", True):
+            raise HomesyncError(f"hub profile '{prof.name}' is not indexed — run `fsync hub index` on the hub")
+        live, tomb = tw.strip_state_prefix(st, rel)
+        head = int(st.get("seq") or 0)
+    plan = tw.classify(tw.converged_base(base), L, live, tomb,
+                       conflict=prof.conflict, merge_jsonl=prof.merge_jsonl)
+    root_missing = not local_root.is_dir()
+    if root_missing:
+        # an absent local root says nothing about deletes (new box, unmounted tree)
+        plan.del_hub = []
+    tw.apply_direction(plan, prof.direction)
+    tw.guard_mass_delete(plan, len(base["paths"]) if base else 0, allow=allow_mass_delete)
+    return local_root, remote_root, L, live, tomb, base, head, plan, root_missing
+
+
+def _move_to_backup(src: Path, backup_root: Path, relp: str) -> None:
+    dst = backup_root / relp
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        os.replace(src, dst)
+    except OSError:
+        import shutil
+        shutil.move(str(src), str(dst))
+
+
+def _run_path_full(control, peer: Peer, prof: Profile, rel: str, key: str, n_workers: int, *,
+                   run_dir: Path, run_id: str, dry_run: bool, log, progress, local_backup: str,
+                   remote_backup: str, lease_id: str | None,
+                   allow_mass_delete: bool) -> dict[str, Any]:
+    """One profile path in mode: full — plan, two rsync legs, local removals to
+    the backup dir, hub commit (puts verified there, dels → tombstones, holds),
+    then the new base. Anything that did not converge keeps its old base entry."""
+    local_root, remote_root, L, live, tomb, base, head, plan, root_missing = _plan_full_path(
+        control, peer, prof, rel, key, n_workers, allow_mass_delete=allow_mass_delete)
+    warnings: list[str] = []
+    host = _local_short_host()
+
+    # both-changed merge_jsonl → union merge locally, then push (as in v1)
+    merged: list[str] = []
+    would_merge: list[str] = []
+    merge_failed: list[str] = []
+    if plan.merge and dry_run:
+        would_merge = list(plan.merge)
+        if prof.direction in ("both", "push"):
+            plan.push.extend(plan.merge)
+    elif plan.merge:
+        if progress:
+            progress.path_phase(prof.name, rel, "merging")
+        for relp in plan.merge:
+            try:
+                proc = _ssh(peer, f"cat {shlex.quote(remote_root + '/' + relp)}")
+                if proc.returncode != 0:
+                    raise HomesyncError(proc.stderr.strip().splitlines()[-1]
+                                        if proc.stderr.strip() else f"cat rc={proc.returncode}")
+                local_file = local_root / relp
+                union = union_merge_jsonl(local_file.read_text(), proc.stdout)
+                bak = Path(local_backup) / relp
+                bak.parent.mkdir(parents=True, exist_ok=True)
+                bak.write_text(local_file.read_text())
+                tmp = local_file.with_suffix(local_file.suffix + ".fsync-merge")
+                tmp.write_text(union)
+                os.replace(tmp, local_file)
+                st = local_file.stat()
+                L[relp] = {"path": relp, "size": st.st_size, "mtime": st.st_mtime, "hash": None}
+                merged.append(relp)
+                if prof.direction in ("both", "push"):
+                    plan.push.append(relp)
+                    plan.overwrite_push.append(relp)
+            except (OSError, HomesyncError) as e:
+                merge_failed.append(relp)
+                log(f"  {prof.name}/{rel}: merge of {relp} failed ({e}) — left unresolved")
+
+    if progress:
+        progress.path_phase(prof.name, rel, "a_to_b", planned=len(plan.push))
+    leg_ab = run_rsync_leg(
+        plan.push, str(local_root), peer.spec(remote_root), remote_backup,
+        run_dir / prof.name / f"{key}.a_to_b.lst", dry_run=dry_run, overwrites=len(plan.overwrite_push),
+        on_progress=(lambda b, p_, fd, ft: progress.leg_progress(prof.name, rel, "a_to_b", b, p_, fd, ft))
+        if progress else None)
+    if progress:
+        progress.path_phase(prof.name, rel, "b_to_a", planned=len(plan.pull))
+    leg_ba = run_rsync_leg(
+        plan.pull, peer.spec(remote_root), str(local_root), local_backup,
+        run_dir / prof.name / f"{key}.b_to_a.lst", dry_run=dry_run, overwrites=len(plan.overwrite_pull),
+        on_progress=(lambda b, p_, fd, ft: progress.leg_progress(prof.name, rel, "b_to_a", b, p_, fd, ft))
+        if progress else None)
+
+    # hub tombstones → local backup dir (never rm)
+    deleted_local: list[str] = []
+    del_local_failed: list[str] = []
+    if plan.del_local and not dry_run:
+        if progress:
+            progress.path_phase(prof.name, rel, "deleting", planned=len(plan.del_local))
+        for relp in plan.del_local:
+            src = local_root / relp
+            try:
+                if src.is_file() or src.is_symlink():
+                    _move_to_backup(src, Path(local_backup), relp)
+                deleted_local.append(relp)
+            except OSError as e:
+                del_local_failed.append(relp)
+                warnings.append(f"{prof.name}/{rel}: could not move {relp} to the backup dir: {e}")
+
+    # verify pulls landed (size + mtime vs the hub view) before trusting them in the base
+    pulled_ok: set[str] = set()
+    pulled_failed: set[str] = set()
+    if not dry_run:
+        for relp in plan.pull:
+            h = live.get(relp)
+            try:
+                st = (local_root / relp).stat()
+                ok = h is not None and st.st_size == (h[0] if h[0] is not None else st.st_size) \
+                    and abs(st.st_mtime - float(h[1] or st.st_mtime)) <= tw.MTIME_TOLERANCE
+            except OSError:
+                ok = False
+            (pulled_ok if ok else pulled_failed).add(relp)
+
+    # commit to the hub
+    commit: dict[str, Any] = {"seq_to": head, "accepted_puts": [], "accepted_dels": [], "rejected": []}
+    if not dry_run:
+        puts = [{"path": tw.hub_path(rel, p_), "size": L[p_].get("size"), "mtime": L[p_].get("mtime"),
+                 "hash": L[p_].get("hash")} for p_ in plan.push if p_ in L]
+        dels = [{"path": tw.hub_path(rel, p_), "hash": (base or {}).get("paths", {}).get(p_, [None, None, None])[2]
+                 if base else None} for p_ in plan.del_hub]
+        holds = [{**c, "path": tw.hub_path(rel, c["path"])} for c in plan.conflicts]
+        if puts or dels or holds or base is None or head != (base or {}).get("seq"):
+            commit = control.commit(prof.name, host, run_id, lease_id, puts, dels, holds)
+    pre = rel.rstrip("/") + "/" if rel != "." else ""
+    strip = lambda hp: hp[len(pre):] if pre and hp.startswith(pre) else hp  # noqa: E731
+    accepted_puts = {strip(x) for x in commit.get("accepted_puts", [])}
+    accepted_dels = {strip(x) for x in commit.get("accepted_dels", [])}
+    rejected = [{"path": strip(r["path"]), "reason": r["reason"]} for r in commit.get("rejected", [])]
+    rejected_puts = {r["path"] for r in rejected if r["path"] in set(plan.push)}
+    rejected_dels = {r["path"] for r in rejected if r["path"] in set(plan.del_hub)}
+    if pulled_failed:
+        warnings.append(f"{prof.name}/{rel}: {len(pulled_failed)} pulled file(s) did not verify — "
+                        f"re-pulled next run: " + ", ".join(sorted(pulled_failed)[:5]))
+    if rejected:
+        warnings.append(f"{prof.name}/{rel}: hub rejected {len(rejected)} change(s) — retried next run: "
+                        + ", ".join(f"{r['path']} ({r['reason']})" for r in rejected[:5]))
+    if plan.mass_delete_held:
+        warnings.append(f"{prof.name}/{rel}: {len(plan.mass_delete_held)} local deletion(s) HELD by the "
+                        f"mass-delete guard (≥{tw.MASS_DELETE_MIN} and ≥{int(tw.MASS_DELETE_FRACTION * 100)}% "
+                        f"of the base) — re-run with --allow-mass-delete if intended")
+    if plan.conflicts:
+        warnings.append(f"{prof.name}/{rel}: {len(plan.conflicts)} conflict(s) HELD on the hub "
+                        f"(conflict: review) — `fsync hub holds`")
+    if root_missing and (base or {}).get("paths"):
+        warnings.append(f"{prof.name}/{rel}: local root absent — no deletions derived this run")
+
+    # new base = hub view as of seq_to (+ overrides for what did not converge)
+    overrides: dict = {}
+    if not dry_run:
+        unresolved = (set(plan.stranded_push) | set(plan.stranded_pull) | set(plan.stranded_del_hub)
+                      | set(plan.stranded_del_local) | set(plan.mass_delete_held) | set(merge_failed)
+                      | set(del_local_failed) | {c["path"] for c in plan.conflicts})
+        new_base, overrides = tw.next_base(
+            live, L, tw.converged_base(base),
+            accepted_puts=accepted_puts, rejected_puts=rejected_puts,
+            accepted_dels=accepted_dels, rejected_dels=rejected_dels,
+            pulled_ok=pulled_ok, pulled_failed=pulled_failed,
+            deleted_local=set(deleted_local), unresolved=unresolved)
+        new_tomb = {p_: list(v) for p_, v in tomb.items() if p_ not in new_base}
+        seq_to = int(commit.get("seq_to") or head)
+        for p_ in accepted_dels:
+            new_tomb[p_] = [time.time(), seq_to]
+        tw.save_base(tw.base_path(prof.name, key), seq_to, new_base, run_id, tombstones=new_tomb,
+                     overrides=overrides)
+
+    stranded = (plan.stranded_push + plan.stranded_pull + plan.stranded_del_hub + plan.stranded_del_local)
+    if plan.conflicts:
+        cf = run_dir / prof.name / f"{key}.conflicts.json"
+        cf.parent.mkdir(parents=True, exist_ok=True)
+        cf.write_text(json.dumps(plan.conflicts, indent=2))
+    if deleted_local or plan.del_hub or plan.mass_delete_held:
+        lst = run_dir / prof.name / f"{key}.deletes.lst"
+        lst.parent.mkdir(parents=True, exist_ok=True)
+        lst.write_text("".join(f"local\t{p_}\n" for p_ in deleted_local)
+                       + "".join(f"hub\t{p_}\n" for p_ in plan.del_hub)
+                       + "".join(f"held\t{p_}\n" for p_ in plan.mass_delete_held))
+    attention = bool(stranded or plan.conflicts or plan.mass_delete_held or rejected or pulled_failed
+                     or merge_failed or del_local_failed)
+    log(f"  {prof.name}/{rel}: push {len(plan.push)}"
+        + (f" ({len(plan.overwrite_push)} overwrite->backup)" if plan.overwrite_push else "")
+        + f", pull {len(plan.pull)}"
+        + (f" ({len(plan.overwrite_pull)} overwrite->backup)" if plan.overwrite_pull else "")
+        + (f", del→hub {len(plan.del_hub)}" if plan.del_hub else "")
+        + (f", del←hub {len(deleted_local) if not dry_run else len(plan.del_local)}" if plan.del_local else "")
+        + (f", held {len(plan.conflicts)}" if plan.conflicts else "")
+        + (f", merged {len(merged)}" if merged else "")
+        + (f", would merge {len(would_merge)}" if would_merge else "")
+        + f", identical {plan.noop}"
+        + (f", {prof.direction}-only ({len(stranded)} STRANDED)" if stranded else "")
+        + (f", MASS-DELETE HELD {len(plan.mass_delete_held)}" if plan.mass_delete_held else "")
+        + (f", rejected {len(rejected)}" if rejected else "")
+        + f" [seq {commit.get('seq_to', head)}]")
+    for w in warnings:
+        log(f"  ! {w}")
+    return {
+        "mode": "full",
+        "a_to_b": leg_ab, "b_to_a": leg_ba,
+        "direction": prof.direction,
+        "merged": merged, "would_merge": would_merge,
+        "skipped_by_direction": len(stranded),
+        "stranded": stranded[:STRANDED_SAMPLE],
+        "stranded_truncated": len(stranded) > STRANDED_SAMPLE,
+        "stranded_side": "hub" if prof.direction == "push" else "local",
+        "stranded_only_on_side": len(plan.stranded_push) + len(plan.stranded_pull),
+        "stranded_newer_on_side": 0,
+        "conflicts": len(plan.conflicts),
+        "renames_pending": 0, "renames_demoted": 0,
+        "identical": plan.noop,
+        "deleted_local": deleted_local[:STRANDED_SAMPLE] if not dry_run else plan.del_local[:STRANDED_SAMPLE],
+        "deleted_local_count": len(deleted_local) if not dry_run else len(plan.del_local),
+        "deleted_hub": plan.del_hub[:STRANDED_SAMPLE], "deleted_hub_count": len(plan.del_hub),
+        "introductions": len(plan.introductions), "revived": plan.revived[:STRANDED_SAMPLE],
+        "mass_delete_held": plan.mass_delete_held[:STRANDED_SAMPLE],
+        "mass_delete_held_count": len(plan.mass_delete_held),
+        "rejected": rejected[:STRANDED_SAMPLE], "pull_failed": sorted(pulled_failed)[:STRANDED_SAMPLE],
+        "base_seq": (base or {}).get("seq"), "seq": commit.get("seq_to", head),
+        "unconverged": len(overrides) if not dry_run else None,
+        "first_run": base is None,
+        "untracked_introductions": {"on_peer": [], "on_local": [], "count": 0, "truncated": False},
+        "resurrected": {"on_peer": [], "on_local": [], "count": 0, "truncated": False, "list": None,
+                        "baseline": {"peer": True, "local": True}},
+        "attention": attention,
+        "warnings": warnings,
+    }
+
+
 def _run_summary(res: dict[str, Any], dry_run: bool) -> dict[str, Any]:
     """What the hub remembers about a spoke's run (R41): enough for
     `fsync hub status` to say which box moved what, and when."""
@@ -2917,12 +3235,15 @@ def _run_summary(res: dict[str, Any], dry_run: bool) -> dict[str, Any]:
         up += (pr.get("a_to_b") or {}).get("files_transferred", 0)
         down += (pr.get("b_to_a") or {}).get("files_transferred", 0)
         conflicts += pr.get("conflicts", 0)
+    deleted = sum((pr.get("deleted_local_count") or 0) + (pr.get("deleted_hub_count") or 0)
+                  for pr in (res.get("paths") or {}).values())
     return {"status": res.get("status"), "pushed": up, "pulled": down, "conflicts": conflicts,
-            "dry_run": dry_run, "fsync": FSYNC_VERSION}
+            "deleted": deleted, "dry_run": dry_run, "fsync": FSYNC_VERSION}
 
 
 def _run_file_profile(control, peer: Peer, prof: Profile, *, run_dir: Path, run_id: str,
-                      dry_run: bool, workers: int | None, log, progress) -> dict[str, Any]:
+                      dry_run: bool, workers: int | None, log, progress,
+                      allow_mass_delete: bool = False) -> dict[str, Any]:
     """``run_profile`` under the hub's per-profile lease (P7.1, R36/R41); a
     plain pass-through for a v1 peer. A lease held elsewhere defers THIS
     profile (reported, exit 0 — the next run picks it up); the hub's control
@@ -2937,7 +3258,8 @@ def _run_file_profile(control, peer: Peer, prof: Profile, *, run_dir: Path, run_
     try:
         with control.lease(prof.name, host, run_id) as lease:
             res = run_profile(peer, prof, run_dir=run_dir, run_id=run_id, dry_run=dry_run,
-                              workers=workers, log=log, progress=progress)
+                              workers=workers, log=log, progress=progress, control=control,
+                              lease_id=lease.lease_id, allow_mass_delete=allow_mass_delete)
     except LeaseHeld as e:
         log(f"  {prof.name}: {e} — deferring this profile")
         return {"conflict": prof.conflict, "paths": {}, "status": "deferred",

@@ -160,7 +160,7 @@ flowchart LR
 - **Loopback** API on the hub is token-gated (0600 file) for the hub's own tools; spokes come in
   on the mTLS port with a client cert, no token.
 
-## 6. Three-way reconcile (P7.2, designed, not shipped)
+## 6. Three-way reconcile (P7.2, shipped in 0.9.0)
 
 Each spoke keeps the hub state it last converged to (the *base*). Classification per path:
 
@@ -182,8 +182,11 @@ flowchart TD
 
 With the hub **journal** (`seq, profile, path, op, hash, origin, ts`) and a **cursor** per spoke,
 "what did I miss while away for four days" is one query, replayed once. Tombstones make deletes
-and renames first-class, reversible (backup, never `rm`). This is what retires today's one-way
-profiles and the `git-bundles` / `svn-snapshots` carrier profiles.
+and renames first-class, reversible (backup, never `rm`). Guards: a **mass-delete guard** holds
+≥ 500 / ≥ 20 % local deletions until `--allow-mass-delete`; the hub **verifies** every put against
+its tree before journaling; a spoke refuses `mode: full` against a profile the hub has not indexed.
+`direction:` remains a routing filter per profile until you flip it to `both`. The `git-bundles` /
+`svn-snapshots` carriers go in P7.3.
 
 ## 7. Phases
 
@@ -196,11 +199,11 @@ gantt
     du + decisions (41 GB, hub = files4dx)      :done, p70, 2026-11-08, 1d
     section P7.1 star, additive
     code 0.8.0 (Hub, leases, routes, CLI)       :done, p71, 2026-11-08, 1d
-    cutover: install on files4dx, trust, seed   :active, p71c, 2026-11-09, 3d
+    cutover: install on files4dx, trust, seed   :done, p71c, 2026-11-08, 1d
     section P7.2 state
-    tombstones, journal, cursors, 3-way         :p72, after p71c, 10d
+    tombstones, journal, cursors, 3-way (0.9.0) :done, p72, 2026-11-08, 1d
     section P7.3 kinds
-    git/svn hub stores, self-update             :p73, after p72, 7d
+    git/svn hub stores, self-update             :p73, 2026-11-09, 7d
 ```
 
 ## 8. Benefits, in one table

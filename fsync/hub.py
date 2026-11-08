@@ -99,6 +99,10 @@ def hub_init(hub: Hub, profiles: dict[str, hs.Profile]) -> dict[str, Any]:
         tree.mkdir(parents=True, exist_ok=True)
     (root / "backups").mkdir(parents=True, exist_ok=True)
     state = HubState(root / "state.sqlite")
+    # a tree created empty right now IS indexed (nothing in it); a pre-existing
+    # tree needs `fsync hub index` before spokes may run mode: full against it
+    for name in created:
+        state.mark_indexed(name)
     state.close()
     marker = root / "hub.json"
     info = {"host": hub.host, "root": str(root), "created": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
@@ -127,28 +131,41 @@ def _age(seconds: float | int | None) -> str:
 
 def render_status(hub: Hub, st: dict[str, Any], profiles: dict[str, hs.Profile]) -> str:
     """Human view of `fsync hub status`: one line per file profile — who holds
-    its lease, and each spoke's last run (age, outcome, files up/down)."""
+    its lease, the hub's head seq / live / tombstones / holds, and each spoke's
+    last run (age, outcome, files up/down, cursor vs head)."""
     now = st.get("now") or time.time()
     lines = [f"{hub.label}  root {hub.root}"]
     names = sorted(set(p.name for p in profiles.values() if p.kind == "files")
                    | set(st.get("profiles") or {}))
     width = max([len(n) for n in names] + [7])
-    lines.append(f"{'profile':<{width}}  {'lease':<28}  spokes (last run)")
+    lines.append(f"{'profile':<{width}}  {'lease':<22}  {'hub state':<30}  spokes (last run)")
     for name in names:
         row = (st.get("profiles") or {}).get(name) or {}
         lease = row.get("lease")
         lease_s = (f"{lease['host']} ({int(lease['expires'] - now)}s left)" if lease else "—")
+        if row.get("indexed"):
+            hub_s = (f"seq {row.get('seq', 0)} · {row.get('live', 0)} live"
+                     + (f" · {row['tombstones']} tomb" if row.get("tombstones") else "")
+                     + (f" · {row['holds']} HELD" if row.get("holds") else ""))
+        else:
+            hub_s = "not indexed (additive only)"
         spokes = row.get("spokes") or {}
+        cursors = row.get("cursors") or {}
         if not spokes:
             spokes_s = "no spoke has synced this yet"
         else:
             parts = []
             for host, e in sorted(spokes.items()):
                 sm = e.get("summary") or {}
+                cur = cursors.get(host)
+                behind = ""
+                if cur is not None and row.get("seq") is not None:
+                    gap = int(row["seq"]) - int(cur["last_seq"])
+                    behind = f" @{cur['last_seq']}" + (f" (−{gap})" if gap > 0 else "")
                 parts.append(f"{host} {_age(e.get('age_s'))} {sm.get('status', '?')}"
-                             f" {sm.get('pushed', 0)}↑ {sm.get('pulled', 0)}↓")
+                             f" {sm.get('pushed', 0)}↑ {sm.get('pulled', 0)}↓{behind}")
             spokes_s = " · ".join(parts)
-        lines.append(f"{name:<{width}}  {lease_s:<28}  {spokes_s}")
+        lines.append(f"{name:<{width}}  {lease_s:<22}  {hub_s:<30}  {spokes_s}")
     hosts = st.get("hosts") or {}
     if hosts:
         lines.append("")
@@ -208,5 +225,94 @@ def cmd_hub(args: argparse.Namespace) -> int:
             print(render_status(hub, st, profiles))
         return 0
 
-    print("usage: fsync hub {init,status}", file=sys.stderr)
+    if args.hub_cmd == "index":
+        if not hub.local:
+            print(f"error: `fsync hub index` runs on the hub box ({hub.host})", file=sys.stderr)
+            return 2
+        root = Path(hs.hub_root(hub))
+        state = HubState(root / "state.sqlite")
+        only = set(getattr(args, "profile", None) or [])
+        rc = 0
+        for prof in profiles.values():
+            if prof.kind != "files" or (only and prof.name not in only):
+                continue
+            tree = root / prof.name / "tree"
+            if not tree.is_dir():
+                print(f"{prof.name}: no tree at {tree} — run `fsync hub init`", file=sys.stderr)
+                rc = 1
+                continue
+            t0 = time.time()
+            records = hs.local_index(tree, recursive=True, exclude=[], workers=int(getattr(args, "workers", 8) or 8))
+            res = state.index_tree(prof.name, records)
+            print(f"{prof.name:15} {len(records):7} files  +{res['added']} ~{res['changed']} "
+                  f"-{res['tombstoned']} ={res['unchanged']}  seq {res['seq']}  [{time.time() - t0:.1f}s]",
+                  file=sys.stderr)
+        state.close()
+        return rc
+
+    if args.hub_cmd == "gc":
+        if not hub.local:
+            print(f"error: `fsync hub gc` runs on the hub box ({hub.host})", file=sys.stderr)
+            return 2
+        root = Path(hs.hub_root(hub))
+        ret = hub.retention or {}
+        t_days = _days(ret.get("tombstones"), 90)
+        b_days = _days(ret.get("backups"), 60)
+        dry = bool(getattr(args, "dry_run", False))
+        state = HubState(root / "state.sqlite")
+        res = state.gc(tombstone_days=t_days, journal_days=t_days, dry_run=dry)
+        state.close()
+        cutoff = time.time() - b_days * 86400
+        old_runs = [d for d in sorted((root / "backups").glob("*")) if d.is_dir() and d.stat().st_mtime < cutoff]
+        if not dry:
+            import shutil
+            for d in old_runs:
+                shutil.rmtree(d, ignore_errors=True)
+        verb = "would remove" if dry else "removed"
+        print(f"{verb}: {res['tombstones']} tombstone(s) + {res['journal']} journal row(s) older than "
+              f"{t_days:g}d, {len(old_runs)} backup run dir(s) older than {b_days:g}d", file=sys.stderr)
+        return 0
+
+    if args.hub_cmd == "holds":
+        rel = getattr(args, "release", None)
+        if rel:
+            if not hub.local:
+                print("error: releasing a hold runs on the hub box", file=sys.stderr)
+                return 2
+            state = HubState(Path(hs.hub_root(hub)) / "state.sqlite")
+            ok = state.release_hold(rel[0], rel[1])
+            state.close()
+            print(("released" if ok else "no such hold") + f": {rel[0]} {rel[1]}", file=sys.stderr)
+            return 0 if ok else 1
+        try:
+            holds = hub_control(hub, config_path).holds()
+        except Exception as e:  # noqa: BLE001
+            print(f"error: hub control plane: {e}", file=sys.stderr)
+            return 1
+        if getattr(args, "json", False):
+            print(json.dumps(holds, indent=2))
+        elif not holds:
+            print("no holds", file=sys.stderr)
+        else:
+            for h in holds:
+                print(f"{h['profile']}  {h['path']}  from {h.get('incoming_origin')}  since "
+                      f"{time.strftime('%Y-%m-%d %H:%M', time.localtime(h['since']))}")
+        return 0
+
+    print("usage: fsync hub {init,status,index,gc,holds}", file=sys.stderr)
     return 2
+
+
+def _days(spec: Any, default: float) -> float:
+    """'90d' / '12h' / 30 → days."""
+    if spec is None:
+        return default
+    try:
+        s = str(spec).strip().lower()
+        if s.endswith("d"):
+            return float(s[:-1])
+        if s.endswith("h"):
+            return float(s[:-1]) / 24
+        return float(s)
+    except ValueError:
+        return default

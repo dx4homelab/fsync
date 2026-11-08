@@ -140,6 +140,31 @@ class HubClient:
         self._request("POST", f"/v1/hub/{urllib.parse.quote(profile, safe='')}/runs",
                       {"host": host, "run_id": run_id, "summary": summary})
 
+    # P7.2
+    def state(self, profile: str, prefix: str = "") -> dict:
+        return self._request("GET", f"/v1/hub/{urllib.parse.quote(profile, safe='')}/state",
+                             params={"prefix": prefix or None})
+
+    def journal(self, profile: str, since: int, prefix: str = "") -> dict:
+        return self._request("GET", f"/v1/hub/{urllib.parse.quote(profile, safe='')}/journal",
+                             params={"since": since, "prefix": prefix or None})
+
+    def commit(self, profile: str, host: str, run_id: str, lease_id: str | None,
+               puts: list[dict], dels: list[dict], holds: list[dict]) -> dict:
+        try:
+            return self._request("POST", f"/v1/hub/{urllib.parse.quote(profile, safe='')}/commit",
+                                 {"host": host, "run_id": run_id, "lease_id": lease_id,
+                                  "puts": puts, "dels": dels, "holds": holds})
+        except HubApiError as e:
+            if e.status == 410:
+                raise LeaseLost(e.detail) from None
+            raise
+
+    def holds(self, profile: str | None = None) -> list[dict]:
+        path = (f"/v1/hub/{urllib.parse.quote(profile, safe='')}/holds" if profile
+                else "/v1/hub/holds")
+        return self._request("GET", path) or []
+
 
 def _held_fields(detail: str) -> tuple[str, str | None, float]:
     """The 409 body is JSON {holder, run_id, expires} when the hub produced it;
@@ -169,3 +194,15 @@ class RemoteHubControl(HubControl):
 
     def status(self):
         return self.client.status()
+
+    def state(self, profile, prefix=""):
+        return self.client.state(profile, prefix)
+
+    def journal(self, profile, since, prefix=""):
+        return self.client.journal(profile, since, prefix)
+
+    def commit(self, profile, host, run_id, lease_id, puts, dels, holds):
+        return self.client.commit(profile, host, run_id, lease_id, puts, dels, holds)
+
+    def holds(self, profile=None):
+        return self.client.holds(profile)

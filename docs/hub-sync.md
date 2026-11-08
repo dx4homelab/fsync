@@ -368,6 +368,36 @@ Deviations from the draft above, on purpose:
   tree has `.svn` excluded), so the guard reports only. The durable answer stays `svn` profile
   `apply: auto` (file profiles skip the checkouts).
 
+### P7.2 — shipped in fsync 0.9.0 (2026-11-08), feature flag `hub-full`
+
+| Piece | What landed |
+|---|---|
+| `hubstate.py` (schema 2) | `paths` (live rows + tombstones), `journal` (put/del/hold, global seq), `cursors`, `holds`; `commit()` verifies every put against the tree (size + mtime) before journaling, moves deleted tree files to `<root>/backups/<run>/<profile>` (never rm), refuses a stale lease; `index_tree()` bootstraps/repairs the table from a tree index and marks the profile *indexed*; `gc()` compacts tombstones + journal past retention and records a per-profile journal floor; `state()` / `journal_since()` (prefix-scoped, compact lists) |
+| `threeway.py` | pure classifier for the R32 table (first run, both-changed, delete-vs-edit, tombstone-vs-recreate by mtime, `merge_jsonl`, `review`), direction as a routing filter, **mass-delete guard**, the base file (`~/.fsync/base/<profile>/<key>.json.gz` = hub view at seq + tombstones + *converged overrides*) |
+| `homesync.py` | `Profile.mode` (`full` default under a hub, `additive` escape hatch); `_run_path_full`: journal-since-base (or full state) → classify → push/pull legs → local removals to the backup dir → hub commit → pull verification → new base; preview uses the same planner; `--allow-mass-delete` |
+| `daemon.py` / `hubclient.py` | `GET …/state`, `GET …/journal?since=`, `POST …/commit`, `GET …/holds`, `GET /v1/hub/holds`; status carries head seq, live/tombstone counts, holds and per-spoke cursors |
+| `hub.py` | `fsync hub index [--profile]`, `fsync hub gc [--dry-run]`, `fsync hub holds [--release P PATH]`; status shows `seq · live · tomb · HELD` and each spoke's cursor gap |
+| `tests/test_hub_p72.py` | 13 tests: the classifier table row by row, commit verification/rejections/tombstones/holds, index + gc + journal floor, and the acceptance scenario on one box — delete on A → gone on B and C with backups; re-create on B → everywhere (revived); both-changed → newer wins, loser backed up on exactly one box; laptop away for 50 changes replays once and the cursor advances once; pull-only never pushes or tombstones; `review` holds on the hub; the mass-delete guard; refusal against an unindexed hub; dry-run and preview |
+
+Design notes beyond the draft:
+
+- **The base is two things.** The hub's exact view at `seq` (so the journal can be replayed on top)
+  plus *overrides* for paths the run did not converge (held, stranded, rejected, failed pull):
+  the classifier's B uses the override, the replay uses the view. Without the split a held
+  conflict looked like "local changed only" one run later and would have pushed over the hub.
+- **Tombstones ride in the base** so a re-creation is recognised as a revival and judged against
+  the delete's timestamp even after the journal compacted.
+- **Mass-delete guard.** ≥ 500 local deletions that are also ≥ 20 % of the base are held
+  (reported, `status: attention`); `--allow-mass-delete` applies them. An absent local root never
+  derives deletions at all. This is the `rsync --max-delete` of the hub world.
+- **Direction stays a routing filter** (push-only never pulls or removes locally, pull-only never
+  pushes or tombstones; withheld actions are `stranded`). Flip a profile to `both` when its boxes
+  should all edit — the resurrection reason for one-way is gone in `mode: full`.
+- **A hub profile must be indexed** before spokes may run `mode: full` against it (`hub init` marks
+  trees it created empty; a tree that predates P7.2 needs `fsync hub index`). Otherwise every
+  spoke would re-push the world as "introductions". The spoke refuses with a clear error.
+- `kind: git` / `kind: svn` carriers are untouched (P7.3). `fsync sync folder` still refuses hubs.
+
 ### Cutover — EXECUTED 2026-11-08 (hub = files4dx, three spokes live)
 
 Operator steps (refused to the automation, done by hand): firewalld `7446/tcp` on files4dx,

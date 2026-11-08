@@ -27,8 +27,11 @@ import time
 from pathlib import Path
 from typing import Any
 
-SCHEMA_VERSION = 1
-DEFAULT_LEASE_TTL = 900          # seconds; renewed at TTL/3 while a profile runs
+SCHEMA_VERSION = 2
+DEFAULT_LEASE_TTL = 900
+MTIME_TOLERANCE = 1.0            # seconds; rsync -a preserves mtimes, filesystems round
+INDEXED_KEY = "indexed:"         # meta key prefix: profile has an authoritative paths table
+JOURNAL_FLOOR_KEY = "journal_floor:"  # meta key prefix: highest seq removed by gc          # seconds; renewed at TTL/3 while a profile runs
 MIN_LEASE_TTL = 30
 MAX_LEASE_TTL = 6 * 3600
 
@@ -94,8 +97,51 @@ class HubState:
                     summary  TEXT NOT NULL,
                     PRIMARY KEY (host, profile)
                 );
+                -- P7.2 (R32-R35): the hub's view of every path, the change journal,
+                -- per-spoke cursors and conflict: review holds.
+                CREATE TABLE IF NOT EXISTS paths (
+                    profile    TEXT NOT NULL,
+                    path       TEXT NOT NULL,
+                    hash       TEXT,
+                    size       INTEGER,
+                    mtime      REAL,
+                    seq        INTEGER NOT NULL,
+                    origin     TEXT,
+                    deleted_at REAL,                  -- NULL = live, else a tombstone (R33)
+                    PRIMARY KEY (profile, path)
+                );
+                CREATE TABLE IF NOT EXISTS journal (
+                    seq     INTEGER PRIMARY KEY AUTOINCREMENT,
+                    profile TEXT NOT NULL,
+                    path    TEXT NOT NULL,
+                    op      TEXT NOT NULL,            -- put | del | hold
+                    hash    TEXT,
+                    size    INTEGER,
+                    mtime   REAL,
+                    origin  TEXT,
+                    ts      REAL NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS journal_profile_seq ON journal (profile, seq);
+                CREATE TABLE IF NOT EXISTS cursors (
+                    host        TEXT NOT NULL,
+                    profile     TEXT NOT NULL,
+                    last_seq    INTEGER NOT NULL,
+                    last_run_id TEXT,
+                    last_seen   REAL NOT NULL,
+                    PRIMARY KEY (host, profile)
+                );
+                CREATE TABLE IF NOT EXISTS holds (
+                    profile         TEXT NOT NULL,
+                    path            TEXT NOT NULL,
+                    hub_hash        TEXT,
+                    incoming_hash   TEXT,
+                    incoming_origin TEXT,
+                    incoming_mtime  REAL,
+                    since           REAL NOT NULL,
+                    PRIMARY KEY (profile, path)
+                );
             """)
-            self._conn.execute("INSERT OR IGNORE INTO meta(key, value) VALUES ('schema', ?)",
+            self._conn.execute("INSERT OR REPLACE INTO meta(key, value) VALUES ('schema', ?)",
                                (str(SCHEMA_VERSION),))
             self._conn.execute("INSERT OR IGNORE INTO meta(key, value) VALUES ('created', ?)",
                                (str(time.time()),))
@@ -194,6 +240,262 @@ class HubState:
                 "run_id=excluded.run_id, finished=excluded.finished, summary=excluded.summary",
                 (host, profile, run_id, now, json.dumps(summary, sort_keys=True)))
 
+    # ------------------------------------------------------- paths / journal
+
+    def _meta_get(self, key: str) -> str | None:
+        row = self._conn.execute("SELECT value FROM meta WHERE key = ?", (key,)).fetchone()
+        return row["value"] if row else None
+
+    def _meta_set(self, c, key: str, value: str) -> None:
+        c.execute("INSERT INTO meta(key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET "
+                  "value = excluded.value", (key, value))
+
+    def is_indexed(self, profile: str) -> bool:
+        """True once the profile's paths table is authoritative (`hub init` on an
+        empty tree, or `hub index` over an existing one). A spoke refuses a
+        full-mode run against an unindexed profile — it would re-push the world."""
+        return self._meta_get(INDEXED_KEY + profile) is not None
+
+    def mark_indexed(self, profile: str, now: float | None = None) -> None:
+        with self._tx() as c:
+            self._meta_set(c, INDEXED_KEY + profile, str(now or time.time()))
+
+    def head_seq(self, profile: str) -> int:
+        row = self._conn.execute("SELECT MAX(seq) AS s FROM journal WHERE profile = ?",
+                                 (profile,)).fetchone()
+        return int(row["s"] or 0)
+
+    def journal_floor(self, profile: str) -> int:
+        """Highest seq gc has removed for this profile (0 = journal complete)."""
+        v = self._meta_get(JOURNAL_FLOOR_KEY + profile)
+        return int(v) if v else 0
+
+    def state(self, profile: str, prefix: str = "") -> dict[str, Any]:
+        """Current hub view of ``profile`` under ``prefix`` — compact lists so a
+        100k-path profile stays a few MB: live ``paths[p] = [size, mtime, hash, seq]``,
+        ``tombstones[p] = [deleted_at, seq]``."""
+        like = prefix.rstrip("/") + "/%" if prefix and prefix != "." else "%"
+        live: dict[str, list] = {}
+        tomb: dict[str, list] = {}
+        for r in self._conn.execute(
+                "SELECT path, hash, size, mtime, seq, deleted_at FROM paths "
+                "WHERE profile = ? AND path LIKE ?", (profile, like)):
+            if r["deleted_at"] is None:
+                live[r["path"]] = [r["size"], r["mtime"], r["hash"], r["seq"]]
+            else:
+                tomb[r["path"]] = [r["deleted_at"], r["seq"]]
+        return {"profile": profile, "prefix": prefix, "seq": self.head_seq(profile),
+                "indexed": self.is_indexed(profile), "paths": live, "tombstones": tomb}
+
+    def journal_since(self, profile: str, since: int, prefix: str = "",
+                      limit: int = 200000) -> dict[str, Any]:
+        """Entries after ``since`` (R34). ``complete`` is False when gc removed
+        entries the caller has not seen — then it must fall back to ``state``."""
+        like = prefix.rstrip("/") + "/%" if prefix and prefix != "." else "%"
+        rows = self._conn.execute(
+            "SELECT seq, path, op, hash, size, mtime, origin, ts FROM journal "
+            "WHERE profile = ? AND seq > ? AND path LIKE ? ORDER BY seq LIMIT ?",
+            (profile, since, like, limit)).fetchall()
+        entries = [[r["seq"], r["path"], r["op"], r["hash"], r["size"], r["mtime"], r["origin"], r["ts"]]
+                   for r in rows]
+        head = self.head_seq(profile)
+        return {"profile": profile, "since": since, "seq": head, "entries": entries,
+                "complete": since >= self.journal_floor(profile) and len(entries) < limit,
+                "indexed": self.is_indexed(profile)}
+
+    def cursors(self) -> dict[str, dict[str, dict[str, Any]]]:
+        out: dict[str, dict[str, dict[str, Any]]] = {}
+        for r in self._conn.execute("SELECT * FROM cursors"):
+            out.setdefault(r["profile"], {})[r["host"]] = {
+                "last_seq": r["last_seq"], "last_run_id": r["last_run_id"], "last_seen": r["last_seen"]}
+        return out
+
+    def holds(self, profile: str | None = None) -> list[dict[str, Any]]:
+        q = "SELECT * FROM holds" + (" WHERE profile = ?" if profile else "") + " ORDER BY profile, path"
+        rows = self._conn.execute(q, (profile,) if profile else ()).fetchall()
+        return [dict(r) for r in rows]
+
+    def release_hold(self, profile: str, path: str) -> bool:
+        with self._tx() as c:
+            return c.execute("DELETE FROM holds WHERE profile = ? AND path = ?",
+                             (profile, path)).rowcount > 0
+
+    def _journal(self, c, profile: str, path: str, op: str, hash_: str | None, size: int | None,
+                 mtime: float | None, origin: str, now: float) -> int:
+        cur = c.execute("INSERT INTO journal(profile, path, op, hash, size, mtime, origin, ts) "
+                        "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                        (profile, path, op, hash_, size, mtime, origin, now))
+        return int(cur.lastrowid)
+
+    def _upsert_path(self, c, profile: str, path: str, hash_: str | None, size: int | None,
+                     mtime: float | None, seq: int, origin: str, deleted_at: float | None) -> None:
+        c.execute("INSERT INTO paths(profile, path, hash, size, mtime, seq, origin, deleted_at) "
+                  "VALUES (?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(profile, path) DO UPDATE SET "
+                  "hash=excluded.hash, size=excluded.size, mtime=excluded.mtime, seq=excluded.seq, "
+                  "origin=excluded.origin, deleted_at=excluded.deleted_at",
+                  (profile, path, hash_, size, mtime, seq, origin, deleted_at))
+
+    def commit(self, profile: str, host: str, run_id: str, lease_id: str | None,
+               puts: list[dict], dels: list[dict], holds: list[dict], *,
+               tree_root: Path, backup_dir: Path, now: float | None = None) -> dict[str, Any]:
+        """Accept a spoke's finished transfer into the hub's state (R33/R34/R35).
+
+        ``puts`` were rsync'd into ``tree_root`` already: each is verified against
+        the file (size, mtime within tolerance) before it is journaled — a
+        mismatch is ``rejected`` and the spoke re-plans it next run. ``dels`` move
+        the tree file to ``backup_dir`` (never rm) and become tombstones. ``holds``
+        record a conflict the spoke's policy refused to resolve. The caller's
+        lease must be current when one is given (the hub box's own tools pass
+        None). Returns the new head seq."""
+        now = now or time.time()
+        rejected: list[dict[str, str]] = []
+        accepted_puts: list[str] = []
+        accepted_dels: list[str] = []
+        moved: list[tuple[Path, Path]] = []
+        # file work first (outside the transaction): a failed move is a rejection,
+        # not a half-recorded tombstone
+        del_ok: list[dict] = []
+        for d in dels:
+            path = str(d.get("path") or "")
+            if not path or path.startswith("/") or ".." in path.split("/"):
+                rejected.append({"path": path, "reason": "bad path"})
+                continue
+            src = tree_root / path
+            if src.is_file() or src.is_symlink():
+                dst = backup_dir / path
+                try:
+                    dst.parent.mkdir(parents=True, exist_ok=True)
+                    try:
+                        src.replace(dst)
+                    except OSError:
+                        import shutil
+                        shutil.move(str(src), str(dst))
+                    moved.append((src, dst))
+                except OSError as e:
+                    rejected.append({"path": path, "reason": f"backup move failed: {e}"})
+                    continue
+            del_ok.append(d)
+        put_ok: list[dict] = []
+        for p in puts:
+            path = str(p.get("path") or "")
+            if not path or path.startswith("/") or ".." in path.split("/"):
+                rejected.append({"path": path, "reason": "bad path"})
+                continue
+            f = tree_root / path
+            try:
+                st = f.stat()
+            except OSError:
+                rejected.append({"path": path, "reason": "not in hub tree"})
+                continue
+            size, mtime = p.get("size"), p.get("mtime")
+            if size is not None and int(size) != st.st_size:
+                rejected.append({"path": path, "reason": f"size {st.st_size} != {size}"})
+                continue
+            if mtime is not None and abs(float(mtime) - st.st_mtime) > MTIME_TOLERANCE:
+                rejected.append({"path": path, "reason": "mtime differs"})
+                continue
+            put_ok.append({**p, "size": st.st_size, "mtime": st.st_mtime})
+        with self._tx() as c:
+            if lease_id is not None:
+                row = c.execute("SELECT * FROM leases WHERE profile = ? AND lease_id = ?",
+                                (profile, lease_id)).fetchone()
+                if row is None or row["expires"] <= now:
+                    raise LeaseLost(f"commit on '{profile}' with a lease that is no longer current")
+            for p in put_ok:
+                seq = self._journal(c, profile, p["path"], "put", p.get("hash"), p["size"], p["mtime"],
+                                    host, now)
+                self._upsert_path(c, profile, p["path"], p.get("hash"), p["size"], p["mtime"], seq,
+                                  host, None)
+                c.execute("DELETE FROM holds WHERE profile = ? AND path = ?", (profile, p["path"]))
+                accepted_puts.append(p["path"])
+            for d in del_ok:
+                seq = self._journal(c, profile, d["path"], "del", d.get("hash"), None, None, host, now)
+                self._upsert_path(c, profile, d["path"], d.get("hash"), None, None, seq, host, now)
+                c.execute("DELETE FROM holds WHERE profile = ? AND path = ?", (profile, d["path"]))
+                accepted_dels.append(d["path"])
+            for h in holds:
+                path = str(h.get("path") or "")
+                if not path:
+                    continue
+                self._journal(c, profile, path, "hold", h.get("incoming_hash"), None,
+                              h.get("incoming_mtime"), host, now)
+                c.execute("INSERT INTO holds(profile, path, hub_hash, incoming_hash, incoming_origin, "
+                          "incoming_mtime, since) VALUES (?, ?, ?, ?, ?, ?, ?) ON CONFLICT(profile, path) "
+                          "DO UPDATE SET hub_hash=excluded.hub_hash, incoming_hash=excluded.incoming_hash, "
+                          "incoming_origin=excluded.incoming_origin, incoming_mtime=excluded.incoming_mtime",
+                          (profile, path, h.get("hub_hash"), h.get("incoming_hash"), host,
+                           h.get("incoming_mtime"), now))
+            head = c.execute("SELECT MAX(seq) AS s FROM journal WHERE profile = ?",
+                             (profile,)).fetchone()["s"] or 0
+            c.execute("INSERT INTO cursors(host, profile, last_seq, last_run_id, last_seen) "
+                      "VALUES (?, ?, ?, ?, ?) ON CONFLICT(host, profile) DO UPDATE SET "
+                      "last_seq=excluded.last_seq, last_run_id=excluded.last_run_id, "
+                      "last_seen=excluded.last_seen", (host, profile, int(head), run_id, now))
+        return {"seq_to": int(head), "accepted_puts": accepted_puts, "accepted_dels": accepted_dels,
+                "rejected": rejected, "holds": len(holds), "moved_to_backup": len(moved)}
+
+    def index_tree(self, profile: str, records: list[dict], *, origin: str = "hub-index",
+                   now: float | None = None) -> dict[str, int]:
+        """Make the paths table agree with an index of the profile tree (bootstrap
+        of a tree that predates P7.2, or repair): rows missing/differing → put,
+        live rows whose file is gone → tombstone. Marks the profile indexed."""
+        now = now or time.time()
+        seen: set[str] = set()
+        added = changed = tombstoned = unchanged = 0
+        with self._tx() as c:
+            existing = {r["path"]: r for r in c.execute(
+                "SELECT path, hash, size, mtime, deleted_at FROM paths WHERE profile = ?", (profile,))}
+            for rec in records:
+                path = rec.get("path")
+                if not path:
+                    continue
+                seen.add(path)
+                row = existing.get(path)
+                same = (row is not None and row["deleted_at"] is None
+                        and (row["hash"] == rec.get("hash") if row["hash"] and rec.get("hash")
+                             else (row["size"] == rec.get("size")
+                                   and abs((row["mtime"] or 0) - (rec.get("mtime") or 0)) <= MTIME_TOLERANCE)))
+                if same:
+                    unchanged += 1
+                    continue
+                seq = self._journal(c, profile, path, "put", rec.get("hash"), rec.get("size"),
+                                    rec.get("mtime"), origin, now)
+                self._upsert_path(c, profile, path, rec.get("hash"), rec.get("size"), rec.get("mtime"),
+                                  seq, origin, None)
+                if row is None:
+                    added += 1
+                else:
+                    changed += 1
+            for path, row in existing.items():
+                if path in seen or row["deleted_at"] is not None:
+                    continue
+                seq = self._journal(c, profile, path, "del", row["hash"], None, None, origin, now)
+                self._upsert_path(c, profile, path, row["hash"], None, None, seq, origin, now)
+                tombstoned += 1
+            self._meta_set(c, INDEXED_KEY + profile, str(now))
+        return {"added": added, "changed": changed, "tombstoned": tombstoned, "unchanged": unchanged,
+                "seq": self.head_seq(profile)}
+
+    def gc(self, *, tombstone_days: float = 90, journal_days: float = 90,
+           now: float | None = None, dry_run: bool = False) -> dict[str, int]:
+        """Compact tombstones and journal entries older than the retention
+        (R33). The journal floor per profile is remembered so a spoke whose
+        cursor predates it falls back to a full state fetch."""
+        now = now or time.time()
+        t_cut, j_cut = now - tombstone_days * 86400, now - journal_days * 86400
+        n_t = self._conn.execute("SELECT COUNT(*) AS n FROM paths WHERE deleted_at IS NOT NULL "
+                                 "AND deleted_at < ?", (t_cut,)).fetchone()["n"]
+        n_j = self._conn.execute("SELECT COUNT(*) AS n FROM journal WHERE ts < ?",
+                                 (j_cut,)).fetchone()["n"]
+        if not dry_run:
+            with self._tx() as c:
+                for r in c.execute("SELECT profile, MAX(seq) AS s FROM journal WHERE ts < ? "
+                                   "GROUP BY profile", (j_cut,)).fetchall():
+                    self._meta_set(c, JOURNAL_FLOOR_KEY + r["profile"], str(int(r["s"])))
+                c.execute("DELETE FROM journal WHERE ts < ?", (j_cut,))
+                c.execute("DELETE FROM paths WHERE deleted_at IS NOT NULL AND deleted_at < ?", (t_cut,))
+        return {"tombstones": int(n_t), "journal": int(n_j)}
+
     def status(self, now: float | None = None) -> dict[str, Any]:
         """Per-profile lease + per-spoke last run; the body of `fsync hub status`."""
         now = now or time.time()
@@ -213,6 +515,21 @@ class HubState:
             h["last_seen"] = max(h["last_seen"], r["finished"])
         for prof, lease in leases.items():
             profiles.setdefault(prof, {"lease": None, "spokes": {}})["lease"] = lease
+        # P7.2 state per profile: head seq, live/tombstone counts, holds, cursors
+        for r in self._conn.execute(
+                "SELECT profile, SUM(deleted_at IS NULL) AS live, SUM(deleted_at IS NOT NULL) AS tomb "
+                "FROM paths GROUP BY profile"):
+            e = profiles.setdefault(r["profile"], {"lease": None, "spokes": {}})
+            e["live"], e["tombstones"] = int(r["live"] or 0), int(r["tomb"] or 0)
+        for r in self._conn.execute("SELECT profile, MAX(seq) AS s FROM journal GROUP BY profile"):
+            profiles.setdefault(r["profile"], {"lease": None, "spokes": {}})["seq"] = int(r["s"] or 0)
+        for r in self._conn.execute("SELECT profile, COUNT(*) AS n FROM holds GROUP BY profile"):
+            profiles.setdefault(r["profile"], {"lease": None, "spokes": {}})["holds"] = int(r["n"])
+        for prof, by_host in self.cursors().items():
+            e = profiles.setdefault(prof, {"lease": None, "spokes": {}})
+            e["cursors"] = by_host
+        for prof, e in profiles.items():
+            e["indexed"] = self.is_indexed(prof)
         return {"now": now, "schema": SCHEMA_VERSION, "profiles": profiles, "hosts": hosts,
                 "leases": leases}
 
@@ -279,26 +596,50 @@ class HubControl:
     def release(self, profile: str, lease_id: str) -> bool: ...
     def record_run(self, host: str, profile: str, run_id: str, summary: dict) -> None: ...
     def status(self) -> dict: ...
+    # P7.2
+    def state(self, profile: str, prefix: str = "") -> dict: ...
+    def journal(self, profile: str, since: int, prefix: str = "") -> dict: ...
+    def commit(self, profile: str, host: str, run_id: str, lease_id: str | None,
+               puts: list[dict], dels: list[dict], holds: list[dict]) -> dict: ...
+    def holds(self, profile: str | None = None) -> list[dict]: ...
 
     def lease(self, profile: str, host: str, run_id: str, ttl: int = DEFAULT_LEASE_TTL) -> Lease:
         return Lease(self, profile, host, run_id, ttl)
 
 
 class LocalHubControl(HubControl):
-    def __init__(self, state: HubState):
-        self.state = state
+    """Direct sqlite + direct tree access: the hub box's own tools and the
+    one-box test fixture. ``root`` is the hub root (trees + backups)."""
+
+    def __init__(self, state: HubState, root: str | Path | None = None):
+        self.state_db = state
+        self.root = Path(root).expanduser() if root else state.path.parent
 
     def acquire(self, profile, host, run_id, ttl):
-        return self.state.acquire(profile, host, run_id, ttl)
+        return self.state_db.acquire(profile, host, run_id, ttl)
 
     def renew(self, profile, lease_id, ttl):
-        return self.state.renew(profile, lease_id, ttl)
+        return self.state_db.renew(profile, lease_id, ttl)
 
     def release(self, profile, lease_id):
-        return self.state.release(profile, lease_id)
+        return self.state_db.release(profile, lease_id)
 
     def record_run(self, host, profile, run_id, summary):
-        self.state.record_run(host, profile, run_id, summary)
+        self.state_db.record_run(host, profile, run_id, summary)
 
     def status(self):
-        return self.state.status()
+        return self.state_db.status()
+
+    def state(self, profile, prefix=""):
+        return self.state_db.state(profile, prefix)
+
+    def journal(self, profile, since, prefix=""):
+        return self.state_db.journal_since(profile, since, prefix)
+
+    def commit(self, profile, host, run_id, lease_id, puts, dels, holds):
+        return self.state_db.commit(profile, host, run_id, lease_id, puts, dels, holds,
+                                    tree_root=self.root / profile / "tree",
+                                    backup_dir=self.root / "backups" / run_id / profile)
+
+    def holds(self, profile=None):
+        return self.state_db.holds(profile)
