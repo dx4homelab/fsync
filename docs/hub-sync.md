@@ -368,26 +368,31 @@ Deviations from the draft above, on purpose:
   tree has `.svn` excluded), so the guard reports only. The durable answer stays `svn` profile
   `apply: auto` (file profiles skip the checkouts).
 
-### Cutover status (2026-11-08 evening) — hub prepared, spokes still on v1
+### Cutover — EXECUTED 2026-11-08 (hub = files4dx, three spokes live)
 
-Done on files4dx: fsync 0.8.0 pyz + daemon venv installed, `fsync hub init` laid down the ten
-profile trees + `state.sqlite`, the daemon pins minis4dx/fury4dx/omen4dx and its mTLS listener is
-up on `0.0.0.0:7446`. Done on spokes: minis4dx and fury4dx pin `files4dx.pem`; omen4dx has the
-pyz, the daemon venv, the v2 config and the hub pin. The v2 config is validated for all four
-hosts and staged as `~/.config/fsync/sync-profiles.v2.yaml` on minis4dx and fury4dx.
+Operator steps (refused to the automation, done by hand): firewalld `7446/tcp` on files4dx,
+`loginctl enable-linger developer` on files4dx and omen4dx, omen4dx's ssh key authorized on
+files4dx. Everything else ran from this session: pyz + daemon venv on files4dx and omen4dx,
+`fsync hub init` (ten trees), cert pins (hub ↔ each spoke), v2 config live on all four boxes
+(v1 kept as `sync-profiles.yaml.bak-v1-*`).
 
-**Blocked on three operator actions** (each refused to the automation on purpose):
+| Run | Box | Duration | Result |
+|---|---|---|---|
+| seed `20261108-111000-0b8b` | minis4dx | 6 m 46 s | 0 errors; 33 GB pushed (homelab 18.8 G, primary 11.4 G, documents 1.5 G, dotfiles 0.6 G, tools 0.3 G …); hub tree 31 G on files4dx NVMe |
+| join `20261108-111717-308c` | omen4dx | 8 m 06 s | 0 errors; 32 GB pulled over WiFi; 32 git repos auto-applied; 11 pre-existing local files withheld (pull-only) |
+| join `20261108-112008-1c60` | fury4dx | 34 s | 0 errors; homelab/primary **deferred** (leases held by omen4dx and minis4dx's hourly run at that moment) |
+| rerun `20261108-112746-a416` | fury4dx | 1 m 13 s | homelab 12 pulled; primary identical 121,740; stranded = fury's own pull-only work (known backlog) |
 
-1. files4dx firewall (zone FedoraServer) drops 7446/tcp — `fsync hub status` from any spoke fails
-   with "No route to host": `sudo firewall-cmd --add-port=7446/tcp --permanent && sudo firewall-cmd --reload`
-2. files4dx `Linger=no`: the hub daemon stops when the last ssh session ends:
-   `loginctl enable-linger developer` (same on omen4dx for its daemon).
-3. omen4dx's ssh key (`developer@omen4dx`) is not authorized on files4dx, so its rsync legs and
-   address probe fail: from omen4dx `ssh-copy-id developer@files4dx.lan`.
+Observed live: three spokes converging concurrently, each holding a different profile lease;
+a file omen4dx pushed into the hub (`dotfiles`, `claude`) reached fury4dx on its next run with no
+spoke-to-spoke contact (P7.1 acceptance). `fsync hub status` on any box lists all three spokes.
 
-Then: `cp ~/.config/fsync/sync-profiles.v2.yaml ~/.config/fsync/sync-profiles.yaml` on minis4dx and
-fury4dx, `fsync hub status` from minis (must list the profiles), seed with `fsync sync run --all`
-on minis4dx (≈ 41 GB), then `fsync sync run --all` on fury4dx and omen4dx.
+Two findings fixed the same day: the deployed pyz lacked `certs.py` (`fsync hub` could not import
+on a spoke — the import check had run from the repo dir, which shadows the pyz); and the seed
+reported ~160 k "resurrected" files because the peer-side prev-index baseline still described the
+v1 peer's tree — the hub baseline is now scoped `<key>.peer@hub-<host>` (one-time, no data effect).
+Expected carry-overs: fury's `attention` on `claude` (24 `.claude/state/*` ephemera re-created from
+the hub — additive until P7.2) and its stranded pull-only work (user reconciliation, as before).
 
 ### Cutover checklist (reference; hub = files4dx)
 
