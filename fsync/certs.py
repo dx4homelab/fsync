@@ -159,3 +159,44 @@ def cert_fingerprint(path: Path) -> str:
     if proc.returncode != 0:
         raise CertError(f"fingerprint failed for {path}")
     return proc.stdout.strip().split("=", 1)[-1]
+
+
+# --------------------------------------------------------------------------- #
+# `fsync daemon cert|trust` — stdlib only, so a deployed .pyz spoke can pin   #
+# the hub's cert without the daemon's fastapi stack (P7.1 cutover finding)    #
+# --------------------------------------------------------------------------- #
+
+def cmd_cert(args) -> int:
+    cert, _ = ensure_cert()
+    if getattr(args, "show", False):
+        print(cert.read_text(), end="")
+    else:
+        print(f"{cert}\n  SHA256 {cert_fingerprint(cert)}")
+    return 0
+
+
+def cmd_trust(args) -> int:
+    """Pin the cert of the box at ``args.host`` (an ssh target) under
+    trust/<name>.pem, fetching it with that box's own `fsync daemon cert --show`."""
+    import sys
+
+    host = getattr(args, "host", None)
+    if not host:
+        print("usage: fsync daemon trust <ssh-host> [--name NAME]", file=sys.stderr)
+        return 2
+    proc = subprocess.run(
+        ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10",
+         "-o", "StrictHostKeyChecking=accept-new", host,
+         "~/.local/bin/fsync daemon cert --show 2>/dev/null || fsync daemon cert --show"],
+        capture_output=True, text=True,
+    )
+    if proc.returncode != 0 or "BEGIN CERTIFICATE" not in proc.stdout:
+        print(f"could not fetch peer cert over ssh: {proc.stderr.strip()[-200:]}", file=sys.stderr)
+        return 1
+    name = getattr(args, "name", None) or host.split("@")[-1].split(".")[0]
+    dest = trust_peer(name, proc.stdout)
+    print(f"pinned {name}: SHA256 {cert_fingerprint(dest)}")
+    print("restart the daemon to (re)open the mTLS listener: systemctl --user restart fsync-daemon")
+    print(f"reciprocal on the peer: ssh {host} '~/.local/bin/fsync daemon trust "
+          f"{socket.gethostname().split('.')[0]}.lan'")
+    return 0

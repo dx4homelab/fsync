@@ -513,3 +513,24 @@ def test_hub_cli_refuses_v1_config(tmp_path, capsys):
     v1 = _cfg(tmp_path, "peer: {host: h}\nprofiles: {x: {paths: [a]}}")
     assert cmd_hub(argparse.Namespace(hub_cmd="status", json=False, config=v1)) == 2
     assert "no hub" in capsys.readouterr().err
+
+
+def test_pyz_carries_the_hub_stack(tmp_path):
+    """Cutover finding 2026-11-08: certs.py was missing from CORE_MODULES, so the
+    deployed spoke could not even import fsync.hub. Build the pyz and import the
+    whole spoke-side hub stack from a neutral cwd (the repo dir would shadow it)."""
+    import subprocess, sys
+    from fsync import meta_deploy as md
+    assert "certs.py" in md.CORE_MODULES
+    out = md.build_pyz(tmp_path / "fsync.pyz")["path"]
+    proc = subprocess.run(
+        [sys.executable, "-c",
+         "import fsync.hub, fsync.hubclient, fsync.hubstate, fsync.certs, fsync.cli; print('ok')"],
+        cwd=str(tmp_path), env={"PYTHONPATH": str(out), "HOME": str(tmp_path), "PATH": "/usr/bin:/bin"},
+        capture_output=True, text=True, timeout=60)
+    assert proc.returncode == 0 and proc.stdout.strip() == "ok", proc.stderr
+    # `fsync daemon cert` from the pyz needs no fastapi
+    proc = subprocess.run([sys.executable, str(out), "daemon", "cert"], cwd=str(tmp_path),
+                          env={"HOME": str(tmp_path), "PATH": "/usr/bin:/bin"},
+                          capture_output=True, text=True, timeout=60)
+    assert proc.returncode == 0 and "SHA256" in proc.stdout, proc.stderr

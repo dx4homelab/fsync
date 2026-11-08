@@ -981,6 +981,11 @@ def main(argv: list[str] | None = None) -> int:
 
         return cmd_hub(args)
     if args.cmd == "daemon":
+        if getattr(args, "action", None) in ("cert", "trust"):
+            # stdlib path: works from the deployed .pyz (no fastapi there)
+            from . import certs
+
+            return certs.cmd_cert(args) if args.action == "cert" else certs.cmd_trust(args)
         from .daemon import cmd_daemon
 
         return cmd_daemon(args)

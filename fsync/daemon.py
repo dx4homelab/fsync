@@ -847,12 +847,7 @@ def cmd_daemon(args) -> int:
         return run_daemon(getattr(args, "config", None))
 
     if action == "cert":
-        cert, _ = certs.ensure_cert()
-        if getattr(args, "show", False):
-            print(cert.read_text(), end="")
-        else:
-            print(f"{cert}\n  SHA256 {certs.cert_fingerprint(cert)}")
-        return 0
+        return certs.cmd_cert(args)
 
     if action == "install":
         certs.ensure_cert()
@@ -907,27 +902,7 @@ def cmd_daemon(args) -> int:
         return 0
 
     if action == "trust":
-        host = getattr(args, "host", None)
-        if not host:
-            print("usage: fsync daemon trust <ssh-host> [--name NAME]", file=sys.stderr)
-            return 2
-        proc = subprocess.run(
-            ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", host,
-             "~/.local/bin/fsync daemon cert --show"],
-            capture_output=True, text=True,
-        )
-        if proc.returncode != 0 or "BEGIN CERTIFICATE" not in proc.stdout:
-            print(f"could not fetch peer cert over ssh: {proc.stderr.strip()[-200:]}",
-                  file=sys.stderr)
-            return 1
-        name = getattr(args, "name", None) or host.split("@")[-1].split(".")[0]
-        dest = certs.trust_peer(name, proc.stdout)
-        print(f"pinned {name}: SHA256 {certs.cert_fingerprint(dest)}")
-        print("restart the daemon to (re)open the mTLS listener: "
-              f"systemctl --user restart {UNIT_NAME}")
-        print(f"reciprocal on the peer: ssh {host} '~/.local/bin/fsync daemon trust "
-              f"{socket.gethostname().split('.')[0]}.lan'")
-        return 0
+        return certs.cmd_trust(args)
 
     print("usage: fsync daemon {run|install|remove|status|trust|cert}", file=sys.stderr)
     return 2
