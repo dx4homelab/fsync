@@ -435,9 +435,24 @@ deletions after an exclude change (cc13700), and the mass-delete guard did its j
 `apply: auto`, so file profiles skip the svn working copies on each box (25 on minis, 27 on fury) and
 checkouts travel only through the guarded `kind: svn` path. `repos`/`svn` keep the host default
 direction (minis producer → laptops): a checkout or repo that exists **only on a laptop** (e.g.
-fury's `afsas/afsas-tomcat-11-migration`) therefore does not reach the other boxes yet — flipping
-the kinds to `both` needs the auto-apply gate to accept "snapshot and apply others' newest" on one
-box, which is the next step if wanted. Open question 1 is thereby answered "newest wins at the hub".
+fury's `afsas/afsas-tomcat-11-migration`) therefore did not reach the other boxes at first.
+Open question 1 is thereby answered "newest wins at the hub".
+
+### Kinds at `both` — 2026-11-08 night (svn)
+
+The auto-apply gate (`auto_apply_git_repos` / `auto_apply_svn_checkouts`) takes `via_hub`: under a
+hub a kind profile at `direction: both` with `apply: auto` **snapshots its own repos / working copies
+in the main pass and applies the newest snapshot of another host in the post-pass**. This is safe
+only under a hub because the registry (`_hub_kind_metas`) never returns a box its own snapshot; the
+pairwise carrier mode keeps the pull-only rule (the carrier dir holds this box's own bundles). The
+run report for such a profile carries the snapshot result at the top level (`repos` / `checkouts`)
+plus `applied` / `skipped` / `status`, and the snapshot again under `snapshot`. Ping-pong is
+prevented by the existing guards: a box that applied a dirty snapshot has local changes and skips;
+an identical clean state is "up to date"; receiver-ahead skips (never a rollback).
+`svn` is `direction: both` on every box now; `repos` stays minis → laptops for the moment (same gate,
+flip when wanted). Tests: `test_kind_auto_apply_gate_both_only_under_hub`,
+`test_git_both_boxes_snapshot_and_apply_each_other` (a repo that exists only on the laptop reaches
+the other box, neither box re-applies its own snapshot).
 
 ### Cutover — EXECUTED 2026-11-08 (hub = files4dx, three spokes live)
 

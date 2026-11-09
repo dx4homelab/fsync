@@ -34,11 +34,12 @@ class GitFleet:
     """Producer home A (box 'boxA', repos direction both) and receiver home B
     ('boxB', pull + apply:auto) against a local hub."""
 
-    def __init__(self, tmp_path: Path, monkeypatch):
+    def __init__(self, tmp_path: Path, monkeypatch, directions: dict[str, str] | None = None):
         self.tmp, self.mp = tmp_path, monkeypatch
         self.hub_root = tmp_path / "hub"
         self.cfgs = {}
-        for name, direction in (("A", "both"), ("B", "pull")):
+        directions = directions or {"A": "both", "B": "pull"}
+        for name, direction in directions.items():
             cfg = tmp_path / f"cfg-{name}.yaml"
             cfg.write_text(f"""
 version: 2
@@ -148,6 +149,59 @@ def test_git_snapshot_apply_and_stale_stomp_is_noop(tmp_path, monkeypatch):
     rep = f.run("B")
     assert len(rep["profiles"]["repos"]["applied"]) == 1
     assert _git(rb, "rev-parse", "HEAD") == _git(ra, "rev-parse", "HEAD")
+
+
+def test_kind_auto_apply_gate_both_only_under_hub():
+    """A `both` kind profile applies others' snapshots ONLY under a hub (the
+    registry never hands a box its own snapshot); pairwise stays pull-only."""
+    for kind, gate in (("git", hs.auto_apply_git_repos), ("svn", hs.auto_apply_svn_checkouts)):
+        both = hs.Profile("k", ["ws"], kind=kind, apply="auto", direction="both")
+        pull = hs.Profile("k", ["ws"], kind=kind, apply="auto", direction="pull")
+        push = hs.Profile("k", ["ws"], kind=kind, apply="auto", direction="push")
+        demand = hs.Profile("k", ["ws"], kind=kind, apply="on-demand", direction="both")
+        assert gate(both, via_hub=True) and gate(pull, via_hub=True)
+        assert not gate(push, via_hub=True) and not gate(demand, via_hub=True)
+        assert gate(pull) and not gate(both) and not gate(push)
+
+
+@needs_git
+def test_git_both_boxes_snapshot_and_apply_each_other(tmp_path, monkeypatch):
+    """Kinds at `direction: both` under a hub: a repo that exists only on the
+    laptop (B) reaches A, A's repo reaches B, and neither box applies its own
+    snapshot (the second run on each is 'up to date', nothing re-applied)."""
+    f = GitFleet(tmp_path, monkeypatch, directions={"A": "both", "B": "both"})
+    for name, fname in (("A", "from-a.txt"), ("B", "from-b.txt")):
+        r = f.homes[name] / "workspaces" / f"only-{name.lower()}"
+        r.mkdir()
+        _git(r, "init", "-q", "-b", "main")
+        (r / fname).write_text(name)
+        _git(r, "add", "."); _git(r, "commit", "-q", "-m", name)
+
+    rep = f.run("A")                       # A snapshots only-a; nothing of others' yet
+    pa = rep["profiles"]["repos"]
+    assert pa["snapshot"]["store"] == "hub" and len(pa["snapshot"]["repos"]) == 1
+    assert pa["applied"] == [] and pa["skipped"] == []
+
+    rep = f.run("B")                       # B snapshots only-b AND applies A's only-a
+    pb = rep["profiles"]["repos"]
+    assert len(pb["snapshot"]["repos"]) == 1 and [a["repo"] for a in pb["applied"]] == ["only-a"]
+    assert (f.homes["B"] / "workspaces" / "only-a" / "from-a.txt").read_text() == "A"
+    hosts = {r["host"] for r in f.state.kind_snapshots("git", "repos")}
+    assert hosts == {"boxA", "boxB"}
+
+    rep = f.run("A")                       # A now applies B's only-b, never its own only-a
+    pa = rep["profiles"]["repos"]
+    assert [a["repo"] for a in pa["applied"]] == ["only-b"]
+    assert (f.homes["A"] / "workspaces" / "only-b" / "from-b.txt").read_text() == "B"
+    # B's own snapshot of only-a (made after it applied A's) is what A sees as
+    # "newest of another host" for only-a → identical state → up to date, no re-apply
+    rep = f.run("B")
+    pb = rep["profiles"]["repos"]
+    assert pb["applied"] == [] and {s["reason"] for s in pb["skipped"]} <= {"up to date"}
+    rep = f.run("A")
+    pa = rep["profiles"]["repos"]
+    assert pa["applied"] == [] and {s["reason"] for s in pa["skipped"]} <= {"up to date"}
+    assert pa["status"] == "ok"
 
 
 @needs_git

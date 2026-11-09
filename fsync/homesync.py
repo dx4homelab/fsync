@@ -1608,11 +1608,18 @@ def git_profile_snapshots(prof: Profile) -> bool:
     return prof.kind == "git" and prof.direction in ("push", "both")
 
 
-def auto_apply_git_repos(prof: Profile) -> bool:
-    """Receiver-side auto-apply runs only for a pull-only kind:git profile set to
-    apply:auto (the durable ISSUE-001 fix C). The producer never auto-applies."""
-    return (prof.kind == "git" and prof.apply == "auto"
-            and not git_profile_snapshots(prof))
+def auto_apply_git_repos(prof: Profile, *, via_hub: bool = False) -> bool:
+    """Receiver-side auto-apply runs for a kind:git profile set to apply:auto that
+    is pull-only (the durable ISSUE-001 fix C) — or, under a hub (P7.3), also
+    ``direction: both``: there the registry hands a box only the newest snapshot
+    of ANOTHER host, so a box can snapshot its own repos and apply the others'
+    in the same run without ever applying itself. Without a hub the carrier dir
+    holds this box's own bundles too, so the pairwise rule stays pull-only."""
+    if prof.kind != "git" or prof.apply != "auto":
+        return False
+    if via_hub:
+        return prof.direction in ("pull", "both")
+    return not git_profile_snapshots(prof)
 
 
 def git_repo_excludes_for_file_profiles(profiles: dict[str, Profile]) -> dict[str, list[str]]:
@@ -1830,8 +1837,13 @@ def svn_profile_snapshots(prof: Profile) -> bool:
     return prof.kind == "svn" and prof.direction in ("push", "both")
 
 
-def auto_apply_svn_checkouts(prof: Profile) -> bool:
-    return prof.kind == "svn" and prof.apply == "auto" and not svn_profile_snapshots(prof)
+def auto_apply_svn_checkouts(prof: Profile, *, via_hub: bool = False) -> bool:
+    """Same rule as ``auto_apply_git_repos``: pull-only, or ``both`` under a hub."""
+    if prof.kind != "svn" or prof.apply != "auto":
+        return False
+    if via_hub:
+        return prof.direction in ("pull", "both")
+    return not svn_profile_snapshots(prof)
 
 
 def _svn_snapshot_files(snap_dir: Path, meta: dict[str, Any]) -> list[Path]:
@@ -3045,6 +3057,7 @@ def _cmd_run(args) -> int:
         return 1
 
     auto_apply_later: list[Profile] = []
+    via_hub = isinstance(peer, Hub)
     for prof in selected:
         try:
             if prof.kind == "git":
@@ -3054,11 +3067,15 @@ def _cmd_run(args) -> int:
                 # newest-wins and make apply a no-op. Bundles arrive via the
                 # files-profile that carries the bundle dir; restore with
                 # `fsync git apply` (or auto-apply, guarded, when apply:auto).
+                # Under a hub a `both` profile does BOTH: snapshot its own repos
+                # now, then (post-pass) apply the newest snapshot of another box.
                 if git_profile_snapshots(prof):
                     report["profiles"][prof.name] = snapshot_git_profile(
                         prof, DEFAULT_GIT_BUNDLE_DIR, log,
                         hub=peer if isinstance(peer, Hub) else None, control=control)
-                elif auto_apply_git_repos(prof):
+                    if auto_apply_git_repos(prof, via_hub=via_hub):
+                        auto_apply_later.append(prof)
+                elif auto_apply_git_repos(prof, via_hub=via_hub):
                     # Defer to a post-pass so the git-bundles file profile (which
                     # carries fresh bundles) has already run this cycle.
                     auto_apply_later.append(prof)
@@ -3076,7 +3093,9 @@ def _cmd_run(args) -> int:
                     report["profiles"][prof.name] = snapshot_svn_profile(
                         prof, DEFAULT_SVN_SNAPSHOT_DIR, log,
                         hub=peer if isinstance(peer, Hub) else None, control=control)
-                elif auto_apply_svn_checkouts(prof):
+                    if auto_apply_svn_checkouts(prof, via_hub=via_hub):
+                        auto_apply_later.append(prof)
+                elif auto_apply_svn_checkouts(prof, via_hub=via_hub):
                     auto_apply_later.append(prof)
                     report["profiles"][prof.name] = {"kind": "svn", "apply": "auto",
                                                      "pending": True}
@@ -3131,6 +3150,11 @@ def _cmd_run(args) -> int:
                 res = auto_apply_git_profile(prof, DEFAULT_GIT_BUNDLE_DIR,
                                              run_id=run_id, dry_run=args.dry_run, log=log,
                                              hub=_hub, control=control)
+            prev = report["profiles"].get(prof.name) or {}
+            if not prev.get("pending"):
+                # `both` under a hub: this run's own snapshot result (repos /
+                # checkouts) stays at the top level, the apply result joins it.
+                res = {**prev, **res, "snapshot": prev}
             report["profiles"][prof.name] = res
             log(f"  {prof.name}: auto-apply — {len(res['applied'])} applied, "
                 f"{len(res['skipped'])} skipped, {len(res['errors'])} error(s)"
