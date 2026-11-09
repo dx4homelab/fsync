@@ -418,6 +418,28 @@ def svn_world(tmp_path):
 
 
 @pytest.mark.skipif(not HAS_SVN, reason="svn/svnadmin not installed")
+def test_apply_new_checkout_of_branch_deleted_at_head(svn_world, tmp_path):
+    """A producer snapshot of a working copy whose branch was since deleted on
+    the server must still create the receiver checkout (pegged at the
+    producer's revision), not fail with 'path not found' at HEAD."""
+    prod = svn_world["prod"]
+    (prod / "keep.txt").write_text("keep\n")             # clean producer for a plain snapshot
+    (prod / "scratch.txt").unlink()
+    snap = tmp_path / "snaps"
+    meta = svs.snapshot_wc(prod, snap, name="proj", rel="ws/proj")
+    assert meta["revision"] == 3 and not meta["dirty"]
+    # the branch disappears from HEAD (r4)
+    _run(["svn", "rm", "-q", "-m", "r4 drop trunk", svn_world["url"]], tmp_path)
+    target = tmp_path / "home-c" / "ws" / "proj"
+    ok, reason = svs.apply_decision(target, meta, state_dir=tmp_path / "st")
+    assert ok and reason == "new"
+    res = svs.apply_wc(target, snap, meta, backup_dir=tmp_path / "bk", state_dir=tmp_path / "st")
+    assert res["created"] and res["revision"] == 3
+    assert (target / "keep.txt").read_text() == "keep\n"
+    assert svs.wc_info(target)["revision"] == 3
+
+
+@pytest.mark.skipif(not HAS_SVN, reason="svn/svnadmin not installed")
 def test_probe_and_guard_end_to_end(svn_world):
     local, _ = svs.probe_local(svn_world["home_a"] / "ws")
     peer, _ = svs.probe_local(svn_world["home_b"] / "ws")

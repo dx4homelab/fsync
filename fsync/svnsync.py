@@ -652,7 +652,10 @@ def apply_wc(wc: str | Path, snap_dir: str | Path, meta: dict[str, Any], *,
         if wc.exists() and any(wc.iterdir()):
             raise SvnSyncError(f"{name}: {wc} exists and is not empty — refusing to check out over it")
         wc.parent.mkdir(parents=True, exist_ok=True)
-        _svn(wc.parent, "checkout", "-r", str(rev), url, str(wc))
+        # Peg the URL at the producer's revision: a branch deleted or moved
+        # on the server after that revision is "path not found" at HEAD
+        # (fsync 0.10.1 incident: fury's afsas_249 / asap_246 branches).
+        _svn(wc.parent, "checkout", "-r", str(rev), f"{url}@{rev}", str(wc))
     else:
         busy = wc_busy(wc)
         if busy:
