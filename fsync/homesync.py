@@ -1608,6 +1608,17 @@ def git_profile_snapshots(prof: Profile) -> bool:
     return prof.kind == "git" and prof.direction in ("push", "both")
 
 
+def _note_kind_error(report: dict, prof: Profile, e: Exception, log) -> int:
+    """Record a kind profile's snapshot failure in the run report (status
+    error, message in ``errors``) without aborting the profile; returns the
+    run's rc (1)."""
+    report["profiles"][prof.name] = {"kind": prof.kind, "status": "error",
+                                     "snapshot_error": str(e)}
+    report["errors"].append(f"{prof.name}: {e}")
+    log(f"  {prof.name}: ERROR {e}")
+    return 1
+
+
 def auto_apply_git_repos(prof: Profile, *, via_hub: bool = False) -> bool:
     """Receiver-side auto-apply runs for a kind:git profile set to apply:auto that
     is pull-only (the durable ISSUE-001 fix C) — or, under a hub (P7.3), also
@@ -3070,10 +3081,18 @@ def _cmd_run(args) -> int:
                 # Under a hub a `both` profile does BOTH: snapshot its own repos
                 # now, then (post-pass) apply the newest snapshot of another box.
                 if git_profile_snapshots(prof):
-                    report["profiles"][prof.name] = snapshot_git_profile(
-                        prof, DEFAULT_GIT_BUNDLE_DIR, log,
-                        hub=peer if isinstance(peer, Hub) else None, control=control)
-                    if auto_apply_git_repos(prof, via_hub=via_hub):
+                    applies = auto_apply_git_repos(prof, via_hub=via_hub)
+                    try:
+                        report["profiles"][prof.name] = snapshot_git_profile(
+                            prof, DEFAULT_GIT_BUNDLE_DIR, log,
+                            hub=peer if isinstance(peer, Hub) else None, control=control)
+                    except (HomesyncError, grs.GitSyncError) as e:
+                        if not applies:
+                            raise
+                        # `both`: a failed snapshot of our own repos must not
+                        # stop us from applying the other boxes' newest ones.
+                        rc = _note_kind_error(report, prof, e, log)
+                    if applies:
                         auto_apply_later.append(prof)
                 elif auto_apply_git_repos(prof, via_hub=via_hub):
                     # Defer to a post-pass so the git-bundles file profile (which
@@ -3090,10 +3109,16 @@ def _cmd_run(args) -> int:
                                                      "reason": "pull-only receiver"}
             elif prof.kind == "svn":
                 if svn_profile_snapshots(prof):
-                    report["profiles"][prof.name] = snapshot_svn_profile(
-                        prof, DEFAULT_SVN_SNAPSHOT_DIR, log,
-                        hub=peer if isinstance(peer, Hub) else None, control=control)
-                    if auto_apply_svn_checkouts(prof, via_hub=via_hub):
+                    applies = auto_apply_svn_checkouts(prof, via_hub=via_hub)
+                    try:
+                        report["profiles"][prof.name] = snapshot_svn_profile(
+                            prof, DEFAULT_SVN_SNAPSHOT_DIR, log,
+                            hub=peer if isinstance(peer, Hub) else None, control=control)
+                    except (HomesyncError, svs.SvnSyncError) as e:
+                        if not applies:
+                            raise
+                        rc = _note_kind_error(report, prof, e, log)
+                    if applies:
                         auto_apply_later.append(prof)
                 elif auto_apply_svn_checkouts(prof, via_hub=via_hub):
                     auto_apply_later.append(prof)
@@ -3153,8 +3178,11 @@ def _cmd_run(args) -> int:
             prev = report["profiles"].get(prof.name) or {}
             if not prev.get("pending"):
                 # `both` under a hub: this run's own snapshot result (repos /
-                # checkouts) stays at the top level, the apply result joins it.
+                # checkouts) stays at the top level, the apply result joins it;
+                # a failed snapshot keeps the profile at status error.
                 res = {**prev, **res, "snapshot": prev}
+                if prev.get("status") == "error":
+                    res["status"] = "error"
             report["profiles"][prof.name] = res
             log(f"  {prof.name}: auto-apply — {len(res['applied'])} applied, "
                 f"{len(res['skipped'])} skipped, {len(res['errors'])} error(s)"

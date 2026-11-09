@@ -205,6 +205,30 @@ def test_git_both_boxes_snapshot_and_apply_each_other(tmp_path, monkeypatch):
 
 
 @needs_git
+def test_git_both_applies_others_even_when_own_snapshot_fails(tmp_path, monkeypatch):
+    """`both` under a hub: a failed snapshot of this box's own repos is reported
+    (status error, rc 1) but does not stop the post-pass apply of the other
+    box's newest snapshot."""
+    f = GitFleet(tmp_path, monkeypatch, directions={"A": "both", "B": "both"})
+    ra = f.homes["A"] / "workspaces" / "only-a"
+    ra.mkdir(); _git(ra, "init", "-q", "-b", "main")
+    (ra / "a.txt").write_text("A"); _git(ra, "add", "."); _git(ra, "commit", "-q", "-m", "a")
+    f.run("A")
+    real = hs.snapshot_git_profile
+
+    def boom(*a, **k):
+        raise hs.HomesyncError("repos: 1 repo(s) failed to snapshot: broken")
+    monkeypatch.setattr(hs, "snapshot_git_profile", boom)
+    rep = f.run("B", expect_rc=1)
+    pb = rep["profiles"]["repos"]
+    assert pb["status"] == "error" and "broken" in pb["snapshot_error"]
+    assert [a["repo"] for a in pb["applied"]] == ["only-a"]
+    assert (f.homes["B"] / "workspaces" / "only-a" / "a.txt").read_text() == "A"
+    assert any("broken" in e for e in rep["errors"])
+    monkeypatch.setattr(hs, "snapshot_git_profile", real)
+
+
+@needs_git
 def test_git_cli_status_and_apply_through_hub(tmp_path, monkeypatch, capsys):
     f = GitFleet(tmp_path, monkeypatch)
     ra = f.repo("A"); ra.mkdir()
@@ -287,7 +311,7 @@ shared: {{profiles: {{docs: {{paths: [D]}}}}}}
 
 def test_features_and_version():
     from fsync import FEATURES, __version__
-    assert "hub-stores" in FEATURES and __version__ == "0.10.0"
+    assert "hub-stores" in FEATURES and __version__ == "0.10.1"
 
 
 def test_drop_retired_profile(tmp_path):
