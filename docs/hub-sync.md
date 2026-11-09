@@ -450,7 +450,15 @@ plus `applied` / `skipped` / `status`, and the snapshot again under `snapshot`. 
 prevented by the existing guards: a box that applied a dirty snapshot has local changes and skips;
 an identical clean state is "up to date"; receiver-ahead skips (never a rollback).
 `svn` is `direction: both` on every box now; `repos` stays minis → laptops for the moment (same gate,
-flip when wanted). Tests: `test_kind_auto_apply_gate_both_only_under_hub`,
+flip when wanted). The first live `both` runs surfaced two svn-apply bugs, fixed the same night: an
+absolute symlink inside the unversioned tar made `tarfile`'s data filter abort the whole pass (now
+re-created by hand, any other refusal skipped, and one checkout's unexpected error no longer takes
+the pass down), and a fresh checkout of a branch deleted on the server after the snapshot revision
+failed "path not found" at HEAD (checkout now pegs `URL@REV`). Fury's three working copies with a
+missing `.svn/tmp` could not `svn diff`; `mkdir` repaired them. Outcome: fury's laptop-only
+`afsas/afsas-tomcat-11-migration` and `tomcat-11` were checked out on minis by the hub path; omen has no
+VPN to the SVN server and its checkouts are plain copies without `.svn` (file-profile era), so it
+skips every svn apply as "not an svn working copy" until that is cleaned up by hand. Tests: `test_kind_auto_apply_gate_both_only_under_hub`,
 `test_git_both_boxes_snapshot_and_apply_each_other` (a repo that exists only on the laptop reaches
 the other box, neither box re-applies its own snapshot).
 
