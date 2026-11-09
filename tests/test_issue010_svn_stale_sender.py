@@ -30,6 +30,31 @@ HAS_SVN = shutil.which("svn") is not None and shutil.which("svnadmin") is not No
 # fix 1 / fix 4: config patterns                                              #
 # --------------------------------------------------------------------------- #
 
+def test_safe_extract_recreates_absolute_symlinks_and_skips_escapes(tmp_path):
+    """The unversioned tar may carry a symlink to an absolute path (same home
+    layout fleet-wide): it is re-created, not refused; a file whose path escapes
+    the working copy is still dropped."""
+    import io, os, tarfile
+    tar = tmp_path / "u.tar.gz"
+    with tarfile.open(tar, "w:gz") as tf:
+        data = b"hello"
+        ti = tarfile.TarInfo("sub/plain.txt"); ti.size = len(data); tf.addfile(ti, io.BytesIO(data))
+        ln = tarfile.TarInfo("links/abs"); ln.type = tarfile.SYMTYPE; ln.linkname = "/var/home/x/configs"
+        tf.addfile(ln)
+        rel = tarfile.TarInfo("links/rel"); rel.type = tarfile.SYMTYPE; rel.linkname = "../sub/plain.txt"
+        tf.addfile(rel)
+        esc = tarfile.TarInfo("../escape.txt"); esc.size = 1; tf.addfile(esc, io.BytesIO(b"x"))
+    wc = tmp_path / "wc"; wc.mkdir()
+    n = svs._safe_extract(tar, wc)
+    assert n == 3
+    assert (wc / "sub" / "plain.txt").read_text() == "hello"
+    assert os.readlink(wc / "links" / "abs") == "/var/home/x/configs"
+    assert (wc / "links" / "rel").read_text() == "hello"
+    assert not (tmp_path / "escape.txt").exists()
+    # idempotent: an existing link is replaced, not an error
+    assert svs._safe_extract(tar, wc) == 3
+
+
 def test_starter_config_excludes_svn_metadata(tmp_path):
     import yaml
     data = yaml.safe_load(hs.DEFAULT_PROFILES_YAML)

@@ -2015,6 +2015,9 @@ def auto_apply_svn_profile(prof: Profile, snap_dir: str | Path, *,
         except svs.SvnSyncError as e:
             out["errors"].append(f"{name}: {e}")
             log(f"  {prof.name}/{name}: auto-apply ERROR {e}")
+        except Exception as e:  # noqa: BLE001 — one checkout must never take the pass down
+            out["errors"].append(f"{name}: unexpected {type(e).__name__}: {e}")
+            log(f"  {prof.name}/{name}: auto-apply ERROR unexpected {type(e).__name__}: {e}")
     if out["errors"]:
         out["status"] = "error"
     elif any(s["reason"] not in _SVN_STICKY_BENIGN for s in out["skipped"]):

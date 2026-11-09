@@ -595,16 +595,36 @@ def _tar_members(tar_path: Path) -> list[str]:
 
 
 def _safe_extract(tar_path: Path, dest: Path) -> int:
+    """Unpack the unversioned files (regular files + symlinks) under ``dest``.
+    The ``data`` filter refuses a symlink whose target is absolute or leaves
+    ``dest`` — legitimate in a working copy (the fleet shares one home layout,
+    e.g. ``links/afsas-solr-configs -> /var/home/.../configs``). Such a link is
+    created by hand: making the link itself writes nothing outside ``dest``,
+    and any later member whose path runs *through* it is still rejected by the
+    filter (it resolves real paths). Anything else the filter refuses is skipped."""
     n = 0
+    filter_error = getattr(tarfile, "FilterError", ())
     with tarfile.open(tar_path, "r:gz") as tf:
         for m in tf.getmembers():
             p = Path(m.name)
             if p.is_absolute() or ".." in p.parts:
                 continue
-            if m.isfile() or m.issym():
+            if not (m.isfile() or m.issym()):
+                continue
+            try:
                 tf.extract(m, path=str(dest), filter="data") if hasattr(tarfile, "data_filter") \
                     else tf.extract(m, path=str(dest))
-                n += 1
+            except filter_error:
+                if not m.issym():
+                    continue
+                target = dest / p
+                if target.is_dir() and not target.is_symlink():
+                    continue
+                target.parent.mkdir(parents=True, exist_ok=True)
+                if target.is_symlink() or target.exists():
+                    target.unlink()
+                os.symlink(m.linkname, target)
+            n += 1
     return n
 
 
