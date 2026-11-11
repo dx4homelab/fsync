@@ -63,6 +63,33 @@ This design adds, in service of goal 1:
   Overlap between the 12.7 TB and 4.5 TB drives is under 4 GB by name and size, so
   most of that content is single-copy.
 
+### 3.1 Proxmox hosts backing up to `tank` (as built)
+
+| Host | Guests | Target on files4dx | Schedule | Retention |
+|---|---|---|---|---|
+| pve9 (192.168.60.10) | 30121 GitLab VM | `tank/pve`, NFS export `/pve` | 01:00 | 7 daily, 4 weekly, 3 monthly |
+| proxmox-zbook (192.168.1.30, PVE 7.4) | 100 PFSense, 101 UbuntuMailServer, 102 Portainer | `tank/pve-zbook`, NFS export `/pve-zbook` | 22:00 | 7 daily, 12 monthly |
+
+proxmox-zbook, set up 2026-11-11:
+
+- Its only backup target had been the USB drive `seagate7tb4zbook` (Seagate 7.3 TB,
+  serial NA9RQHPH). The drive was away from the host from 2026-08-04 to 2026-11-11, so
+  no backups ran in that time.
+- files4dx: dataset `tank/pve-zbook` (recordsize 1M), `/etc/exports.d/zbook.exports`,
+  firewalld rich rules for `nfs`, `mountd`, `rpc-bind` from 192.168.1.30 only.
+- proxmox-zbook: storage `files4dx-tank` (NFS 4.2, `soft,timeo=600`), a second vzdump job
+  at 22:00 with hook `/usr/local/bin/vzdump-ntfy.sh`, which posts aborted backups to the
+  ntfy topic `homelab-alerts` (PVE 7 has no webhook notifications). Config backups:
+  `/root/storage.cfg.bak-20261111`, `/root/jobs.cfg.bak-20261111`.
+- The original 21:00 job to the USB drive is unchanged. Disable it when the drive leaves
+  that host for good.
+- The USB drive's whole history (57 archives back to 2025-07-31, plus a 23 GB partition
+  image from 2024) is copied to
+  `tank/pve-zbook/archive/usb-seagate7tb4zbook-20261111/`, outside the `dump` folder so
+  Proxmox retention never prunes it.
+- SSH to proxmox-zbook as root works from minis4dx and fury4dx, not from omen4dx or
+  files4dx.
+
 ## 4. Architecture
 
 ```
