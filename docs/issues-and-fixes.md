@@ -821,3 +821,23 @@ repos, `.git` of repos no snapshot carries when they hold unpushed commits). The
 hard-to-replace list is ordered recently-touched first. It also reports covered files
 modified since the last run (the current exposure window) and warns when the sync
 service is not active or the last run is older than 6 h.
+
+### 0.11.1 (2026-11-11) — hub moved onto `tank`; failure alerts via ntfy
+
+Phase 0 of `docs/universal-backup-architecture.md`.
+
+- **Hub storage.** The hub (51 GB) lived in `~/.fsync/hub` on files4dx's single boot
+  NVMe, outside the RAIDZ2 pool and in no backup job. It now lives on dataset
+  `tank/hub` (`/var/mnt/tank/hub`); `~/.fsync/hub` is a **symlink** to it, so `hub.root`
+  in the config is unchanged and no spoke needed a config change. A symlink rather than
+  a ZFS mountpoint on purpose: if `tank` fails to import, the link dangles and every
+  rsync leg and the daemon fail loudly, instead of spokes seeing an empty hub tree.
+  The copy was checksum-verified (`rsync -c`, zero differences) with all four daemons
+  stopped. The old copy is kept at `~/.fsync/hub.pre-tank-20261111` until the owner
+  deletes it.
+- **Snapshots.** `/etc/sanoid/sanoid.conf` on files4dx covers `tank/hub` only: 48
+  hourly, 30 daily, 8 weekly, 12 monthly; `sanoid.timer` + `sanoid-prune.service`
+  enabled. Browse history under `/var/mnt/tank/hub/.zfs/snapshot/`.
+- **ntfy.** `defaults.ntfy: <topic URL>` in `sync-profiles.yaml` makes `sync run
+  --notify` failures and the watchdog's daemon-down alert also POST to ntfy (stdlib
+  `urllib`). Routine "N files synced" notifications stay desktop-only.

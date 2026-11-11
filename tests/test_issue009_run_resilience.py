@@ -41,7 +41,7 @@ def test_run_confines_an_unexpected_profile_error(tmp_path, monkeypatch):
     monkeypatch.setattr(hs, "peer_busy", lambda p: False)
     monkeypatch.setattr(hs, "ensure_peer_engine", lambda p: None)
     notes = []
-    monkeypatch.setattr(hs, "_notify", lambda s, b: notes.append((s, b)))
+    monkeypatch.setattr(hs, "_notify", lambda s, b, **kw: notes.append((s, b)))
 
     def fake_run_profile(peer, prof, **kw):
         if prof.name == "a":
@@ -58,4 +58,4 @@ def test_run_confines_an_unexpected_profile_error(tmp_path, monkeypatch):
     assert report["profiles"]["a"]["status"] == "error"
     assert report["profiles"]["b"]["status"] == "ok"               # the run went on
     assert report["errors"] == ["a: unexpected TimeoutExpired: Command 'rsync' timed out after 1 seconds"]
-    assert notes and notes[0][0] == "fsync sync FAILED"
+    assert notes and notes[0][0].startswith("fsync sync FAILED on ")

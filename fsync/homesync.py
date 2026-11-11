@@ -665,13 +665,43 @@ def peer_busy(peer: Peer) -> bool:
         return True
 
 
-def _notify(summary: str, body: str) -> None:
-    """Best-effort desktop notification; failures never affect the run."""
+def _default_ntfy_url() -> str | None:
+    """`defaults.ntfy` of this box's own config, or None; never raises."""
+    try:
+        return (load_config(None)[2] or {}).get("ntfy") or None
+    except Exception:  # noqa: BLE001 - an alert path must not fail on bad config
+        return None
+
+
+def _ntfy_post(url: str, summary: str, body: str, *, timeout: float = 10) -> bool:
+    """POST one alert to an ntfy topic URL (stdlib only). Best-effort."""
+    import urllib.request
+    if not url.startswith(("http://", "https://")):
+        return False
+    title = summary.encode("ascii", "replace").decode()      # HTTP headers are latin-1
+    req = urllib.request.Request(url, data=body.encode(), method="POST",
+                                 headers={"Title": title, "Priority": "high", "Tags": "warning"})
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return 200 <= r.status < 300
+    except (OSError, ValueError):
+        return False
+
+
+def _notify(summary: str, body: str, *, ntfy=None) -> None:
+    """Best-effort desktop notification; failures never affect the run.
+
+    ``ntfy`` (a topic URL, or a callable returning one) also pushes the alert
+    to ntfy — used for failures only, so a headless box (the hub) or a box
+    nobody is sitting at can still reach the owner's phone."""
     try:
         subprocess.run(["notify-send", "--app-name=fsync", summary, body],
                        check=False, capture_output=True, timeout=10)
     except (OSError, subprocess.TimeoutExpired):
         pass
+    url = ntfy() if callable(ntfy) else ntfy
+    if url:
+        _ntfy_post(str(url), summary, body)
 
 
 def peer_home(peer: Peer) -> str:
@@ -2964,6 +2994,7 @@ def _cmd_run(args) -> int:
 
     try:
         peer, profiles, _defaults = load_config(getattr(args, "config", None))
+        ntfy_url = (_defaults or {}).get("ntfy")
     except HomesyncError as e:
         print(f"error: {e}", file=sys.stderr)
         return 2
@@ -3250,7 +3281,8 @@ def _cmd_run(args) -> int:
         # Held conflicts are standing state (the claude profile always has
         # some) — only speak up when files moved or something went wrong.
         if rc != 0:
-            _notify("fsync sync FAILED", "; ".join(report["errors"])[:200])
+            _notify(f"fsync sync FAILED on {_local_short_host()}",
+                    "; ".join(report["errors"])[:200], ntfy=ntfy_url)
         elif moved or report["warnings"]:
             parts = ([f"{moved} file(s) synced with {peer.host}"
                       + (f", {conflicts} conflict(s) held" if conflicts else "")]
@@ -3764,7 +3796,8 @@ def watchdog_check(*, settle: float = WATCHDOG_SETTLE_S, now: float | None = Non
                 f"{DAEMON_UNIT} is '{state}' since "
                 f"{time.strftime('%Y-%m-%d %H:%M', time.localtime(since))}. "
                 f"Syncing directly as a fallback. Repair: `fsync deploy daemon` from the "
-                f"deploy origin; details: journalctl --user -u {DAEMON_UNIT}")
+                f"deploy origin; details: journalctl --user -u {DAEMON_UNIT}",
+                ntfy=_default_ntfy_url)
         notified = now
         out["notified"] = True
     save({"down_since": since, "notified": notified, "state": state})

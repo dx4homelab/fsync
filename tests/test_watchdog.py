@@ -37,7 +37,7 @@ def _wire(monkeypatch, tmp_path, enabled=True, states=("active",)):
         return CompletedProcess(argv, 0, stdout="", stderr="")
 
     monkeypatch.setattr(hs, "_systemctl", fake_systemctl)
-    monkeypatch.setattr(hs, "_notify", lambda s, b: notes.append((s, b)))
+    monkeypatch.setattr(hs, "_notify", lambda s, b, **kw: notes.append((s, b)))
     monkeypatch.setattr(hs, "state_root", lambda: tmp_path)
     return notes, runs
 
@@ -74,3 +74,19 @@ def test_watchdog_restart_in_progress_is_not_an_outage(monkeypatch, tmp_path):
     monkeypatch.setattr(hs.time, "sleep", lambda s: None)
     assert hs.watchdog_check(settle=1, run_sync=lambda: runs.append(1) or 0)["daemon"] == "active"
     assert not notes and not runs
+
+
+def test_notify_posts_failures_to_ntfy(monkeypatch):
+    """0.11.1: an alert with an ntfy URL is POSTed there; without one, nothing is."""
+    posts = []
+    real_post = hs._ntfy_post
+    monkeypatch.setattr(hs.subprocess, "run", lambda *a, **k: None)
+    monkeypatch.setattr(hs, "_ntfy_post", lambda url, s, b, **k: posts.append((url, s, b)) or True)
+    hs._notify("plain", "body")
+    assert posts == []
+    hs._notify("fsync sync FAILED on x", "boom", ntfy="https://ntfy.example/topic")
+    hs._notify("down", "b", ntfy=lambda: "https://ntfy.example/t2")
+    hs._notify("down", "b", ntfy=lambda: None)
+    assert posts == [("https://ntfy.example/topic", "fsync sync FAILED on x", "boom"),
+                     ("https://ntfy.example/t2", "down", "b")]
+    assert real_post("file:///etc/passwd", "s", "b") is False
