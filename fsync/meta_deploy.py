@@ -27,6 +27,7 @@ CORE_MODULES = [
     "meta_deploy.py", "foldersync.py", "vmclone.py", "svnsync.py",
     "hub.py", "hubstate.py", "hubclient.py", "certs.py",   # P7.1 hub-sync (stdlib only)
     "threeway.py",                                         # P7.2 three-way classifier + base
+    "risk.py",                                             # `fsync risk` exposure report (stdlib only)
     "db.py", "catalog_client.py", "eventbus.py", "agent.py",
 ]
 

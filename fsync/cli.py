@@ -841,6 +841,16 @@ def build_parser() -> argparse.ArgumentParser:
     p_dd.add_argument("--dry-run", action="store_true", help="Print the plan, change nothing")
     p_dd.add_argument("--verbose", action="count", default=0)
 
+    # risk: what this box would lose if its drive died now (read-only)
+    p_risk = sub.add_parser("risk", help="Report what this box would lose if its drive failed now: "
+                                         "files no profile carries, ranked by how replaceable they look")
+    p_risk.add_argument("--json", action="store_true", help="Machine-readable report")
+    p_risk.add_argument("--top", type=int, default=25, help="At-risk groups to list (0 = all; default 25)")
+    p_risk.add_argument("--recent-days", type=int, default=30,
+                        help="What counts as recently touched (default 30)")
+    p_risk.add_argument("--config", help="Profiles YAML (default: ~/.config/fsync/sync-profiles.yaml)")
+    p_risk.add_argument("--verbose", action="count", default=0, help="Increase verbosity")
+
     # tui: thin client of fsyncd — plan -> one confirmation -> backend run
     p_tui = sub.add_parser("tui", help="Terminal UI for sync (thin client of fsyncd)")
     p_tui.add_argument("--profile", action="append", default=None,
@@ -954,6 +964,9 @@ def main(argv: list[str] | None = None) -> int:
 
     args.logger = logger
 
+    if args.cmd == "risk":
+        from .risk import cmd_risk
+        return cmd_risk(args)
     if args.cmd == "index":
         return cmd_index(args)
     if args.cmd == "compare":

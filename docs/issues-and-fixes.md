@@ -807,3 +807,17 @@ origin's Python and installed `--no-index`.
   running the stdlib-only pyz. When `fsync-daemon.service` is enabled but not active it
   notifies (once, then daily) and runs `sync run --all` itself until the daemon is back.
   Installed by `deploy daemon` on every box.
+
+### 0.11.0 (2026-11-11) — `fsync risk`: what a drive failure would cost
+
+Goal 1 is to minimise the risk of losing files, but sync only protects what a profile
+carries and nothing showed what falls outside. `fsync risk [--json] [--top N]
+[--recent-days N]` (stdlib, in the pyz, read-only, no hub contact) walks `$HOME` and
+classifies every file: **safe** (file profile / git snapshot / svn snapshot), **lost,
+replaceable** (caches, reinstallable software, disk images, re-clonable git history,
+fsync's own state — `risk.REPLACEABLE`), **lost, hard to replace** (everything else:
+folders in no profile, exclude-pattern hits, git-ignored files inside snapshot-owned
+repos, `.git` of repos no snapshot carries when they hold unpushed commits). The
+hard-to-replace list is ordered recently-touched first. It also reports covered files
+modified since the last run (the current exposure window) and warns when the sync
+service is not active or the last run is older than 6 h.
