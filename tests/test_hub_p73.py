@@ -311,7 +311,7 @@ shared: {{profiles: {{docs: {{paths: [D]}}}}}}
 
 def test_features_and_version():
     from fsync import FEATURES, __version__
-    assert "hub-stores" in FEATURES and __version__ == "0.10.1"
+    assert "hub-stores" in FEATURES and _version_tuple(__version__) >= _version_tuple("0.10.1")
 
 
 def test_drop_retired_profile(tmp_path):

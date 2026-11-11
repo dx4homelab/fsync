@@ -726,6 +726,13 @@ def build_parser() -> argparse.ArgumentParser:
                               help="Run cadence as a systemd time span (default: 1h)")
     p_sync_timer.add_argument("--verbose", action="count", default=0, help="Increase verbosity")
 
+    p_sync_wd = sync_sub.add_parser(
+        "watchdog", help="Watch fsyncd: notify and run the sync directly while the daemon is down")
+    p_sync_wd.add_argument("action", choices=("install", "remove", "status", "check"),
+                           help="install: write+enable the timer; check: one pass (what the timer runs)")
+    p_sync_wd.add_argument("--interval", default="1h", help="Check cadence as a systemd time span (default: 1h)")
+    p_sync_wd.add_argument("--verbose", action="count", default=0, help="Increase verbosity")
+
     p_sync_folder = sync_sub.add_parser(
         "folder", help="Ad-hoc reconcile of ONE folder with the peer, VCS-aware "
                        "(SVN-first recommendation with [y/N] steps; git -> bundles; plain -> newest-wins)")

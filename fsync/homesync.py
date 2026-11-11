@@ -2686,10 +2686,28 @@ def _daemon_deploy_script() -> str:
     return f'''set -e
 V="$HOME/{md.DAEMON_VENV_REL}"
 WH="$HOME/{md.WHEELHOUSE_REL}"
-rm -rf "$V.new"
-if ! (python3 -m venv "$V.new" \\
-      && "$V.new/bin/python3" -m pip install --quiet --no-index --find-links "$WH" fsync \\
-      && "$V.new/bin/python3" -c "import fsync.daemon"); then
+# The fsync wheel is installed by PATH, never by name: PyPI has an unrelated
+# "fsync" project that would outrank ours the moment an index is reachable.
+WHL=$(ls -t "$WH"/fsync-*.whl 2>/dev/null | head -1)
+if [ -z "$WHL" ]; then echo "daemon-deploy: build-failed"; exit 1; fi
+PIP="--quiet --disable-pip-version-check"
+build() {{
+  rm -rf "$V.new"
+  python3 -m venv "$V.new" >/dev/null 2>&1 \\
+    && "$V.new/bin/python3" -m pip install $PIP "$@" --find-links "$WH" "$WHL" >/dev/null 2>&1 \\
+    && "$V.new/bin/python3" -c "import fsync.daemon" 2>/dev/null
+}}
+# 1. offline, from the wheelhouse (the normal case: same Python as the origin).
+# 2./3. this box runs another Python than the origin (an OS update bumped it):
+#    the compiled wheels in the wheelhouse do not fit, so fetch this Python's
+#    builds of the DEPENDENCIES from PyPI; PyYAML from source in pure-Python
+#    mode when it has no wheel for this Python yet (0.10.2 omen4dx outage).
+if build --no-index; then :
+elif build --only-binary :all:; then
+  echo "daemon-deploy: deps-fetched $(python3 -V 2>&1)"
+elif PYYAML_FORCE_LIBYAML=0 build --only-binary :all: --no-binary pyyaml; then
+  echo "daemon-deploy: deps-fetched $(python3 -V 2>&1) (PyYAML pure-Python)"
+else
   rm -rf "$V.new"; echo "daemon-deploy: build-failed"; exit 1
 fi
 rm -rf "$V.bak"
@@ -2698,6 +2716,11 @@ mv "$V.new" "$V"
 if "$V/bin/python3" -m fsync.cli daemon install >/dev/null \\
    && systemctl --user restart fsync-daemon.service \\
    && sleep 2 && systemctl --user is-active --quiet fsync-daemon.service; then
+  # watchdog: runs from the stdlib-only pyz, so it outlives a broken venv
+  if [ -f "$HOME/.local/bin/fsync" ]; then
+    python3 "$HOME/.local/bin/fsync" sync watchdog install >/dev/null 2>&1 \\
+      || echo "daemon-deploy: watchdog-not-installed"
+  fi
   echo "daemon-deploy: ok"
 else
   rm -rf "$V.failed"; mv "$V" "$V.failed" 2>/dev/null || true
@@ -2721,7 +2744,9 @@ def _daemon_deploy_to(target: str | None, wheelhouse: str) -> dict:
         _rsync_dir_push(wheelhouse, target, md.WHEELHOUSE_REL)
         proc = _ssh_to(target, script, timeout=600)
     ok = "daemon-deploy: ok" in proc.stdout
-    return {"ok": ok,
+    notes = [ln.split("daemon-deploy: ", 1)[1] for ln in proc.stdout.splitlines()
+             if ln.startswith("daemon-deploy: deps-fetched") or ln.startswith("daemon-deploy: watchdog-")]
+    return {"ok": ok, "notes": notes,
             "rolled_back": "daemon-deploy: rolled-back" in proc.stdout,
             "detail": ("venv build/import failed (live venv untouched)"
                        if "daemon-deploy: build-failed" in proc.stdout
@@ -3648,6 +3673,159 @@ def _cmd_timer(args) -> int:
     return 2
 
 
+# --------------------------------------------------------------------------- #
+# watchdog: fsyncd is the scheduler, and its venv dies when an OS update      #
+# bumps Python (omen4dx 2026-11-11: crash-loop, sync silently stopped). The   #
+# watchdog is a separate systemd user timer that runs the stdlib-only pyz, so #
+# it keeps working when the venv does not: it notifies once per outage and    #
+# runs the sync itself until the daemon is back.                              #
+# --------------------------------------------------------------------------- #
+
+WATCHDOG_UNIT = "fsync-watchdog"
+DAEMON_UNIT = "fsync-daemon.service"
+WATCHDOG_RENOTIFY_S = 24 * 3600
+WATCHDOG_SETTLE_S = 20          # a restart (deploy, boot) is not an outage
+
+
+def _self_cmd() -> list[str]:
+    """How to invoke fsync so it survives a broken daemon venv: the deployed
+    pyz under the system python3 when present, else this interpreter."""
+    pyz = Path("~/.local/bin/fsync").expanduser()
+    if pyz.is_file():
+        return ["/usr/bin/env", "python3", str(pyz)]
+    return [sys.executable, "-m", "fsync.cli"]
+
+
+def render_watchdog_units(cmd: list[str], interval: str) -> tuple[str, str]:
+    service = f"""[Unit]
+Description=fsync watchdog (notify + run the sync directly while fsyncd is down)
+
+[Service]
+Type=oneshot
+Nice=10
+Environment=DBUS_SESSION_BUS_ADDRESS=unix:path=%t/bus
+ExecStart={" ".join(cmd)} sync watchdog check
+"""
+    timer = f"""[Unit]
+Description=Periodic fsync watchdog
+
+[Timer]
+OnBootSec=10min
+# OnUnitInactiveSec, not OnUnitActiveSec — see fsync-sync.timer.
+OnUnitInactiveSec={interval}
+RandomizedDelaySec=4min
+
+[Install]
+WantedBy=timers.target
+"""
+    return service, timer
+
+
+def _watchdog_state_path() -> Path:
+    return state_root() / "watchdog.json"
+
+
+def watchdog_check(*, settle: float = WATCHDOG_SETTLE_S, now: float | None = None,
+                   run_sync=None, log=print) -> dict:
+    """One watchdog pass. Returns {"daemon": state, "action": ...}; never raises
+    for an expected condition (the unit must not sit in "failed")."""
+    now = time.time() if now is None else now
+    sp = _watchdog_state_path()
+    try:
+        st = json.loads(sp.read_text())
+    except (OSError, ValueError):
+        st = {}
+
+    def save(d: dict) -> None:
+        try:
+            sp.parent.mkdir(parents=True, exist_ok=True)
+            sp.write_text(json.dumps(d))
+        except OSError:
+            pass
+
+    if _systemctl("is-enabled", DAEMON_UNIT).returncode != 0:
+        return {"daemon": "not-installed", "action": "none"}
+    state = _systemctl("is-active", DAEMON_UNIT).stdout.strip() or "unknown"
+    if state != "active" and settle:
+        time.sleep(settle)
+        state = _systemctl("is-active", DAEMON_UNIT).stdout.strip() or "unknown"
+    if state == "active":
+        if st.get("down_since"):
+            log(f"fsyncd is back (was down since {time.strftime('%Y-%m-%d %H:%M', time.localtime(st['down_since']))})")
+            save({})
+        return {"daemon": "active", "action": "none"}
+
+    host = _local_short_host()
+    since = st.get("down_since") or now
+    notified = st.get("notified") or 0
+    out = {"daemon": state, "action": "fallback-run", "notified": False}
+    if not notified or now - notified >= WATCHDOG_RENOTIFY_S:
+        _notify(f"fsync: sync service is DOWN on {host}",
+                f"{DAEMON_UNIT} is '{state}' since "
+                f"{time.strftime('%Y-%m-%d %H:%M', time.localtime(since))}. "
+                f"Syncing directly as a fallback. Repair: `fsync deploy daemon` from the "
+                f"deploy origin; details: journalctl --user -u {DAEMON_UNIT}")
+        notified = now
+        out["notified"] = True
+    save({"down_since": since, "notified": notified, "state": state})
+    log(f"fsyncd is '{state}' — running the sync directly")
+    if run_sync is None:
+        def run_sync() -> int:
+            try:
+                return subprocess.run(_self_cmd() + ["sync", "run", "--all", "--notify"],
+                                      timeout=3 * 3600).returncode
+            except (OSError, subprocess.TimeoutExpired) as e:
+                log(f"fallback run failed to complete: {e}")
+                return 1
+    out["run_rc"] = run_sync()
+    return out
+
+
+def _cmd_watchdog(args) -> int:
+    unit_dir = Path(UNIT_DIR).expanduser()
+    svc_path = unit_dir / f"{WATCHDOG_UNIT}.service"
+    tmr_path = unit_dir / f"{WATCHDOG_UNIT}.timer"
+    if args.action == "check":
+        res = watchdog_check()
+        print(f"watchdog: daemon {res['daemon']}, action {res['action']}"
+              + (f", fallback run rc={res['run_rc']}" if "run_rc" in res else ""))
+        return 0
+    if args.action == "install":
+        unit_dir.mkdir(parents=True, exist_ok=True)
+        service, timer = render_watchdog_units(_self_cmd(), args.interval)
+        svc_path.write_text(service)
+        tmr_path.write_text(timer)
+        _systemctl("daemon-reload")
+        en = _systemctl("enable", "--now", f"{WATCHDOG_UNIT}.timer")
+        if en.returncode != 0:
+            print(f"enable failed: {en.stderr.strip()}", file=sys.stderr)
+            return 1
+        print(f"installed {tmr_path.name} (every {args.interval}, +boot)")
+        return 0
+    if args.action == "remove":
+        _systemctl("disable", "--now", f"{WATCHDOG_UNIT}.timer")
+        removed = []
+        for p in (svc_path, tmr_path):
+            if p.exists():
+                p.unlink()
+                removed.append(p.name)
+        _systemctl("daemon-reload")
+        print(f"removed: {', '.join(removed) or 'nothing installed'}")
+        return 0
+    if args.action == "status":
+        out = _systemctl("list-timers", f"{WATCHDOG_UNIT}.timer", "--no-pager")
+        print(out.stdout.strip() or "watchdog not installed")
+        print(f"{DAEMON_UNIT}: {_systemctl('is-active', DAEMON_UNIT).stdout.strip() or 'unknown'}")
+        try:
+            st = json.loads(_watchdog_state_path().read_text())
+        except (OSError, ValueError):
+            st = {}
+        if st.get("down_since"):
+            print("down since " + time.strftime("%Y-%m-%d %H:%M", time.localtime(st["down_since"])))
+        return 0
+    return 2
+
+
 def cmd_sync(args) -> int:
     if getattr(args, "sync_cmd", None) == "init":
         return _cmd_init(args)
@@ -3655,6 +3833,8 @@ def cmd_sync(args) -> int:
         return _cmd_run(args)
     if getattr(args, "sync_cmd", None) == "timer":
         return _cmd_timer(args)
+    if getattr(args, "sync_cmd", None) == "watchdog":
+        return _cmd_watchdog(args)
     if getattr(args, "sync_cmd", None) == "folder":
         from .foldersync import cmd_sync_folder
         return cmd_sync_folder(args)

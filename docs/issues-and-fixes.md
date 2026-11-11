@@ -791,3 +791,19 @@ folder whole to `<backup>/<name>.pre-checkout`, (3) renames the working copy int
 then patches + unpacks as usual. Nothing is deleted. The box still needs the SVN server
 reachable (VPN) and cached credentials; until then the skip reason stays the benign
 "svn server unreachable".
+
+### 0.10.3 (2026-11-11) — daemon venv vs an OS Python bump; watchdog
+
+omen4dx rebooted into a new OS image (Python 3.14 → 3.15): the fsyncd venv could not
+import, `fsync-daemon.service` crash-looped (301 starts) and scheduled sync stopped with
+no signal. `fsync deploy daemon` could not repair it — the wheelhouse is built on the
+origin's Python and installed `--no-index`.
+
+- **deploy daemon**: installs the fsync wheel by path (PyPI has an unrelated `fsync`
+  project — never install by name with an index reachable); when the offline install
+  fails it fetches the target Python's builds of the dependencies from PyPI, PyYAML from
+  source in pure-Python mode if it has no wheel yet. Reported as `deps-fetched`.
+- **`fsync sync watchdog install|remove|status|check`**: an hourly systemd user timer
+  running the stdlib-only pyz. When `fsync-daemon.service` is enabled but not active it
+  notifies (once, then daily) and runs `sync run --all` itself until the daemon is back.
+  Installed by `deploy daemon` on every box.
