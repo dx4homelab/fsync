@@ -528,7 +528,12 @@ def apply_decision(wc: str | Path, meta: dict[str, Any], *,
     if not wc.exists() or (wc.is_dir() and not any(wc.iterdir())):
         return True, "new"
     if not is_svn_wc(wc):
-        return False, "receiver path exists but is not an svn working copy"
+        if not wc.is_dir() or wc.is_symlink():
+            return False, "receiver path exists but is not an svn working copy"
+        # A plain folder at a checkout path (files carried by a file profile
+        # before kind:svn owned it): apply_wc checks out aside, moves the
+        # folder to the backup dir, then swaps the working copy in.
+        return True, "adopt"
     busy = wc_busy(wc)
     if busy:
         return False, f"receiver {busy}"
@@ -648,9 +653,36 @@ def apply_wc(wc: str | Path, snap_dir: str | Path, meta: dict[str, Any], *,
 
     created = not is_svn_wc(wc)
     backup = None
-    if created:
-        if wc.exists() and any(wc.iterdir()):
-            raise SvnSyncError(f"{name}: {wc} exists and is not empty — refusing to check out over it")
+    adopted = None
+    if created and wc.exists() and any(wc.iterdir()):
+        # Adopt a plain folder. Order matters: the slow, fallible step (the
+        # checkout — server down, auth, bad URL) runs into a staging dir first,
+        # so a failure leaves the folder exactly as it was. Only then is the
+        # folder moved whole into the backup dir and the working copy renamed
+        # into place. Nothing is deleted.
+        if not wc.is_dir() or wc.is_symlink():
+            raise SvnSyncError(f"{name}: {wc} exists and is not a folder — refusing to check out over it")
+        backup_dir.mkdir(parents=True, exist_ok=True)
+        staging = backup_dir / f"{name}.checkout.tmp"
+        kept = backup_dir / f"{name}.pre-checkout"
+        if kept.exists():
+            raise SvnSyncError(f"{name}: {kept} already exists — refusing to overwrite a backup")
+        if staging.exists():
+            shutil.rmtree(staging)
+        try:
+            _svn(backup_dir, "checkout", "-r", str(rev), f"{url}@{rev}", str(staging))
+        except BaseException:
+            shutil.rmtree(staging, ignore_errors=True)
+            raise
+        shutil.move(str(wc), str(kept))
+        try:
+            shutil.move(str(staging), str(wc))
+        except BaseException:
+            if not wc.exists():
+                shutil.move(str(kept), str(wc))      # put the folder back
+            raise
+        adopted = str(kept)
+    elif created:
         wc.parent.mkdir(parents=True, exist_ok=True)
         # Peg the URL at the producer's revision: a branch deleted or moved
         # on the server after that revision is "path not found" at HEAD
@@ -678,8 +710,8 @@ def apply_wc(wc: str | Path, snap_dir: str | Path, meta: dict[str, Any], *,
     applied[name] = meta.get("snapshot_id", "")
     _save_applied(state_dir, applied)
     return {"wc": str(wc), "name": name, "revision": rev, "created": created,
-            "patched": patched, "unpacked": unpacked,
-            "backup": str(backup_dir) if backup else None, "applied": True}
+            "patched": patched, "unpacked": unpacked, "adopted": adopted,
+            "backup": str(backup_dir) if (backup or adopted) else None, "applied": True}
 
 
 def preview_apply(wc: str | Path, meta: dict[str, Any], *, state_dir: Path | None = None) -> dict[str, Any]:

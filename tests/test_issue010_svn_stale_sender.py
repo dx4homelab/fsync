@@ -539,3 +539,39 @@ def test_profile_kind_svn_loads_and_requires_feature(tmp_path):
     assert "svn-sync" in FEATURES
     from fsync import meta_deploy
     assert "svnsync.py" in meta_deploy.CORE_MODULES
+
+
+@pytest.mark.skipif(not HAS_SVN, reason="svn/svnadmin not installed")
+def test_apply_adopts_plain_folder(svn_world, tmp_path):
+    """A plain folder at a checkout path (files carried by a file profile, no
+    .svn) becomes a real working copy; the folder moves whole to the backup."""
+    snap = tmp_path / "snaps"
+    meta = svs.snapshot_wc(svn_world["prod"], snap, name="ws__proj", rel="ws/proj")
+    plain = tmp_path / "home-d" / "ws" / "proj"
+    plain.mkdir(parents=True)
+    (plain / "keep.txt").write_text("stale plain copy\n")
+    (plain / "only-here.txt").write_text("local only\n")
+    assert svs.apply_decision(plain, meta) == (True, "adopt")
+    # a plain FILE at the path is still refused
+    f = tmp_path / "home-d" / "ws" / "afile"
+    f.write_text("x")
+    assert svs.apply_decision(f, meta)[0] is False
+
+    # unreachable server: the folder is untouched, nothing left behind
+    bk0 = tmp_path / "bk" / "run0-svnapply"
+    with pytest.raises(svs.SvnSyncError):
+        svs.apply_wc(plain, snap, {**meta, "url": "file:///nonexistent-repo"}, backup_dir=bk0)
+    assert (plain / "only-here.txt").read_text() == "local only\n" and not svs.is_svn_wc(plain)
+    assert not (bk0 / "ws__proj.pre-checkout").exists() and not (bk0 / "ws__proj.checkout.tmp").exists()
+
+    bk = tmp_path / "bk" / "run1-svnapply"
+    res = svs.apply_wc(plain, snap, meta, backup_dir=bk, state_dir=tmp_path / "st")
+    assert res["created"] and res["adopted"] == str(bk / "ws__proj.pre-checkout")
+    assert svs.is_svn_wc(plain) and svs.wc_info(plain)["revision"] == 3
+    assert "edited on producer" in (plain / "keep.txt").read_text()       # producer state, not the stale copy
+    assert (plain / "scratch.txt").read_text() == "unversioned\n"
+    assert not (plain / "only-here.txt").exists()
+    assert (bk / "ws__proj.pre-checkout" / "only-here.txt").read_text() == "local only\n"
+    assert (bk / "ws__proj.pre-checkout" / "keep.txt").read_text() == "stale plain copy\n"
+    # svn sees a normal working copy after the move into place
+    assert svs.wc_status(plain)["modified"]

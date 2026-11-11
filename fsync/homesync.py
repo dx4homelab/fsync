@@ -2003,9 +2003,11 @@ def auto_apply_svn_profile(prof: Profile, snap_dir: str | Path, *,
                 src_dir = _pull_svn_snapshot_from_hub(hub, meta, snap_dir / "hub" / meta["host"] / name)
             res = svs.apply_wc(target, src_dir, meta, backup_dir=backup_dir, state_dir=state_dir)
             out["applied"].append({"checkout": name, "revision": res["revision"],
-                                   "created": res["created"], "backup": res.get("backup")})
+                                   "created": res["created"], "backup": res.get("backup"),
+                                   "adopted": res.get("adopted")})
             log(f"  {prof.name}/{name}: auto-applied r{res['revision']}"
-                + (" (new checkout)" if res["created"] else "")
+                + (f" (plain folder adopted; previous files kept in {res['adopted']})" if res.get("adopted")
+                   else " (new checkout)" if res["created"] else "")
                 + (" + diff" if res["patched"] else "")
                 + (f" + {res['unpacked']} unversioned" if res["unpacked"] else ""))
         except svs.SvnServerUnreachable as e:
@@ -2158,7 +2160,9 @@ def cmd_svn(args) -> int:
             print(f"{nm}: ERROR {e}", file=sys.stderr)
             rc = 1
             continue
-        print(f"{nm}: applied r{res['revision']}" + (" (new checkout)" if res["created"] else "")
+        print(f"{nm}: applied r{res['revision']}"
+              + (f" (plain folder adopted; previous files kept in {res['adopted']})" if res.get("adopted")
+                 else " (new checkout)" if res["created"] else "")
               + (" + diff" if res["patched"] else "")
               + (f" + {res['unpacked']} unversioned" if res["unpacked"] else "")
               + (f"  [backup {backup_dir}]" if res.get("backup") else ""))

@@ -779,3 +779,15 @@ repository and skip without `svn`/`svnadmin`). Suite: 245 passed.
   revisions).
 - minis4dx: `~/.local/state/fsync/runs/20261106-124730-9dbc/report.json` (`primary` push, a→b 7,012).
 - `stat -c %w` on the resurrected files: 2026-11-06 12:48:54 ±4 s.
+
+### 0.10.2 (2026-11-11) — adopt a plain folder at a checkout path
+
+A box that joined after `.svn` was excluded from file sync (omen4dx) received every
+checkout as plain files, so `fsync svn apply` skipped it forever ("receiver path exists
+but is not an svn working copy", 23 of 33 on omen). `apply_decision` now returns
+`(True, "adopt")` for a plain folder and `apply_wc` (1) checks out into a staging dir
+under the backup dir — a failing server/auth leaves the folder untouched, (2) moves the
+folder whole to `<backup>/<name>.pre-checkout`, (3) renames the working copy into place,
+then patches + unpacks as usual. Nothing is deleted. The box still needs the SVN server
+reachable (VPN) and cached credentials; until then the skip reason stays the benign
+"svn server unreachable".
