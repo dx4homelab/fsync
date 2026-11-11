@@ -41,8 +41,13 @@ This design adds, in service of goal 1:
 - files4dx: Ryzen 7 2700X, 32 GB, encrypted RAIDZ2 pool `tank` (4 x 18 TB, 31.4 TB
   free). Running: Garage (S3), Caddy, ntfy, Beszel, NFS export for Proxmox dumps.
   sanoid and syncoid are installed with no policy. Tailscale is not running.
-- **The fsync hub (51 GB) is in `~/.fsync/hub` on the single boot NVMe**, outside
-  `tank`, with no snapshots and in no backup job. This is the first thing to fix.
+- ~~The fsync hub (51 GB) is in `~/.fsync/hub` on the single boot NVMe, outside `tank`,
+  with no snapshots and in no backup job.~~ **Fixed 2026-11-11 (phase 0 done):** the hub
+  is on dataset `tank/hub`, reached through a symlink at `~/.fsync/hub`; sanoid keeps
+  48 hourly, 30 daily, 8 weekly and 12 monthly snapshots; sync failures and
+  daemon-down alerts go to ntfy (fsync 0.11.1). The old copy remains at
+  `~/.fsync/hub.pre-tank-20261111` on files4dx until the owner deletes it. Details:
+  `docs/issues-and-fixes.md`, entry 0.11.1.
 - Workstations minis4dx, fury4dx, omen4dx run the Python fsync 0.11.0 (fury is behind).
 - `fsync risk` on minis: 479 GB hard to replace and in no profile, including one
   450 GB file in `~/backups/june-2026`.
