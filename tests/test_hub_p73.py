@@ -311,6 +311,7 @@ shared: {{profiles: {{docs: {{paths: [D]}}}}}}
 
 def test_features_and_version():
     from fsync import FEATURES, __version__
+    from fsync.hub import _version_tuple
     assert "hub-stores" in FEATURES and _version_tuple(__version__) >= _version_tuple("0.10.1")
 
 
